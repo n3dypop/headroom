@@ -1,0 +1,43 @@
+[package]
+name = "headroom"
+version = "0.1.0"
+edition = "2024"
+description = "Headroom background agent"
+publish = false
+
+[lib]
+name = "headroom"
+path = "src/lib.rs"
+
+# Console build: for statusLine and manual runs
+[[bin]]
+name = "headroom"
+path = "src/main.rs"
+
+# Windowless background build for Windows (same as headroom on Mac / Linux)
+[[bin]]
+name = "headroomw"
+path = "src/main_windowless.rs"
+
+[dependencies]
+# JSON read/write (snapshots, statusLine input, probe output)
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Config file config.toml (parsing only)
+toml = { version = "1", default-features = false, features = ["parse", "serde"] }
+# Receive changes to ~/.claude/projects and the statusLine record as events (no polling)
+notify = { version = "8", default-features = false, features = ["macos_fsevent"] }
+# Convert /usage reset times to UTC using the source time zone (IANA name) and daylight saving time.
+# Bundles tzdb on Windows; uses the OS zoneinfo on Mac
+jiff = "0.2"
+# HTTPS to the destination (push). Uses the OS TLS and certificate store, so no C build is needed
+ureq = { version = "3", default-features = false, features = ["native-tls"] }
+# Keep the destination credentials in the OS credential store (Windows Credential Manager / Mac Keychain)
+keyring = { version = "3", features = ["windows-native", "apple-native"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

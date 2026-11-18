@@ -1,0 +1,10 @@
+{
+  "session_id": "<redacted>",
+  "model": { "id": "claude-opus-5-5", "display_name": "Opus 5.5" },
+  "workspace": { "current_dir": "<redacted>" },
+  "context_window": { "used_percentage": 8, "remaining_percentage": 92 },
+  "rate_limits": {
+    "five_hour": { "used_percentage": 23.5, "resets_at": 1763305200 },
+    "seven_day": { "used_percentage": 41.2, "resets_at": 1763596800 }
+  }
+}

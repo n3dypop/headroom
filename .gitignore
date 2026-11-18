@@ -1,0 +1,25 @@
+node_modules/
+*.log
+.env
+.env.*
+# Collected results and raw (unmasked) responses are never committed
+snapshot.json
+.headroom/
+fixtures/**/raw/
+# Local Worker credentials and wrangler's working directory
+.dev.vars
+.wrangler/
+# Production Worker settings (D1 database ID and the host, which contains the account subdomain).
+# The committed wrangler.toml keeps placeholders.
+packages/worker/wrangler.prod.toml
+# Local preview launch settings
+.claude/launch.json
+# Provider logos for the Scriptable widget (third-party trademarks) and the script built with them
+packages/scriptable/icons/
+packages/scriptable/dist/
+# Release packages built by scripts/
+/dist/
+# Local-only development notes and agent instructions (not part of the public repository)
+/private/
+/AGENTS.md
+/CLAUDE.md

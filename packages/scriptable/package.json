@@ -1,0 +1,6 @@
+{
+  "name": "@headroom/scriptable",
+  "private": true,
+  "type": "module",
+  "description": "iPhone widget (Scriptable). Paste Headroom.js into Scriptable"
+}

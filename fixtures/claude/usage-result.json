@@ -1,0 +1,34 @@
+{
+  "type": "result",
+  "subtype": "success",
+  "is_error": false,
+  "num_turns": 0,
+  "duration_ms": 93,
+  "result": "You are currently using your subscription to power your Claude Code usage\n\nCurrent session: 9% used · resets Nov 17, 1am (Asia/Tokyo)\nCurrent week (all models): 2% used · resets Nov 20, 4pm (Asia/Tokyo)\nCurrent week (Fable): 0% used · resets Nov 20, 4pm (Asia/Tokyo)\n\nWhat's contributing to your usage?\nApproximate · sessions on this machine only · shares overlap\n\nLast 24h · 142 requests · 1 session\n  84%  Start fresh when you switch tasks · run /clear\n  38%  Turn off ccd_turn when you don't need it\n  23%  See what fills your context · run /context\n  Top MCP servers: ccd_turn 38%\n\nLast 7d · 142 requests · 1 session\n  84%  Start fresh when you switch tasks · run /clear\n  38%  Turn off ccd_turn when you don't need it\n  23%  See what fills your context · run /context\n  Top MCP servers: ccd_turn 38%",
+  "total_cost_usd": 0,
+  "usage": {
+    "output_tokens_details": {
+      "thinking_tokens": 0
+    },
+    "input_tokens": 0,
+    "cache_creation_input_tokens": 0,
+    "cache_read_input_tokens": 0,
+    "output_tokens": 0,
+    "server_tool_use": {
+      "web_search_requests": 0,
+      "web_fetch_requests": 0
+    },
+    "service_tier": "standard",
+    "cache_creation": {
+      "ephemeral_1h_input_tokens": 0,
+      "ephemeral_5m_input_tokens": 0
+    },
+    "inference_geo": "",
+    "iterations": [],
+    "speed": "standard",
+    "fallback_credit": null
+  },
+  "session_id": "<redacted>",
+  "uuid": "<redacted>",
+  "local_command": "usage"
+}

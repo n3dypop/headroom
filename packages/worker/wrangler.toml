@@ -1,0 +1,26 @@
+# Headroom's delivery endpoint. Setup steps: docs/install.md.
+# Deploy with wrangler (Cloudflare's CLI). It's not a repository dependency (run it with npx wrangler).
+name = "headroom"
+main = "src/index.ts"
+compatibility_date = "2026-11-01"
+# The entry point is a single workers.dev host. The gate is a per-device Worker token (Access is not used).
+# Preview URLs are disabled. The Worker also rejects requests to any host other than ALLOWED_HOST
+workers_dev = true
+preview_urls = false
+
+[[d1_databases]]
+binding = "DB"
+database_name = "headroom"
+database_id = "00000000-0000-0000-0000-000000000000" # Placeholder. Put the real value only in your local wrangler.prod.toml (see docs/install.md)
+migrations_dir = "migrations"
+
+[vars]
+# Preferred PC names (comma-separated). Used to pick between near-simultaneous observations and the current value
+COLLECTOR_PRIORITY = ""
+# Entry host name (e.g. headroom.<account-subdomain>.workers.dev). If unset, all requests are rejected
+ALLOWED_HOST = ""
+
+# Credentials are not written in wrangler.toml: npx wrangler secret put TOKENS -c wrangler.prod.toml (the value is a JSON array of scripts/new-token.ts output lines)
+
+[triggers]
+crons = ["*/5 * * * *"] # Every 5 min: compute derived values for changed providers and gradually delete rows past retention (within budget)
