@@ -1,0 +1,160 @@
+# Builds the release packages when a version tag (v<version>) is pushed, and attaches them to a draft release.
+# The draft is reviewed and published by hand.
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  version:
+    name: Check the tag
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: version
+        name: The tag must match the agent version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' agent/Cargo.toml | head -n 1)"
+          if [ "$TAG" != "v$version" ]; then
+            echo "Tag $TAG does not match agent/Cargo.toml version $version" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  windows:
+    name: Windows (x64)
+    needs: version
+    runs-on: windows-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust (stable)
+        run: |
+          rustup toolchain install stable --profile minimal --target x86_64-pc-windows-msvc
+          rustup default stable
+      - name: Test
+        run: cargo test --locked --manifest-path agent/Cargo.toml
+      - name: Build the package
+        run: pwsh scripts/package-windows.ps1
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/headroom-${{ needs.version.outputs.version }}-windows-x64.zip
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: windows
+          path: dist/headroom-${{ needs.version.outputs.version }}-windows-x64.zip*
+          if-no-files-found: error
+
+  macos:
+    name: macOS (Apple silicon)
+    needs: version
+    runs-on: macos-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: The runner must be Apple silicon
+        run: test "$(uname -m)" = arm64
+      - name: Install Rust (stable)
+        run: |
+          rustup toolchain install stable --profile minimal --target aarch64-apple-darwin
+          rustup default stable
+      - name: Test
+        run: cargo test --locked --manifest-path agent/Cargo.toml
+      - name: Build the package
+        run: bash scripts/package-macos.sh
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/headroom-${{ needs.version.outputs.version }}-macos-arm64.tar.gz
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: macos
+          path: dist/headroom-${{ needs.version.outputs.version }}-macos-arm64.tar.gz*
+          if-no-files-found: error
+
+  release:
+    name: Draft release
+    needs: [version, windows, macos]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ github.ref_name }}
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: windows
+          path: dist
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: macos
+          path: dist
+      - name: Check the four files
+        working-directory: dist
+        run: |
+          ls -l
+          for archive in "headroom-$VERSION-windows-x64.zip" "headroom-$VERSION-macos-arm64.tar.gz"; do
+            test -f "$archive" || { echo "missing $archive" >&2; exit 1; }
+            test -f "$archive.sha256" || { echo "missing $archive.sha256" >&2; exit 1; }
+            # The checksum file that will be published must be byte for byte the record computed from the archive here
+            # ("<hash>  <archive>", with or without one final newline), and that file itself must verify
+            expected="$(sha256sum --text "$archive")" # text mode: "<hash>  <name>" (two spaces) on every platform
+            printf '%s' "$expected" > expected.tmp
+            printf '%s\n' "$expected" > expected-nl.tmp
+            if ! cmp -s "$archive.sha256" expected.tmp && ! cmp -s "$archive.sha256" expected-nl.tmp; then
+              echo "$archive.sha256 is not exactly the record for $archive" >&2
+              exit 1
+            fi
+            rm expected.tmp expected-nl.tmp
+            sha256sum -c "$archive.sha256"
+          done
+      - name: The tag must still point at the built commit
+        run: |
+          current="$(gh api "repos/$GH_REPO/commits/refs/tags/$TAG" -q .sha)"
+          if [ "$current" != "$GITHUB_SHA" ]; then
+            echo "Tag $TAG now points at $current, but $GITHUB_SHA was built" >&2
+            exit 1
+          fi
+      - name: There must be no release for the tag yet
+        run: |
+          # Fails the step if the list cannot be read (drafts are included with this token)
+          tags="$(gh api --paginate "repos/$GH_REPO/releases?per_page=100" -q '.[] | .tag_name')"
+          if printf '%s\n' "$tags" | grep -Fqx -- "$TAG"; then
+            echo "A release for $TAG already exists. If it is a draft left by a failed run, check it and delete the draft before re-running" >&2
+            exit 1
+          fi
+      - name: Create the draft release
+        run: |
+          gh release create "$TAG" --draft --verify-tag \
+            --title "Headroom $VERSION" \
+            --notes "Built by the Release workflow from $TAG ($GITHUB_SHA). Review the notes before publishing." \
+            "dist/headroom-$VERSION-windows-x64.zip" \
+            "dist/headroom-$VERSION-windows-x64.zip.sha256" \
+            "dist/headroom-$VERSION-macos-arm64.tar.gz" \
+            "dist/headroom-$VERSION-macos-arm64.tar.gz.sha256"

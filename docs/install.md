@@ -167,7 +167,13 @@ The agent starts Codex's App Server with the agent's own environment. A custom `
 
 **From a release package** (no build tools needed):
 
-Packages are published on the [Releases page](https://github.com/n3dypop/headroom/releases). Each package has a `.sha256` file next to it; the Releases page also shows each file's SHA-256 digest. Set `V` to the version you install (for example `0.1.2`).
+Packages are published on the [Releases page](https://github.com/n3dypop/headroom/releases). Each package has a `.sha256` file next to it; the Releases page also shows each file's SHA-256 digest. Packages from 0.1.3 on are built by the repository's Release workflow on GitHub Actions. To check that a downloaded package came from that workflow and that version's tag, use the [GitHub CLI](https://cli.github.com/) (sign in once with `gh auth login`):
+
+```bash
+gh attestation verify <file> --repo n3dypop/headroom --signer-workflow n3dypop/headroom/.github/workflows/release.yml --source-ref refs/tags/v<version>
+```
+
+In the steps below, set `V` to the version you install (for example `0.1.2`).
 
 Always download and extract into a new, empty folder. An older package you keep for rollback must not be overwritten, even one with the same version.
 

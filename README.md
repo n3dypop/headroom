@@ -68,6 +68,8 @@ cargo clippy --locked --manifest-path agent/Cargo.toml --all-targets
 
 TypeScript runs directly on Node.js 24 without a build step, so only erasable syntax is used (no `enum`, `namespace` or parameter properties).
 
+GitHub Actions runs these checks on every push to `main` and on pull requests: the Rust checks on Windows and macOS, the TypeScript checks on Ubuntu ([`ci.yml`](.github/workflows/ci.yml)). Pushing a tag `v<version>` that matches `agent/Cargo.toml` builds the Windows and macOS packages with build provenance attestations and attaches them to a draft release ([`release.yml`](.github/workflows/release.yml)).
+
 ## Status and plans
 
 Headroom is a personal project in active development. Planned next: more clients that read the same server API, namely a Windows system-tray app, a macOS widget and menu-bar app, and a Discord bot.
