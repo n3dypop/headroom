@@ -3,6 +3,7 @@ name = "headroom"
 version = "0.1.0"
 edition = "2024"
 description = "Headroom background agent"
+license = "MIT"
 publish = false
 
 [lib]

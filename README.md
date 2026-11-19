@@ -71,3 +71,7 @@ TypeScript runs directly on Node.js 24 without a build step, so only erasable sy
 ## Status and plans
 
 Headroom is a personal project in active development. Planned next: more clients that read the same server API, namely a Windows system-tray app, a macOS widget and menu-bar app, and a Discord bot.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
