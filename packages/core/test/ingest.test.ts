@@ -1,6 +1,13 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { effectiveObservedAt, nextSendSeq, observationKey, shouldReplaceCollectorSnapshot } from "../src/index.ts";
+import {
+  effectiveObservedAt,
+  mergeSnapshots,
+  nextSendSeq,
+  observationKey,
+  shouldReplaceCollectorSnapshot,
+  type Snapshot,
+} from "../src/index.ts";
 
 const at = (hhmm: string) => `2026-11-17T${hhmm}:00.000Z`;
 

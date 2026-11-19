@@ -618,8 +618,8 @@ fn group_prefix(group: &str) -> String {
     group
         .chars()
         .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' {
-                c
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
             } else {
                 '_'
             }
@@ -694,10 +694,11 @@ fn normalize(
             let base_id = if *group == "codex" {
                 duration_id
             } else {
-                let scope = text(bucket, "limitName").unwrap_or(group);
+                let prefix = group_prefix(group);
+                let scope = crate::schema::known_scope(&prefix).unwrap_or(&prefix);
                 value.scope = Some(scope.into());
                 value.label = format!("{} {scope}", value.label);
-                format!("{}_{}", group_prefix(group), duration_id)
+                format!("{prefix}_{duration_id}")
             };
             let mut id = base_id.clone();
             let mut collision = 0;
@@ -868,7 +869,7 @@ mod tests {
                         "secondary":{"usedPercent":30,"windowDurationMins":300,"resetsAt":null}
                     },
                     "codex.extra": {
-                        "limitName":"Extra model","normalModelSlug":"test-model",
+                        "limitName":"Acme Corp","normalModelSlug":"test-model",
                         "rateLimitReachedType":"rateLimitReached",
                         "primary":{"usedPercent":100,"windowDurationMins":10080},
                         "secondary":{"usedPercent":20,"windowDurationMins":10080}
@@ -895,9 +896,34 @@ mod tests {
         );
         assert_eq!(snap.windows[1].used_percent, 30.0);
         assert!(snap.windows[1].resets_at.is_none());
-        assert_eq!(snap.windows[2].scope.as_deref(), Some("Extra model"));
-        assert_eq!(snap.windows[2].label, "Weekly Extra model");
+        assert_eq!(snap.windows[2].scope.as_deref(), Some("codex_extra"));
+        assert_eq!(snap.windows[2].label, "Weekly codex_extra");
         assert_eq!(snap.blocked, Some(false));
+        assert!(snap.windows.iter().all(|w| {
+            !w.label.contains("Acme Corp")
+                && w.scope.as_deref().is_none_or(|s| !s.contains("Acme Corp"))
+        }));
+        assert_eq!(snap.for_upload().windows.as_slice(), &snap.windows[..2]);
+    }
+
+    #[test]
+    fn known_group_uses_normalized_id_and_display_name() {
+        let limits = json!({"rateLimitsByLimitId": {
+            "Codex-Bengalfox": {
+                "limitName": "Acme Corp",
+                "primary": {"usedPercent": 10, "windowDurationMins": 300}
+            }
+        }});
+        let snap = normalize(&limits, None, NOW).unwrap();
+        let window = &snap.windows[0];
+        assert_eq!(window.id, "codex_bengalfox_five_hour");
+        assert!(crate::schema::is_window_id(&window.id));
+        assert_eq!(
+            crate::schema::sendable_scope(&window.id),
+            Some(Some("Codex extra"))
+        );
+        assert_eq!(window.scope.as_deref(), Some("Codex extra"));
+        assert_eq!(window.label, "5h Codex extra");
     }
 
     #[test]
@@ -961,7 +987,7 @@ mod tests {
             "rateLimitReachedType": "rateLimitReached"
         }});
         let snapshot = normalize(&limits, None, NOW).unwrap();
-        assert_eq!(snapshot.windows[0].scope.as_deref(), Some("codex.other"));
+        assert_eq!(snapshot.windows[0].scope.as_deref(), Some("codex_other"));
         assert_eq!(snapshot.blocked, None);
 
         let mut denied = limits;

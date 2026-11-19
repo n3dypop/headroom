@@ -75,9 +75,10 @@ The committed `wrangler.toml` holds placeholders only. Keep your real values in 
    - When you replace a PC, reuse its old name.
    - Do not use a name that identifies you personally, such as a hostname containing your name.
 
-6. **Store the token list as a secret.** Put all the lines into one JSON array and run:
+6. **Store the token list as a secret.** Put all the lines into one JSON array. Go back to `packages/worker` and run:
 
    ```bash
+   cd packages/worker
    npx wrangler secret put TOKENS -c wrangler.prod.toml
    ```
 
@@ -99,6 +100,7 @@ The Worker runs a Cron job every 5 minutes. It computes derived values (recent u
 - Each client read touches only precomputed rows, at most 3.
 - All other work (uploads from PCs, fetch turns, Cron) reserves rows from a daily budget before it touches D1.
 - When the budget is used up, the Worker answers 503. Agents keep their data and send it again after the daily reset.
+- The free plan's D1 limits apply to the whole Cloudflare account, but each Headroom database counts its own budget. If the account has a second Headroom database, for example one for testing, set `D1_BUDGET_PERCENT` in each one's `[vars]` so the shares add up to 100 or less, for example `D1_BUDGET_PERCENT = "80"` and `D1_BUDGET_PERCENT = "20"`. Each share must be at least 13, or the Cron job never runs. Empty means 100; any value that is not a whole number from 1 to 100 stops all uploads.
 
 ## 2. Agent (each PC)
 
@@ -256,7 +258,7 @@ The agent reads its settings when it starts, so write them before you install it
    own_fetch_min = 60                # longest wait for another PC's turn before fetching on this PC
    ```
 
-   When several PCs are on, they take turns fetching through the server, so the same values are not fetched twice.
+   When several PCs are on, they take turns fetching through the server, so the same values are not fetched twice. A PC that stops with `headroom stop` hands its turn back. Another PC takes over when its own next fetch is due: a PC told to wait asks again within one fetch interval plus 2 minutes, however long the turn was held for. A PC that shuts down without `headroom stop` keeps the turn until it runs out, which can take up to an hour while a limit is reached.
 
 2. **Store the PC's write token.**
    - It goes to the OS credential store (Windows Credential Manager or the macOS Keychain). It is never written to a file or shown on screen.
@@ -378,11 +380,12 @@ iOS decides how often widgets refresh, usually every 15–60 minutes. Countdowns
   2. Deploy with `npx wrangler deploy -c wrangler.prod.toml`.
 
   Normally you apply migrations before deploying. **Exception:** a migration that only drops a table is applied **after** deploying the Worker that no longer uses it. Its header comment says so.
-- **Widget:** paste the new script over the old one. Settings are kept.
+- **Widget:** update the server first, then paste the new script over the old one (a newer widget may ask the server for data an older server doesn't serve). Settings are kept.
 
 ## 5. Troubleshooting
 
 - **First check:** `headroom status` shows the last error per provider and the send result.
+- **Send result says the PC's clock is ahead of or behind the destination's:** the Worker refuses uploads from a PC whose clock is more than 2 minutes off, because it uses the PC's times as they are. Turn on automatic time sync (Windows: Settings > Time & language > Set time automatically; macOS: System Settings > General > Date & Time). Observations the agent had queued when it was refused are dropped (they were stamped by the wrong clock), and it takes no fetch turn until a send goes through, so another PC fetches meanwhile.
 - **Codex `account_changed`:** the CLI's account changed, so fetching stopped to avoid mixing histories. Check that it is the right account, then run `headroom collect --provider codex --accept-account`.
 - **Claude account change:** same as Codex, with `--provider claude`.
 - **Claude safety stop:** fetching stopped because the agent could not confirm that `/usage` used no quota.

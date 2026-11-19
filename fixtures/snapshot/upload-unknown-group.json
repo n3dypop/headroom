@@ -1,0 +1,145 @@
+{
+  "seq": 1794837600000,
+  "snapshot": {
+    "schema_version": 2,
+    "generated_at": "2026-11-16T13:00:00.000Z",
+    "providers": {
+      "claude": {
+        "status": "ok",
+        "fetched_at": "2026-11-16T12:58:00.000Z",
+        "collector": "win-desktop",
+        "error": null,
+        "error_code": null,
+        "plan": "max",
+        "blocked": false,
+        "history_since": null,
+        "windows": [
+          {
+            "id": "five_hour",
+            "label": "5h",
+            "kind": "session",
+            "scope": null,
+            "used_percent": 10,
+            "resets_at": "2026-11-16T16:00:00.000Z",
+            "fetched_at": "2026-11-16T12:59:30.000Z"
+          },
+          {
+            "id": "seven_day",
+            "label": "Weekly",
+            "kind": "weekly",
+            "scope": null,
+            "used_percent": 2,
+            "resets_at": "2026-11-20T07:00:00.000Z",
+            "fetched_at": "2026-11-16T12:58:00.000Z"
+          },
+          {
+            "id": "seven_day_fable",
+            "label": "Weekly Fable",
+            "kind": "weekly",
+            "scope": "Fable",
+            "used_percent": 0,
+            "resets_at": "2026-11-20T07:00:00.000Z",
+            "fetched_at": "2026-11-16T12:58:00.000Z"
+          }
+        ]
+      },
+      "codex": {
+        "status": "ok",
+        "fetched_at": "2026-11-16T12:59:00.000Z",
+        "collector": "win-desktop",
+        "error": null,
+        "error_code": null,
+        "plan": "prolite",
+        "blocked": false,
+        "history_since": null,
+        "windows": [
+          {
+            "id": "seven_day",
+            "label": "Weekly",
+            "kind": "weekly",
+            "scope": null,
+            "used_percent": 29,
+            "resets_at": "2026-11-20T10:51:04.000Z",
+            "fetched_at": "2026-11-16T12:59:00.000Z"
+          },
+          {
+            "id": "codex_other_seven_day",
+            "label": "Weekly codex_other",
+            "kind": "weekly",
+            "scope": "codex_other",
+            "used_percent": 5.5,
+            "resets_at": null,
+            "fetched_at": "2026-11-16T12:59:00.000Z"
+          },
+          {
+            "id": "codex_bengalfox_five_hour",
+            "label": "5h Codex extra",
+            "kind": "session",
+            "scope": "Codex extra",
+            "used_percent": 12,
+            "resets_at": "2026-11-16T16:00:00.000Z",
+            "fetched_at": "2026-11-16T12:59:00.000Z"
+          },
+          {
+            "id": "mystery_group_five_hour",
+            "label": "5h mystery_group",
+            "kind": "session",
+            "scope": "mystery_group",
+            "used_percent": 40,
+            "resets_at": "2026-11-16T16:00:00.000Z",
+            "fetched_at": "2026-11-16T12:59:00.000Z"
+          },
+          {
+            "id": "Mystery-Group_five_hour",
+            "label": "5h Mystery-Group",
+            "kind": "session",
+            "scope": "Mystery-Group",
+            "used_percent": 41,
+            "resets_at": "2026-11-16T16:00:00.000Z",
+            "fetched_at": "2026-11-16T12:59:00.000Z"
+          },
+          {
+            "id": "codex_other_five_hour_primary",
+            "label": "Primary codex_other_five_hour",
+            "kind": "session",
+            "scope": "codex_other_five_hour",
+            "used_percent": 42,
+            "resets_at": "2026-11-16T16:00:00.000Z",
+            "fetched_at": "2026-11-16T12:59:00.000Z"
+          }
+        ]
+      }
+    },
+    "collector": "win-desktop"
+  },
+  "observations": [
+    {
+      "provider": "codex",
+      "window_id": "seven_day",
+      "resets_at": "2026-11-16T16:00:00.000Z",
+      "used_percent": 29,
+      "observed_at": "2026-11-16T12:59:00.000Z"
+    },
+    {
+      "provider": "codex",
+      "window_id": "codex_bengalfox_five_hour",
+      "resets_at": "2026-11-16T16:00:00.000Z",
+      "used_percent": 12,
+      "observed_at": "2026-11-16T12:59:00.000Z"
+    },
+    {
+      "provider": "codex",
+      "window_id": "mystery_group_five_hour",
+      "resets_at": "2026-11-16T16:00:00.000Z",
+      "used_percent": 40,
+      "observed_at": "2026-11-16T12:59:00.000Z"
+    },
+    {
+      "provider": "codex",
+      "window_id": "Mystery-Group_five_hour",
+      "resets_at": "2026-11-16T16:00:00.000Z",
+      "used_percent": 41,
+      "observed_at": "2026-11-16T12:59:00.000Z"
+    }
+  ]
+}

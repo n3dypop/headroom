@@ -1,5 +1,7 @@
 // Checks the server (Worker) applies when receiving a send from a PC. Pure functions with no D1 dependency.
 
+import type { Snapshot } from "./schema.ts";
+
 /**
  * Send sequence number (`seq`). The PC computes `max(previous seq + 1, current time in ms)` for each send and saves it locally.
  * It always exceeds the previous one even if the clock is turned back, and if the state is wiped it restarts from the
@@ -39,7 +41,7 @@ export function observationKey(
 }
 
 /**
- * Observation time used for calculations. Clamped to the **first receive time** so it never lies in the future even if the PC clock runs ahead.
+ * Observation time used for calculations. Clamped to the **first receive time** so it never lies in the future even if the PC clock runs a little ahead.
  * The first receive time is fixed when stored (not overwritten by resends), so resending doesn't change the calculation time.
  */
 export function effectiveObservedAt(observedAt: string, firstReceivedAt: string): string | null {
@@ -48,3 +50,16 @@ export function effectiveObservedAt(observedAt: string, firstReceivedAt: string)
   if (!Number.isFinite(at) || !Number.isFinite(received)) return null;
   return new Date(Math.min(at, received)).toISOString();
 }
+
+/**
+ * How far a PC's clock may be from the endpoint's: an upload whose send time (`generated_at`) differs from its receive time by more is
+ * refused, and the PC shows that its clock is off. Times from PCs are then used as they are
+ */
+export const CLOCK_TOLERANCE_MS = 2 * 60_000;
+
+/**
+ * After an account switch, a PC's values stamped within this span after the boundary may still be from before it: the accepting PC's
+ * clock may run behind and another PC's ahead, each by up to the tolerance plus the time a request takes (2 x (2 min + 20 s) = 4 min
+ * 40 s), so they are left out of history and of the latest values
+ */
+export const BOUNDARY_GUARD_MS = 5 * 60_000;

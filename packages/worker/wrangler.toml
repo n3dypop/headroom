@@ -19,6 +19,10 @@ migrations_dir = "migrations"
 COLLECTOR_PRIORITY = ""
 # Entry host name (e.g. headroom.<account-subdomain>.workers.dev). If unset, all requests are rejected
 ALLOWED_HOST = ""
+# This D1's share of the daily free-tier budget in percent (1-100, empty for 100). The free tier is per Cloudflare account:
+# if the account has another Headroom D1 (e.g. for testing), give each a share so they add up to 100 or less, each at least 13
+# (e.g. D1_BUDGET_PERCENT = "80" here and "20" for the other)
+D1_BUDGET_PERCENT = ""
 
 # Credentials are not written in wrangler.toml: npx wrangler secret put TOKENS -c wrangler.prod.toml (the value is a JSON array of scripts/new-token.ts output lines)
 

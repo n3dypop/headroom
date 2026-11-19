@@ -265,3 +265,91 @@ test("same fetch time and usage, but a changed reset time from the chosen observ
   assert.equal(judge([session(90, 13)], later.state, { now: 3, observations: rows(13) }).events.length, 0, "repeating the same observation adds nothing");
 });
 
+
+test("after an account switch, the new account's threshold is notified exactly once, even in the same or an earlier cycle", () => {
+  const judgeAt = (windows: UsageWindow[], state: EventState, now: number, stamp: string) => {
+    const snapshot = buildSnapshot({ claude: { ...emptyProvider("ok", null), collector: "win", windows } });
+    snapshot.collectors = [{ id: "win", generated_at: at(0), received_at: at(now) }];
+    const view = toView(snapshot, new Date(at(now)), { observations: [] });
+    return judgeEvents(view, state, { last_received_at: view.last_received_at }, new Date(at(now)), { boundaries: { claude: stamp } });
+  };
+  // The previous account crossed 80% in the cycle ending at 180
+  const old = judgeAt([session(85)], emptyEventState(), 1, "");
+  assert.deepEqual(visible(old.events), [`threshold:claude:five_hour:${at(180)}:80`]);
+  // Same cycle after the switch: notified again for the new account, under a new key
+  const sameCycle = judgeAt([session(82, 180, 10)], old.state, 11, "2026-11-16T12:09:00.000Z#1");
+  assert.deepEqual(visible(sameCycle.events), [`threshold:claude#1:five_hour:${at(180)}:80`]);
+  assert.equal(sameCycle.events.some((e) => e.body.kind === "reset"), false, "no reset for the previous account's cycle");
+  // Once only
+  const again = judgeAt([session(83, 180, 15)], sameCycle.state, 16, "2026-11-16T12:09:00.000Z#1");
+  assert.deepEqual(visible(again.events), []);
+  // A new account whose cycle resets earlier than the old one is judged, not taken for a late old value
+  const earlier = judgeAt([session(90, 120, 20)], old.state, 21, "2026-11-16T12:19:00.000Z#1");
+  assert.deepEqual(visible(earlier.events), [`threshold:claude#1:five_hour:${at(120)}:80`]);
+  // A state written before stamps were kept (by an older version) ...
+  const { boundaries: _b, switches: _s, ...legacyState } = old.state;
+  assert.equal("boundaries" in legacyState, false);
+  // ... keeps its keys when there was no switch since (no repeat after an upgrade)
+  const upgraded = judgeAt([session(86, 180, 5)], legacyState, 6, "");
+  assert.deepEqual(visible(upgraded.events), []);
+  assert.equal(upgraded.state.boundaries?.claude, "");
+  assert.deepEqual(visible(judgeAt([session(86, 180, 5)], legacyState, 6, "#0").events), [], "the server's stamp without a switch");
+  // ... but after a switch, even one accepted before its last judgment (it may have reached the server late), the new account
+  // starts afresh: notified once
+  const switched = judgeAt([session(82, 180, 10)], legacyState, 11, `${at(-30)}#1`);
+  // A boundary saved before the count existed ("<time>#0") is a switch too
+  assert.deepEqual(visible(judgeAt([session(82, 180, 10)], legacyState, 11, `${at(-30)}#0`).events), [`threshold:claude#1:five_hour:${at(180)}:80`]);
+  assert.deepEqual(visible(switched.events), [`threshold:claude#1:five_hour:${at(180)}:80`]);
+  assert.deepEqual(visible(judgeAt([session(83, 180, 15)], switched.state, 16, `${at(-30)}#1`).events), []);
+});
+
+test("a resend whose fetch time moved by seconds is the same fetch, even if the forecast changed", () => {
+  const first = judge([session(50, 180, 10)], emptyEventState(), { now: 11 });
+  const resend = judge([makeWindow("five_hour", 50, at(180), { fetched_at: new Date(Date.parse(at(10)) + 2_000).toISOString() })], first.state, { now: 12 });
+  assert.equal(resend.state.cycles["claude.five_hour"]?.judged_at, first.state.cycles["claude.five_hour"]?.judged_at);
+  assert.equal(first.state.cycles["claude.five_hour"]?.judged_by, "win");
+  // A new fetch with a new value is judged
+  const next = judge([session(85, 180, 15)], first.state, { now: 16 });
+  assert.deepEqual(visible(next.events), [`threshold:claude:five_hour:${at(180)}:80`]);
+});
+
+test("another PC's fetch at the same time with the same value is judged on its own", () => {
+  const snapshotFrom = (collector: string) => {
+    const snapshot = buildSnapshot({ claude: { ...emptyProvider("ok", null), collector, windows: [session(50, 180, 10)] } });
+    snapshot.collectors = [{ id: collector, generated_at: at(10), received_at: at(11) }];
+    return snapshot;
+  };
+  const now = new Date(at(11));
+  const a = judgeEvents(toView(snapshotFrom("a"), now, { observations: [] }), emptyEventState(), { last_received_at: at(11) }, now);
+  const b = judgeEvents(toView(snapshotFrom("b"), now, { observations: [] }), a.state, { last_received_at: at(11) }, now);
+  assert.equal(b.state.cycles["claude.five_hour"]?.judged_by, "b");
+});
+
+test("a state written before fetch times were placed in real time doesn't hold back a newer fetch", () => {
+  // The old version saved a fetch from a PC an hour ahead: 70% judged at 13:00 on that clock (12:00 real time)
+  const first = judge([session(70, 180, 0)], emptyEventState());
+  const cycle = first.state.cycles["claude.five_hour"]!;
+  const { judged_by: _, ...legacy } = { ...cycle, judged_at: at(60) };
+  const state: EventState = { ...first.state, cycles: { "claude.five_hour": legacy } };
+  // After the update, 96% fetched at 12:05 real time
+  const next = judge([session(96, 180, 5)], state, { now: 6 });
+  assert.deepEqual(visible(next.events), [`threshold:claude:five_hour:${at(180)}:95`]);
+  // Also when judged after that PC's old clock time (fetched 12:03, old record 12:04, judged at 12:05)
+  const close = { ...state, cycles: { "claude.five_hour": { ...legacy, judged_at: at(4) } } };
+  assert.deepEqual(visible(judge([session(96, 180, 3)], close, { now: 5 }).events), [`threshold:claude:five_hour:${at(180)}:95`]);
+});
+
+test("a state written before fetch times were placed in real time doesn't judge the same fetch again (even with more history)", () => {
+  const rows: UsageObservation[] = Array.from({ length: 12 }, (_, i) => ({
+    provider: "claude", window_id: "five_hour", collector: "win", resets_at: at(180),
+    used_percent: 30 + i * 5, observed_at: at(-60 + i * 5),
+  }));
+  const base = judge([session(90)], emptyEventState(), { observations: rows.slice(-1) });
+  const { judged_by: _, ...legacy } = { ...base.state.cycles["claude.five_hour"]!, judged_at: at(60) };
+  const state: EventState = { ...base.state, cycles: { "claude.five_hour": legacy } };
+  const late = judge([session(90)], state, { observations: rows, now: 5 });
+  assert.equal(late.events.filter((e) => e.body.kind === "soon").length, 0);
+  // The same fetch takes the state over, so a real new fetch with the same value is judged like a current state
+  assert.equal(late.state.cycles["claude.five_hour"]?.judged_by, "win");
+  assert.equal(late.state.cycles["claude.five_hour"]?.judged_at, at(0));
+});

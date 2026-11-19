@@ -7,6 +7,8 @@
 //! - Unsent observations are queued in `~/.headroom/outbox.json` (up to 24 hours / 5,000 entries) and removed once sent.
 //! - The send sequence number `seq` comes from `next_send_seq()`. The destination replaces each PC's latest value by this number.
 //! - On failure, wait from 1 minute, doubling up to 60 minutes. Observations in a request whose body is rejected (400, 413) are dropped (so the same body is not sent forever).
+//! - Only what the destination stores leaves the PC: the snapshot goes through `Snapshot::for_upload` (windows with unknown names
+//!   are dropped, labels and scopes are rebuilt from known names, error text is fixed) and observations of such windows are not queued.
 //! - Credentials are read from the OS credential store and never written to logs or files.
 //! - Redirects (3xx) are not followed; following them could send the credential header to another host.
 //! - 409 (observations stored, but `seq` was not above the stored one, so the latest value was not replaced) is not a success. Resend once
@@ -14,18 +16,20 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::config::{Config, explicit_collector_id};
 use crate::schedule::{TurnAsker, TurnReply};
-use crate::schema::{ErrorCode, ProviderSnapshot, Snapshot};
+use crate::schema::{ErrorCode, ProviderSnapshot, Snapshot, is_collision_id, sendable_scope};
 use crate::store::{Logger, backoff_ms, next_send_seq, read_json, write_json_atomic};
 use crate::time::{MINUTE_MS, iso_from_ms};
 
 pub const OUTBOX_FILE: &str = "outbox.json";
+/// Outbox format. 1: queued observations of collision ids are known to be windows that are sent
+const OUTBOX_VERSION: u32 = 1;
 const KEEP_MS: i64 = 24 * 60 * MINUTE_MS;
 /// A day of observations is 2 providers × 3 windows × 288 fetches ≈ 1,700. Up to 5,000 for headroom
 const MAX_QUEUED: usize = 5_000;
@@ -73,6 +77,35 @@ pub struct Outbox {
     pub last_result: Option<String>,
     /// provider → last seen `history_since`. When it changes, the observations queued so far belong to the previous account
     pub history_since: BTreeMap<String, String>,
+    /// Format version (`OUTBOX_VERSION`; 0 for a file written by an older version)
+    pub version: u32,
+    /// The destination refused the last send because this PC's clock is off. Until a send succeeds, this PC takes no fetch turn
+    /// (its values can't be delivered, so another PC should fetch)
+    pub clock_skewed: bool,
+}
+
+impl Outbox {
+    /// Reads the outbox. Observations an older version queued under a collision id may be of an unknown group (and once the window
+    /// is gone from the current values, nothing tells them apart), so they are dropped
+    fn load(path: &Path) -> Self {
+        // Without a readable file, this version starts a new outbox (its own queue is never taken for an older one)
+        Self::read(path).unwrap_or(Self {
+            version: OUTBOX_VERSION,
+            ..Self::default()
+        })
+    }
+
+    /// Reads the outbox as it will be sent (None if there is none). Also used by `headroom status`, so the count matches the queue
+    fn read(path: &Path) -> Option<Self> {
+        let mut outbox: Self = read_json(path)?;
+        if outbox.version < OUTBOX_VERSION {
+            outbox
+                .observations
+                .retain(|o| !is_collision_id(&o.window_id));
+            outbox.version = OUTBOX_VERSION;
+        }
+        Some(outbox)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -310,7 +343,7 @@ impl Pusher {
             log,
             transport,
             credentials,
-            outbox: read_json(&home.join(OUTBOX_FILE)).unwrap_or_default(),
+            outbox: Outbox::load(&home.join(OUTBOX_FILE)),
             dirty: true,
         }
     }
@@ -339,7 +372,7 @@ impl Pusher {
             if snap.error_code == Some(ErrorCode::AccountChanged) {
                 continue;
             }
-            for w in &snap.windows {
+            for w in snap.windows.iter().filter_map(|w| w.for_upload()) {
                 let Some(at) = &w.fetched_at else { continue };
                 let key = format!("{provider}.{}", w.id);
                 let last = self.outbox.last_observed.get(&key);
@@ -355,7 +388,7 @@ impl Pusher {
                 modified = true;
                 self.outbox.observations.push(Observation {
                     provider: provider.clone(),
-                    window_id: w.id.clone(),
+                    window_id: w.id,
                     resets_at: w.resets_at.clone(),
                     used_percent: w.used_percent,
                     observed_at: at.clone(),
@@ -382,6 +415,11 @@ impl Pusher {
             self.log
                 .log("Cannot write outbox.json (unsent observations may be lost on restart)");
         }
+    }
+
+    /// The destination refused the last send because this PC's clock is off
+    pub fn clock_skewed(&self) -> bool {
+        self.outbox.clock_skewed
     }
 
     /// Next send time. With nothing to send, 15 minutes after the last success (liveness resend; i64::MAX if never succeeded)
@@ -431,21 +469,50 @@ impl Pusher {
     // Every branch ends with return so each reply's result is written the same way
     #[allow(clippy::needless_return)]
     pub fn push(&mut self, snapshot: &Snapshot, now: i64) {
+        // Times saved while the clock ran ahead (it has since been set back) don't hold the next send back
+        self.outbox.last_attempt_ms = self.outbox.last_attempt_ms.map(|t| t.min(now));
+        self.outbox.last_success_ms = self.outbox.last_success_ms.map(|t| t.min(now));
         if self.due_ms() > now {
             return;
         }
+        let started = Instant::now();
         let headers = match self.auth_headers() {
             Ok(h) => h,
             Err(reason) => return self.finish(now, false, &reason),
         };
         let headers: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (*k, v.as_str())).collect();
         {
+            // Observations queued by an older version may name windows that are no longer sent: ids of another shape, and
+            // windows the current values show to be something else (e.g. an unknown group whose id contains a known name)
+            let refused: Vec<(String, String)> = snapshot
+                .providers
+                .iter()
+                .flat_map(|(p, s)| {
+                    s.windows
+                        .iter()
+                        .filter(|w| w.for_upload().is_none())
+                        .map(move |w| (p.clone(), w.id.clone()))
+                })
+                .collect();
+            self.outbox.observations.retain(|o| {
+                sendable_scope(&o.window_id).is_some()
+                    && !refused
+                        .iter()
+                        .any(|(p, id)| *p == o.provider && *id == o.window_id)
+            });
             let count = self.outbox.observations.len().min(MAX_PER_REQUEST);
             let seq = next_send_seq(self.outbox.last_seq, now);
             self.outbox.last_seq = Some(seq);
+            // The send time is stamped when the request goes out (reading the credentials may have waited), so the destination's
+            // clock check sees only the request time
+            let mut upload = snapshot.for_upload();
+            let waited_s = started.elapsed().as_secs() as i64;
+            if waited_s > 0 {
+                upload.generated_at = iso_from_ms(now.saturating_add(waited_s * 1000));
+            }
             let body = json!({
                 "seq": seq,
-                "snapshot": snapshot,
+                "snapshot": upload,
                 "observations": &self.outbox.observations[..count],
             })
             .to_string();
@@ -455,6 +522,7 @@ impl Pusher {
                 .map(|(status, text)| (*status, text.as_str()))
             {
                 Ok((200..=299, _)) => {
+                    self.outbox.clock_skewed = false;
                     // One request per send. Remaining observations go 1 minute later (one send per minute)
                     self.outbox.observations.drain(..count);
                     self.dirty = false;
@@ -485,6 +553,26 @@ impl Pusher {
                         now,
                         false,
                         "The destination rejected the body (400, 413). Dropped the observations",
+                    );
+                }
+                Ok((422, text)) if text.contains("clock_skew") => {
+                    // This PC's clock is off by more than the destination allows, so its times can't be used. The queued observations
+                    // were stamped by that clock, so they are dropped (once the clock is fixed they would pass as new values).
+                    // The latest value is sent again with the usual backoff
+                    self.outbox.observations.clear();
+                    self.outbox.clock_skewed = true;
+                    let offset_s = serde_json::from_str::<serde_json::Value>(text)
+                        .ok()
+                        .and_then(|v| v["offset_s"].as_i64())
+                        .unwrap_or(0);
+                    let minutes = (offset_s.abs() + 30) / 60;
+                    let way = if offset_s >= 0 { "ahead of" } else { "behind" };
+                    return self.finish(
+                        now,
+                        false,
+                        &format!(
+                            "Not accepted: this PC's clock is about {minutes} min {way} the destination's. Set the clock automatically (sync it), then it is sent again"
+                        ),
                     );
                 }
                 Ok((401 | 403, _)) => {
@@ -523,7 +611,7 @@ impl Pusher {
     }
 
     pub fn status_line(home: &Path) -> Option<String> {
-        let o: Outbox = read_json(&home.join(OUTBOX_FILE))?;
+        let o = Outbox::read(&home.join(OUTBOX_FILE))?;
         Some(format!(
             "Push: {} unsent observations / {} consecutive failures / last result {} / last success {}",
             o.observations.len(),
@@ -545,6 +633,10 @@ impl TurnAsker for Pusher {
     /// Asks the destination for the turn. None if unreachable, no credentials, or the answer is unreadable (this PC fetches itself).
     /// Not counted in the push state (failure count, backoff)
     fn ask_turn(&mut self, provider: &str, minutes: i64) -> Option<TurnReply> {
+        // While the destination refuses this PC's clock, it takes no turn (it can still hand one back)
+        if minutes > 0 && self.outbox.clock_skewed {
+            return None;
+        }
         let headers = self.auth_headers().ok()?;
         let headers: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (*k, v.as_str())).collect();
         let body = json!({ provider: minutes }).to_string();
@@ -796,6 +888,152 @@ mod tests {
     }
 
     #[test]
+    fn only_known_names_leave_the_pc() {
+        let h = home("d11");
+        let t = FakeTransport::default();
+        let mut p = pusher(&h, &t, Ok(creds()));
+        let mut l = latest(10.0, NOW, None);
+        let claude = l.get_mut("claude").unwrap();
+        claude.error = Some("denied for Acme Corp".into());
+        claude.plan = Some("Acme Corp plan".into());
+        let mut model = make_window("seven_day_opus", 5.0, None).with_fetched_ms(NOW);
+        model.scope = Some("Opus".into());
+        model.label = "Weekly Acme Corp".into();
+        let mut unknown_model = make_window("seven_day_acme_corp", 5.0, None).with_fetched_ms(NOW);
+        unknown_model.scope = Some("Acme Corp".into());
+        let mut unknown_heading = make_window("acme_corp_pool", 5.0, None).with_fetched_ms(NOW);
+        unknown_heading.label = "Acme Corp pool".into();
+        let mut unknown_group = make_window("acme_five_hour", 5.0, None).with_fetched_ms(NOW);
+        unknown_group.scope = Some("acme".into());
+        let bad_id = make_window("Acme-Corp", 5.0, None).with_fetched_ms(NOW);
+        claude
+            .windows
+            .extend([model, unknown_model, unknown_heading, unknown_group, bad_id]);
+        // An observation queued by an older version for a window that is no longer sent
+        p.outbox.observations.push(Observation {
+            provider: "claude".into(),
+            window_id: "acme_corp_pool".into(),
+            resets_at: None,
+            used_percent: 1.0,
+            observed_at: iso_from_ms(NOW - MINUTE_MS),
+        });
+        p.record(&l, true, NOW);
+        p.push(&snapshot(&l), NOW);
+        let s = t.0.lock().unwrap();
+        let body = s.bodies[0].to_string();
+        assert!(!body.to_ascii_lowercase().contains("acme"), "{body}");
+        let windows = &s.bodies[0]["snapshot"]["providers"]["claude"]["windows"];
+        let ids: Vec<_> = windows
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|w| w["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, ["five_hour", "seven_day_opus"]);
+        assert_eq!(windows[1]["scope"], "Opus");
+        assert_eq!(windows[1]["label"], "Weekly Opus");
+        let claude = &s.bodies[0]["snapshot"]["providers"]["claude"];
+        assert_eq!(claude["plan"], serde_json::Value::Null);
+        assert_eq!(claude["error"], crate::schema::WITHHELD_ERROR);
+        let observed: Vec<_> = s.bodies[0]["observations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|o| o["window_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(observed, ["five_hour", "seven_day_opus"]);
+    }
+
+    #[test]
+    fn queued_observations_of_windows_not_sent_are_dropped() {
+        let h = home("queued-unknown");
+        let t = FakeTransport::default();
+        let mut p = pusher(&h, &t, Ok(creds()));
+        let mut l = latest(10.0, NOW, None);
+        // An unknown group whose id contains a known group's name
+        let mut lookalike =
+            make_window("codex_other_five_hour_primary", 5.0, None).with_fetched_ms(NOW);
+        lookalike.scope = Some("codex_other_five_hour".into());
+        let mut codex = ProviderSnapshot::empty(ProviderStatus::Ok, "", None);
+        codex.error = None;
+        codex.windows = vec![lookalike];
+        l.insert("codex".into(), codex);
+        // Queued by an older version that sent it
+        p.outbox.observations.push(Observation {
+            provider: "codex".into(),
+            window_id: "codex_other_five_hour_primary".into(),
+            resets_at: None,
+            used_percent: 5.0,
+            observed_at: iso_from_ms(NOW - MINUTE_MS),
+        });
+        p.record(&l, true, NOW);
+        p.push(&snapshot(&l), NOW);
+        let s = t.0.lock().unwrap();
+        let ids: Vec<_> = s.bodies[0]["observations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|o| o["window_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, ["five_hour"]);
+    }
+
+    #[test]
+    fn an_older_outbox_drops_queued_collision_ids_only() {
+        let h = home("legacy-outbox");
+        let queued = |id: &str| Observation {
+            provider: "codex".into(),
+            window_id: id.into(),
+            resets_at: None,
+            used_percent: 5.0,
+            observed_at: iso_from_ms(NOW - MINUTE_MS),
+        };
+        let old = serde_json::json!({
+            "observations": [queued("five_hour"), queued("codex_other_five_hour_primary"), queued("codex_other_five_hour")],
+        });
+        std::fs::write(h.join(OUTBOX_FILE), old.to_string()).unwrap();
+        let t = FakeTransport::default();
+        let p = pusher(&h, &t, Ok(creds()));
+        let ids: Vec<_> = p
+            .outbox
+            .observations
+            .iter()
+            .map(|o| o.window_id.as_str())
+            .collect();
+        assert_eq!(ids, ["five_hour", "codex_other_five_hour"]);
+        assert_eq!(p.outbox.version, OUTBOX_VERSION);
+        assert!(
+            Pusher::status_line(&h)
+                .unwrap()
+                .starts_with("Push: 2 unsent observations")
+        );
+        // A new outbox is written as this version, so its own collision ids survive a restart
+        let fresh = home("fresh-outbox");
+        let t2 = FakeTransport::default();
+        let mut p2 = pusher(&fresh, &t2, Ok(creds()));
+        assert_eq!(p2.outbox.version, OUTBOX_VERSION);
+        p2.outbox
+            .observations
+            .push(queued("codex_other_five_hour_primary"));
+        p2.save();
+        assert_eq!(Outbox::load(&fresh.join(OUTBOX_FILE)).observations.len(), 1);
+        // Written by this version: kept
+        let mut current = Outbox {
+            version: OUTBOX_VERSION,
+            ..Outbox::default()
+        };
+        current
+            .observations
+            .push(queued("codex_other_five_hour_primary"));
+        std::fs::write(
+            h.join(OUTBOX_FILE),
+            serde_json::to_string(&current).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(Outbox::load(&h.join(OUTBOX_FILE)).observations.len(), 1);
+    }
+
+    #[test]
     fn failures_keep_the_queue_and_back_off_then_resend_with_a_new_seq() {
         let h = home("retry");
         let t = FakeTransport::default();
@@ -824,6 +1062,42 @@ mod tests {
         drop(s);
         assert!(p2.outbox.observations.is_empty());
         assert_eq!(p2.outbox.failures, 0);
+        let _ = std::fs::remove_dir_all(h);
+    }
+
+    #[test]
+    fn a_clock_refusal_drops_the_queue_and_says_how_far_the_clock_is_off() {
+        let h = home("clock-skew");
+        let t = FakeTransport::default();
+        {
+            let mut s = t.0.lock().unwrap();
+            s.replies = vec![Ok(422)];
+            s.reply_bodies = vec![r#"{"error":"clock_skew","offset_s":-430}"#.into()];
+        }
+        let mut p = pusher(&h, &t, Ok(creds()));
+        p.record(&latest(10.0, NOW, None), true, NOW);
+        p.push(&snapshot(&latest(10.0, NOW, None)), NOW);
+        assert!(
+            p.outbox.observations.is_empty(),
+            "stamped by the wrong clock, so dropped"
+        );
+        assert!(p.outbox.clock_skewed);
+        assert_eq!(p.outbox.failures, 1);
+        let result = p.outbox.last_result.clone().unwrap();
+        assert!(result.contains("about 7 min behind"), "{result}");
+        // No turn is taken while refused (handing one back still goes out)
+        assert!(p.ask_turn("claude", 7).is_none());
+        assert!(t.0.lock().unwrap().posts.is_empty());
+        // The clock was an hour ahead when it was refused; once set back, the next send isn't held back by that time
+        p.outbox.last_attempt_ms = Some(NOW + 60 * MINUTE_MS);
+        p.push(&snapshot(&latest(10.0, NOW, None)), NOW + 2 * MINUTE_MS);
+        p.push(&snapshot(&latest(10.0, NOW, None)), NOW + 3 * MINUTE_MS);
+        assert_eq!(
+            t.0.lock().unwrap().bodies.len(),
+            2,
+            "sent again after the backoff"
+        );
+        assert!(!p.clock_skewed(), "accepted, so turns can be taken again");
         let _ = std::fs::remove_dir_all(h);
     }
 

@@ -5,7 +5,7 @@ import { test } from "node:test";
 import { nextSendSeq, type Snapshot } from "../../core/src/index.ts";
 import { MAX_COLLECTORS, parseTokens, sha256Hex } from "../src/auth.ts";
 import { handle, refreshDerived, repairPublicState, runCron, type Env } from "../src/index.ts";
-import { DAILY_BUDGET, RESERVE, daysToReserve, endOfDays, reserve, settle } from "../src/budget.ts";
+import { DAILY_BUDGET, MIN_BUDGET_PERCENT, RESERVE, budgetLimit, daysToReserve, endOfDays, reserve, settle } from "../src/budget.ts";
 import { MAX_WINDOWS, WITHHELD_ERROR } from "../src/sanitize.ts";
 import { sanitizeUpload } from "../src/sanitize.ts";
 import { EVENT_FEED_SQL, MAX_STORED_COLLECTORS, PRUNE_EVENTS, PRUNE_ROWS, dataVersionOf, loadObservations, loadPublicRow, prune, rebuildEventFeed, saveDerived, savePublicState, saveUpload, saveWeekly, loadWeekly, type D1Like } from "../src/store.ts";
@@ -39,13 +39,27 @@ async function setup() {
           ...(token ? { authorization: `Bearer ${token}` } : {}),
           ...(body !== undefined ? { "content-type": "application/json" } : {}),
         },
-        body: body === undefined ? undefined : typeof body === "string" ? body : JSON.stringify(body),
+        body: body === undefined ? undefined : typeof body === "string" ? body : JSON.stringify(sentAt(body, at)),
       }),
       env,
       () => at,
     );
   return { raw, db, call, env };
 }
+
+/**
+ * Uploads in tests are sent by a PC with a right clock: the send time is the receive time, unless the test keeps its own
+ * (`keepClock`, to test a PC whose clock is off). Values stamped after the send time are then dropped by the endpoint
+ */
+function sentAt(body: unknown, at: Date): unknown {
+  if (typeof body !== "object" || body === null || !("snapshot" in body)) return body;
+  const { keepClock, ...rest } = body as { keepClock?: boolean; snapshot: unknown };
+  if (keepClock || typeof rest.snapshot !== "object" || rest.snapshot === null) return rest;
+  return { ...rest, snapshot: { ...rest.snapshot, generated_at: at.toISOString() } };
+}
+
+/** An upload sent as it is (its own send time), for a PC whose clock is off */
+const skewed = <T extends object>(u: T): T & { keepClock: true } => ({ ...u, keepClock: true });
 
 function upload(seq: number, snapshot: Snapshot = fixture(), observations: unknown[] = []) {
   return { seq, snapshot, observations };
@@ -171,6 +185,60 @@ test("short identifiers that can't be told apart by shape are not stored unless 
   assert.equal(merged.providers.codex?.plan, "prolite", "known plan names remain");
 });
 
+test("a window id of another shape drops only that window and its observations", async () => {
+  const { call, raw } = await setup();
+  const snap = fixture() as unknown as Record<string, any>;
+  snap.providers.codex.windows.push({ ...snap.providers.codex.windows[0], id: "Mystery-Group_five_hour", scope: "Mystery-Group" });
+  snap.providers.codex.windows.push({ ...snap.providers.codex.windows[0], id: "x".repeat(80), scope: null });
+  const observations = [
+    obs("five_hour", 10, "2026-11-16T12:59:00Z"),
+    { ...obs("five_hour", 10, "2026-11-16T12:59:00Z"), provider: "codex", window_id: "Mystery-Group_five_hour" },
+    { ...obs("five_hour", 10, "2026-11-16T12:59:00Z"), provider: "codex", window_id: "seven_day" },
+  ];
+  assert.equal((await call("PUT", "/v2/snapshots/mac", MAC, upload(1, snap as Snapshot, observations))).status, 204);
+  const merged = (await (await call("GET", "/v2/snapshot", READ)).json()) as Snapshot;
+  assert.deepEqual(
+    merged.providers.codex?.windows.map((w) => w.id),
+    (fixture().providers.codex?.windows ?? []).map((w) => w.id),
+    "the known windows of the same upload are stored",
+  );
+  const stored = raw.prepare("SELECT provider, window_id FROM observations ORDER BY provider, window_id").all() as { provider: string; window_id: string }[];
+  assert.deepEqual(stored.map((r) => `${r.provider}.${r.window_id}`), ["claude.five_hour", "codex.seven_day"]);
+  assert.equal(dumpAll(raw).includes("Mystery"), false);
+});
+
+test("an older PC's limit flag set only by extra usage is not stored as a reached limit", async () => {
+  const { call } = await setup();
+  const snap = fixture();
+  const claude = snap.providers.claude!;
+  claude.windows = claude.windows.map((w) => ({ ...w, used_percent: 20 }));
+  claude.windows.push({ ...claude.windows[0]!, id: "extra_usage", label: "Extra usage", kind: "other", scope: null, used_percent: 100 });
+  claude.blocked = true;
+  assert.equal((await call("PUT", "/v2/snapshots/mac", MAC, upload(1, snap))).status, 204);
+  const merged = (await (await call("GET", "/v2/snapshot", READ)).json()) as Snapshot;
+  assert.equal(merged.providers.claude?.blocked, null);
+  assert.equal(merged.providers.claude?.windows.some((w) => w.id === "extra_usage"), false);
+  // A stored overall window at the limit keeps the flag
+  const full = fixture();
+  full.providers.claude!.windows[0]!.used_percent = 100;
+  full.providers.claude!.windows.push({ ...full.providers.claude!.windows[0]!, id: "extra_usage", kind: "other", scope: null });
+  full.providers.claude!.blocked = true;
+  assert.equal((await call("PUT", "/v2/snapshots/mac", MAC, upload(2, full))).status, 204);
+  const again = (await (await call("GET", "/v2/snapshot", READ)).json()) as Snapshot;
+  assert.equal(again.providers.claude?.blocked, true);
+});
+
+test("the shared upload with an unknown group (also read by the agent's tests) keeps the known windows and observations", async () => {
+  const { call, raw } = await setup();
+  const body = JSON.parse(readFileSync(new URL("../../../fixtures/snapshot/upload-unknown-group.json", import.meta.url), "utf8"));
+  assert.equal((await call("PUT", "/v2/snapshots/win-desktop", WIN, body)).status, 204);
+  const merged = (await (await call("GET", "/v2/snapshot", READ)).json()) as Snapshot;
+  assert.deepEqual(merged.providers.codex?.windows.map((w) => w.id), ["seven_day", "codex_other_seven_day", "codex_bengalfox_five_hour"]);
+  const stored = raw.prepare("SELECT window_id FROM observations WHERE provider = 'codex' ORDER BY window_id").all() as { window_id: string }[];
+  assert.deepEqual(stored.map((r) => r.window_id), ["codex_bengalfox_five_hour", "seven_day"]);
+  assert.equal(dumpAll(raw).toLowerCase().includes("mystery"), false);
+});
+
 test("window id parsing and labels", async () => {
   const { parseWindowId, windowLabel } = await import("../src/sanitize.ts");
   const label = (id: string) => {
@@ -183,7 +251,9 @@ test("window id parsing and labels", async () => {
   assert.deepEqual(label("codex_other_seven_day"), ["codex_other", "Weekly codex_other"]);
   assert.deepEqual(label("window_300m"), [null, "5h"]);
   assert.deepEqual(label("window_90m"), [null, "90m"]);
-  assert.deepEqual(label("extra_usage"), [null, "Extra usage"]);
+  // Extra usage and spend limits are not usage-limit windows
+  assert.equal(label("extra_usage"), null);
+  assert.equal(label("spend_limit"), null);
   // Codex limits of unknown duration, and the suffixes that avoid collisions
   assert.deepEqual(label("primary"), [null, "Primary"]);
   assert.deepEqual(label("secondary"), [null, "Secondary"]);
@@ -194,7 +264,7 @@ test("window id parsing and labels", async () => {
   // Not tied to a model name; labeled so it is distinguishable from the overall limit
   assert.deepEqual(label("codex_bengalfox_five_hour"), ["Codex extra", "5h Codex extra"]);
   assert.deepEqual(label("codex_bengalfox_seven_day"), ["Codex extra", "Weekly Codex extra"]);
-  for (const id of ["current_session_usage_for_acme", "seven_day_acme7x", "acme_seven_day", "acct_9f3e1", "seven_day-x"]) {
+  for (const id of ["current_session_usage_for_acme", "seven_day_acme7x", "acme_seven_day", "acct_9f3e1", "seven_day-x", "Codex-Bengalfox_five_hour", "seven_day_opus_4", "seven_day_2"]) {
     assert.equal(parseWindowId(id), null, id);
   }
 });
@@ -253,9 +323,10 @@ test("a PC that lost its local state learns the saved seq from 409 and can resen
 
 test("a resent observation is stored once; computation time is clamped to the first received time", async () => {
   const { call, raw } = await setup();
-  const future = obs("five_hour", 12, "2026-11-16T13:05:00.000Z"); // PC whose clock is 5 minutes ahead
-  await call("PUT", "/v2/snapshots/mac", MAC, upload(1, fixture(), [future]), new Date("2026-11-16T13:00:00Z"));
-  await call("PUT", "/v2/snapshots/mac", MAC, upload(2, fixture(), [future]), new Date("2026-11-16T13:01:00Z"));
+  const ahead = obs("five_hour", 12, "2026-11-16T13:01:00.000Z"); // PC whose clock is a minute ahead (within the tolerance)
+  const s = snapAt("2026-11-16T13:01:00.000Z");
+  await call("PUT", "/v2/snapshots/mac", MAC, skewed(upload(1, s, [ahead])), new Date("2026-11-16T13:00:00Z"));
+  await call("PUT", "/v2/snapshots/mac", MAC, skewed(upload(2, { ...s, generated_at: "2026-11-16T13:02:00.000Z" }, [ahead])), new Date("2026-11-16T13:01:00Z"));
   const rows = raw.prepare("SELECT observed_at, first_received_at FROM observations").all() as Record<string, string>[];
   assert.equal(rows.length, 1);
   assert.equal(rows[0]?.first_received_at, "2026-11-16T13:00:00.000Z");
@@ -290,13 +361,10 @@ test("after accepting a switch, the previous account's observations are dropped 
   // Previous-account observations left over from a network outage are not stored even if they arrive late
   await call("PUT", "/v2/snapshots/win-desktop", WIN, upload(3, fixture(), [obs("five_hour", 62, "2026-11-16T12:20:00Z")]));
   assert.equal(await count("claude"), 1);
-  // A resend of an old upload (seq not above the saved one) with an earlier boundary, or a boundary too far in the future, deletes nothing
+  // A resend of an old upload (seq not above the saved one) with an earlier boundary deletes nothing
   const older = fixture();
   older.providers.claude!.history_since = "2026-11-16T12:10:00.000Z";
   await call("PUT", "/v2/snapshots/mac", MAC, upload(1, older, [obs("five_hour", 4, "2026-11-16T12:50:00Z")]));
-  const future = fixture();
-  future.providers.claude!.history_since = "2026-11-17T12:00:00.000Z";
-  await call("PUT", "/v2/snapshots/mac", MAC, upload(4, future));
   assert.equal(await count("claude"), 2);
   assert.deepEqual(raw.prepare("SELECT provider, since FROM history_boundaries").all().map((r) => ({ ...r })), [
     { provider: "claude", since: "2026-11-16T12:30:00.000Z" },
@@ -361,9 +429,10 @@ test("even if another request advances the boundary after it was read, an old re
 
 test("old observations from a PC with a fast clock are treated as before the boundary using the first received time", async () => {
   const { db, call, raw } = await setup();
-  // Observation time recorded as 12:40, but it actually arrived at 12:20 (clock 20 minutes ahead)
-  await call("PUT", "/v2/snapshots/win-desktop", WIN, upload(1, fixture(), [obs("five_hour", 60, "2026-11-16T12:40:00Z")]),
-    new Date("2026-11-16T12:20:00Z"));
+  // Observation time recorded as 12:31, but it actually arrived at 12:29:30 (clock 90 seconds ahead, within the tolerance)
+  await call("PUT", "/v2/snapshots/win-desktop", WIN, skewed(upload(1, snapAt("2026-11-16T12:31:00.000Z"), [obs("five_hour", 60, "2026-11-16T12:31:00Z")])),
+    new Date("2026-11-16T12:29:30Z"));
+  assert.equal((raw.prepare("SELECT COUNT(*) AS n FROM observations").get() as { n: number }).n, 1, "stored before the switch");
   const accepted = fixture();
   accepted.providers.claude!.history_since = "2026-11-16T12:30:00.000Z";
   await call("PUT", "/v2/snapshots/mac", MAC, upload(1, accepted), new Date("2026-11-16T12:31:00Z"));
@@ -384,63 +453,145 @@ test("old observations from a PC with a fast clock are treated as before the bou
 test("observations deleted by the boundary don't come back when resent (even with a newer received time); same for current-value windows", async () => {
   const { db, call, raw } = await setup();
   const count = () => (raw.prepare("SELECT COUNT(*) AS n FROM observations").get() as { n: number }).n;
-  // PC with a clock 20 minutes ahead (recorded 12:40, arrived 12:20). The current-value window is also fetched at 12:40
-  const skewed = fixture();
-  skewed.providers.claude!.fetched_at = "2026-11-16T12:40:00.000Z";
-  for (const w of skewed.providers.claude!.windows) w.fetched_at = "2026-11-16T12:40:00.000Z";
-  const old = upload(1, skewed, [obs("five_hour", 60, "2026-11-16T12:40:00Z")]);
-  await call("PUT", "/v2/snapshots/win-desktop", WIN, old, new Date("2026-11-16T12:20:00Z"));
+  // PC with a clock a minute ahead: fetched 12:30:40 on its clock, received 12:29:40 (before the switch)
+  const ahead = snapAt("2026-11-16T12:30:40.000Z");
+  const old = skewed(upload(1, ahead, [obs("five_hour", 60, "2026-11-16T12:30:40Z")]));
+  await call("PUT", "/v2/snapshots/win-desktop", WIN, old, new Date("2026-11-16T12:29:40Z"));
   const accepted = fixture();
   accepted.providers.claude = { ...accepted.providers.claude!, windows: [], fetched_at: null, history_since: "2026-11-16T12:30:00.000Z" };
   await call("PUT", "/v2/snapshots/mac", MAC, upload(1, accepted), new Date("2026-11-16T12:30:00Z"));
   await prune(db, NOW); // Observations before the boundary are filtered on read; Cron deletes them gradually
   assert.equal(count(), 0);
-  // Resend of the same observation and current value (arrives at 12:31)
-  await call("PUT", "/v2/snapshots/win-desktop", WIN, { ...old, seq: 2 }, new Date("2026-11-16T12:31:00Z"));
-  assert.equal(count(), 0, "deleted observations don't come back");
+  // Resend of the same observation and current value (arrives at 12:31; the PC sends at 12:32 on its clock)
+  await call("PUT", "/v2/snapshots/win-desktop", WIN, skewed({ ...old, seq: 2, snapshot: { ...ahead, generated_at: "2026-11-16T12:32:00.000Z" } }), new Date("2026-11-16T12:31:00Z"));
+  assert.equal(count(), 0, "deleted observations don't come back (stamped within the guard after the boundary)");
   const merged = (await (await call("GET", "/v2/snapshot", READ, undefined, new Date("2026-11-16T12:32:00Z"))).json()) as Snapshot;
   assert.equal(merged.providers.claude?.windows.length ?? 0, 0, "the previous account's current-value windows are not shown");
-  // Observations after the marker in that PC's clock (new fetches) are stored
-  await call("PUT", "/v2/snapshots/win-desktop", WIN, upload(3, fixture(), [obs("five_hour", 5, "2026-11-16T12:55:00Z")]),
+  // New fetches after the guard are stored
+  await call("PUT", "/v2/snapshots/win-desktop", WIN, upload(3, snapAt("2026-11-16T12:35:00.000Z"), [obs("five_hour", 5, "2026-11-16T12:35:00Z")]),
     new Date("2026-11-16T12:36:00Z"));
   assert.equal(count(), 1);
 });
 
 test("the next switch after a clock fix also creates a new boundary, and a resend of an old upload doesn't roll it back", async () => {
   const { db, call, raw } = await setup();
-  const count = () => (raw.prepare("SELECT COUNT(*) AS n FROM observations").get() as { n: number }).n;
+  const visible = async () => (await loadObservations(db, "claude", new Date(0))).length;
   const accept = (since: string) => {
     const s = fixture();
     s.providers.claude!.history_since = since;
     return s;
   };
-  // First switch: a PC with a fast clock sends 12:45 (arrives at 12:40)
+  // First switch: the PC reports 12:45 (arrives at 12:40; the boundary is held to the received time)
   await call("PUT", "/v2/snapshots/mac", MAC, upload(1, accept("2026-11-16T12:45:00.000Z")), new Date("2026-11-16T12:40:00Z"));
   // Observation of the new account
-  await call("PUT", "/v2/snapshots/win-desktop", WIN, upload(1, fixture(), [obs("five_hour", 7, "2026-11-16T12:41:00Z")]),
-    new Date("2026-11-16T12:41:00Z"));
-  assert.equal(count(), 1);
-  // Second switch after fixing the clock (sends 12:42, smaller than before)
-  await call("PUT", "/v2/snapshots/mac", MAC, upload(2, accept("2026-11-16T12:42:00.000Z")), new Date("2026-11-16T12:42:30Z"));
-  await prune(db, NOW); // Observations before the boundary are filtered on read; Cron deletes them gradually
-  assert.equal(count(), 0, "the immediately previous account's history is deleted");
+  await call("PUT", "/v2/snapshots/win-desktop", WIN, upload(1, snapAt("2026-11-16T12:46:00.000Z"), [obs("five_hour", 7, "2026-11-16T12:46:00Z")]),
+    new Date("2026-11-16T12:46:00Z"));
+  assert.equal(await visible(), 1);
+  // Second switch after fixing the clock (reports 12:42, smaller than before)
+  await call("PUT", "/v2/snapshots/mac", MAC, upload(2, accept("2026-11-16T12:42:00.000Z")), new Date("2026-11-16T12:47:00Z"));
+  await prune(db, NOW);
+  assert.equal(await visible(), 0, "the immediately previous account's history is not shown");
   assert.equal((raw.prepare("SELECT since FROM history_boundaries").get() as { since: string }).since, "2026-11-16T12:42:00.000Z");
   // A resend of the first upload doesn't bring it back
-  await call("PUT", "/v2/snapshots/mac", MAC, upload(1, accept("2026-11-16T12:45:00.000Z")), new Date("2026-11-16T12:43:00Z"));
+  await call("PUT", "/v2/snapshots/mac", MAC, upload(1, accept("2026-11-16T12:45:00.000Z")), new Date("2026-11-16T12:48:00Z"));
   assert.equal((raw.prepare("SELECT source FROM boundary_sources").get() as { source: string }).source, "2026-11-16T12:42:00.000Z");
+});
+
+test("an acceptance time ahead of the received time (recorded while the clock ran ahead) makes the boundary at the received time", async () => {
+  const { call, raw } = await setup();
+  const accepted = fixture();
+  accepted.providers.claude!.history_since = "2026-11-17T12:00:00.000Z";
+  assert.equal((await call("PUT", "/v2/snapshots/mac", MAC, upload(1, accepted))).status, 204);
+  assert.deepEqual(raw.prepare("SELECT since, collector FROM history_boundaries").all().map((r) => ({ ...r })),
+    [{ since: NOW.toISOString(), collector: "mac" }]);
+});
+
+test("a later acceptance that lands on the same boundary time becomes the setting PC", async () => {
+  const { call } = await setup();
+  // mac accepts a switch at 11:59:40 (received 12:00) and fetches 94% of that account
+  const first = snapAt("2026-11-16T12:00:00.000Z");
+  first.providers.claude!.history_since = "2026-11-16T11:59:40.000Z";
+  first.providers.claude!.windows[0]!.used_percent = 94;
+  await call("PUT", "/v2/snapshots/mac", MAC, upload(1, first), new Date("2026-11-16T12:00:00Z"));
+  // win-desktop accepts the next switch; its boundary is held to the same received time 12:00
+  const second = snapAt("2026-11-16T12:00:00.000Z");
+  second.providers.claude!.history_since = "2026-11-16T12:00:30.000Z";
+  second.providers.claude!.windows[0]!.used_percent = 7;
+  await call("PUT", "/v2/snapshots/win-desktop", WIN, upload(1, second), new Date("2026-11-16T12:00:00Z"));
+  const merged = (await (await call("GET", "/v2/snapshot", READ, undefined, new Date("2026-11-16T12:01:00Z"))).json()) as Snapshot;
+  assert.equal(merged.providers.claude?.collector, "win-desktop");
+  assert.equal(merged.providers.claude?.windows.some((w) => w.used_percent === 94), false);
+});
+
+test("a re-acceptance raised to the received time keeps the accepting PC's own new windows", async () => {
+  const { call } = await setup();
+  const first = snapAt("2026-11-16T12:00:00.000Z");
+  first.providers.claude!.history_since = "2026-11-16T12:00:00.000Z";
+  await call("PUT", "/v2/snapshots/mac", MAC, upload(1, first), new Date("2026-11-16T12:00:00Z"));
+  // win-desktop re-accepts at 11:59 (before the current boundary, so the boundary is raised to the received time 12:01:30), fetched 11:59:15
+  const again = snapAt("2026-11-16T11:59:15.000Z");
+  again.providers.claude!.history_since = "2026-11-16T11:59:00.000Z";
+  again.generated_at = "2026-11-16T11:59:30.000Z";
+  assert.equal((await call("PUT", "/v2/snapshots/win-desktop", WIN, skewed(upload(1, again)), new Date("2026-11-16T12:01:30Z"))).status, 204);
+  const merged = (await (await call("GET", "/v2/snapshot", READ, undefined, new Date("2026-11-16T12:02:00Z"))).json()) as Snapshot;
+  assert.equal(merged.providers.claude?.collector, "win-desktop");
+  assert.ok((merged.providers.claude?.windows.length ?? 0) > 0);
+});
+
+test("a limit flag that came only from a fetch stamped after the send time is dropped too", async () => {
+  const { call } = await setup();
+  for (const provider of ["claude", "codex"] as const) {
+    const s = snapAt("2026-11-16T12:00:30.000Z");
+    s.generated_at = "2026-11-16T12:00:00.000Z";
+    s.providers[provider] = { ...s.providers[provider]!, blocked: true };
+    await call("PUT", "/v2/snapshots/mac", MAC, skewed(upload(provider === "claude" ? 1 : 2, s)), new Date("2026-11-16T12:00:00Z"));
+    const merged = (await (await call("GET", "/v2/snapshot", READ, undefined, new Date("2026-11-16T12:01:00Z"))).json()) as Snapshot;
+    assert.notEqual(merged.providers[provider]?.blocked, true, provider);
+  }
+});
+
+test("a latest value an earlier Worker kept from before a switch is not shown again under the new rules", async () => {
+  const { call, raw } = await setup();
+  // Saved as an earlier Worker did: a value fetched at 13:00 on a clock an hour ahead, received 12:00
+  await call("PUT", "/v2/snapshots/win-desktop", WIN, upload(1, snapAt("2026-11-16T12:00:00.000Z")), new Date("2026-11-16T12:00:00Z"));
+  const row = raw.prepare("SELECT snapshot FROM collector_snapshots WHERE collector = 'win-desktop'").get() as { snapshot: string };
+  const old = JSON.parse(row.snapshot) as Snapshot;
+  for (const p of Object.values(old.providers)) {
+    if (!p) continue;
+    p.fetched_at = "2026-11-16T13:00:00.000Z";
+    for (const w of p.windows) { w.fetched_at = "2026-11-16T13:00:00.000Z"; w.used_percent = 94; }
+  }
+  raw.prepare("UPDATE collector_snapshots SET snapshot = ? WHERE collector = 'win-desktop'").run(JSON.stringify(old));
+  // mac accepts the switch at 12:10 and sends 10% at 12:15
+  const accepted = snapAt("2026-11-16T12:15:00.000Z");
+  accepted.providers.claude!.history_since = "2026-11-16T12:10:00.000Z";
+  accepted.providers.claude!.windows[0]!.used_percent = 10;
+  await call("PUT", "/v2/snapshots/mac", MAC, upload(1, accepted), new Date("2026-11-16T12:15:00Z"));
+  const merged = (await (await call("GET", "/v2/snapshot", READ, undefined, new Date("2026-11-16T12:16:00Z"))).json()) as Snapshot;
+  assert.equal(merged.providers.claude?.windows.some((w) => w.used_percent === 94), false);
+});
+
+test("when every PC's latest value is past retention, the merged value is no longer shown", async () => {
+  const { call, env } = await setup();
+  await call("PUT", "/v2/snapshots/mac", MAC, upload(1, fixture()));
+  assert.equal((await call("GET", "/v2/snapshot", READ)).status, 200);
+  const later = new Date(NOW.getTime() + 32 * 24 * 3_600_000);
+  await runCron(env, later);
+  await runCron(env, later);
+  assert.equal((await call("GET", "/v2/snapshot", READ, undefined, later)).status, 404);
 });
 
 test("a resent current value without observations doesn't bring back windows removed by the boundary", async () => {
   const { call } = await setup();
-  const skewed = fixture();
-  skewed.providers.claude!.fetched_at = "2026-11-16T12:40:00.000Z";
-  for (const w of skewed.providers.claude!.windows) w.fetched_at = "2026-11-16T12:40:00.000Z";
-  // Only a current value had arrived, without observations (PC with a clock 20 minutes ahead)
-  await call("PUT", "/v2/snapshots/win-desktop", WIN, upload(1, skewed), new Date("2026-11-16T12:20:00Z"));
+  // Only a current value had arrived, without observations (PC with a clock a minute ahead: fetched 12:30:40, received 12:29:40)
+  const ahead = snapAt("2026-11-16T12:30:40.000Z");
+  await call("PUT", "/v2/snapshots/win-desktop", WIN, skewed(upload(1, ahead)), new Date("2026-11-16T12:29:40Z"));
+  const before = await (await call("GET", "/v2/snapshot", READ, undefined, new Date("2026-11-16T12:29:50Z"))).text();
+  assert.ok(before.includes("seven_day_fable"), "shown before the switch");
   const accepted = fixture();
   accepted.providers.claude = { ...accepted.providers.claude!, windows: [], fetched_at: null, history_since: "2026-11-16T12:30:00.000Z" };
   await call("PUT", "/v2/snapshots/mac", MAC, upload(1, accepted), new Date("2026-11-16T12:30:00Z"));
-  await call("PUT", "/v2/snapshots/win-desktop", WIN, upload(2, skewed), new Date("2026-11-16T12:31:00Z"));
+  await call("PUT", "/v2/snapshots/win-desktop", WIN, skewed(upload(2, { ...ahead, generated_at: "2026-11-16T12:32:00.000Z" })), new Date("2026-11-16T12:31:00Z"));
   for (const path of ["/v2/snapshot", "/v2/view"]) {
     const text = await (await call("GET", path, READ, undefined, new Date("2026-11-16T12:32:00Z"))).text();
     assert.equal(text.includes("seven_day_fable"), false, `${path}: the previous account's window came back`);
@@ -504,7 +655,7 @@ test("an upload whose seq became stale by save time doesn't change the boundary,
   ]);
   assert.equal((raw.prepare("SELECT since FROM history_boundaries").get() as { since: string }).since, "2026-11-16T12:45:00.000Z");
   // Sending the same 12:45 later with seq 4 is not a new acceptance
-  await saveUpload(db, sanitizeUpload(upload(4, (() => { const s = fixture(); s.providers.claude!.history_since = "2026-11-16T12:45:00.000Z"; return s; })(), [obs("five_hour", 3, "2026-11-16T13:05:00Z")]), "mac") as never, new Date("2026-11-16T13:05:00Z"));
+  await saveUpload(db, sanitizeUpload(upload(4, (() => { const s = fixture(); s.generated_at = "2026-11-16T13:05:00.000Z"; s.providers.claude!.history_since = "2026-11-16T12:45:00.000Z"; return s; })(), [obs("five_hour", 3, "2026-11-16T13:05:00Z")]), "mac") as never, new Date("2026-11-16T13:05:00Z"));
   await saveUpload(db, accept(5, "2026-11-16T12:45:00.000Z"), new Date("2026-11-16T13:06:00Z"));
   assert.equal((raw.prepare("SELECT since FROM history_boundaries").get() as { since: string }).since, "2026-11-16T12:45:00.000Z");
   assert.equal((raw.prepare("SELECT COUNT(*) AS n FROM observations").get() as { n: number }).n, 1);
@@ -870,23 +1021,185 @@ test("even if Cron runs mid-upload, derived values for the new latest value are 
   assert.equal(derived.five_hour?.used_percent, 20, "the next Cron computes from the new latest value");
 });
 
-test("markers are built without gaps from each PC's latest saved observation time, and resends of old observations deleted by Cron don't come back", async () => {
-  const { call, raw, env } = await setup();
-  // Observations from when the clock was ahead (large observed_at) are among the older ones, followed by many observations
-  await call("PUT", "/v2/snapshots/win-desktop", WIN, upload(1, fixture(), [obs("five_hour", 95, "2026-11-16T14:00:00.000Z")]), new Date("2026-11-16T10:00:00Z"));
-  for (let i = 0; i < 5; i++) {
-    await call("PUT", "/v2/snapshots/win-desktop", WIN, upload(2 + i, fixture(), [obs("five_hour", 10 + i, `2026-11-16T11:0${i}:00.000Z`)]), new Date(`2026-11-16T11:0${i}:30Z`));
+test("a latest value saved by an earlier Worker is read under today's rules", async () => {
+  const { call, raw, db } = await setup();
+  assert.equal((await call("PUT", "/v2/snapshots/mac", MAC, upload(1, fixture()))).status, 204);
+  // As an earlier Worker stored it: extra usage at 100% and the limit flag it set
+  const row = raw.prepare("SELECT snapshot FROM collector_snapshots WHERE collector = 'mac'").get() as { snapshot: string };
+  const stored = JSON.parse(row.snapshot) as Snapshot;
+  stored.providers.claude!.windows.push({ ...stored.providers.claude!.windows[0]!, id: "extra_usage", label: "Extra usage", kind: "other", used_percent: 100 });
+  stored.providers.claude!.blocked = true;
+  raw.prepare("UPDATE collector_snapshots SET snapshot = ? WHERE collector = 'mac'").run(JSON.stringify(stored));
+  const { loadSnapshots } = await import("../src/store.ts");
+  const claude = (await loadSnapshots(db)).snapshots[0]!.providers.claude!;
+  assert.equal(claude.windows.some((w) => w.id === "extra_usage"), false);
+  assert.equal(claude.blocked, null);
+});
+
+test("Codex's limit flag is kept even when a window of another shape is dropped", async () => {
+  const { call } = await setup();
+  const snap = fixture();
+  snap.providers.codex!.windows.push({ ...snap.providers.codex!.windows[0]!, id: "Mystery-Group", scope: null, used_percent: 100 });
+  snap.providers.codex!.blocked = true;
+  assert.equal((await call("PUT", "/v2/snapshots/mac", MAC, upload(1, snap))).status, 204);
+  const merged = (await (await call("GET", "/v2/snapshot", READ)).json()) as Snapshot;
+  assert.equal(merged.providers.codex?.blocked, true, "Codex knows its limit apart from the windows");
+});
+
+test("observations saved before a switch from a PC whose clock runs a little ahead stay out after a resend", async () => {
+  const { call, db } = await setup();
+  // win-desktop runs 5 s ahead: weekly 94% observed at 12:00:03 on its clock, received 11:59:58
+  const s = snapAt("2026-11-16T12:00:03.000Z");
+  const rows = [obs("seven_day", 94, "2026-11-16T12:00:03.000Z")];
+  assert.equal((await call("PUT", "/v2/snapshots/win-desktop", WIN, skewed(upload(1, s, rows)), new Date("2026-11-16T11:59:58Z"))).status, 204);
+  // The same PC accepts a switch at 12:00 (received 12:00:00)
+  const accepted = snapAt("2026-11-16T12:00:05.000Z");
+  accepted.providers.claude!.history_since = "2026-11-16T12:00:00.000Z";
+  assert.equal((await call("PUT", "/v2/snapshots/win-desktop", WIN, skewed(upload(2, accepted)), new Date("2026-11-16T12:00:00Z"))).status, 204);
+  await prune(db, new Date("2026-11-16T12:01:00Z"));
+  // Resending the first upload doesn't bring the observation back
+  assert.equal((await call("PUT", "/v2/snapshots/win-desktop", WIN, skewed(upload(1, s, rows)), new Date("2026-11-16T12:01:30Z"))).status, 409);
+  assert.equal((await loadObservations(db, "claude", new Date(0))).some((o) => o.used_percent === 94), false);
+});
+
+test("an older Claude agent's value whose windows are all dropped neither blocks nor wins", async () => {
+  const { call } = await setup();
+  const old = snapAt("2026-11-16T12:10:00.000Z");
+  old.providers.claude = { ...old.providers.claude!, blocked: true,
+    windows: [{ ...old.providers.claude!.windows[0]!, id: "extra_usage", kind: "other", used_percent: 100 }] };
+  await call("PUT", "/v2/snapshots/mac", MAC, upload(1, old), new Date("2026-11-16T12:10:00Z"));
+  await call("PUT", "/v2/snapshots/win-desktop", WIN, upload(1, snapAt("2026-11-16T12:05:00.000Z")), new Date("2026-11-16T12:10:00Z"));
+  const merged = (await (await call("GET", "/v2/snapshot", READ, undefined, new Date("2026-11-16T12:11:00Z"))).json()) as Snapshot;
+  assert.equal(merged.providers.claude?.collector, "win-desktop");
+  assert.equal(merged.providers.claude?.blocked, false);
+  // Not even with false
+  const notBlocked = { ...old, providers: { ...old.providers, claude: { ...old.providers.claude!, blocked: false } } };
+  await call("PUT", "/v2/snapshots/mac", MAC, upload(2, notBlocked), new Date("2026-11-16T12:12:00Z"));
+  const again = (await (await call("GET", "/v2/snapshot", READ, undefined, new Date("2026-11-16T12:13:00Z"))).json()) as Snapshot;
+  assert.equal(again.providers.claude?.collector, "win-desktop");
+});
+
+test("values stamped after the PC's own send time are dropped (its clock was turned back after the fetch)", async () => {
+  const { call, raw } = await setup();
+  // Fetched at 12:10:30 on a clock that was then turned back; sent at 12:10 with the old times
+  const s = snapAt("2026-11-16T12:09:00.000Z");
+  s.providers.claude!.windows[0]!.fetched_at = "2026-11-16T12:10:30.000Z";
+  s.generated_at = "2026-11-16T12:10:00.000Z";
+  const rows = [obs("five_hour", 94, "2026-11-16T12:10:30.000Z"), obs("seven_day", 20, "2026-11-16T12:09:00.000Z")];
+  assert.equal((await call("PUT", "/v2/snapshots/mac", MAC, skewed(upload(1, s, rows)), new Date("2026-11-16T12:10:00Z"))).status, 204);
+  const merged = (await (await call("GET", "/v2/snapshot", READ, undefined, new Date("2026-11-16T12:11:00Z"))).json()) as Snapshot;
+  assert.equal(merged.providers.claude?.windows.length, s.providers.claude!.windows.length - 1);
+  assert.ok(merged.providers.claude!.windows.every((w) => w.fetched_at! <= "2026-11-16T12:10:00.000Z"));
+  assert.deepEqual(raw.prepare("SELECT used_percent FROM observations").all().map((r) => ({ ...r })), [{ used_percent: 20 }]);
+});
+
+test("an upload from a PC whose clock is off by more than the tolerance is refused without touching D1", async () => {
+  const { call, raw } = await setup();
+  for (const [sent, ok] of [
+    ["2026-11-16T12:02:00.000Z", true], ["2026-11-16T11:58:00.000Z", true],
+    ["2026-11-16T12:02:00.001Z", false], ["2026-11-16T11:57:59.999Z", false], ["2026-11-16T13:00:00.000Z", false],
+  ] as const) {
+    const s = snapAt("2026-11-16T11:57:00.000Z");
+    s.generated_at = sent;
+    const res = await call("PUT", "/v2/snapshots/mac", MAC, skewed(upload(1, s)), new Date("2026-11-16T12:00:00Z"));
+    assert.equal(res.status, ok ? 204 : 422, sent);
+    if (!ok) assert.equal(((await res.json()) as { error: string }).error, "clock_skew");
+    raw.exec("DELETE FROM collector_snapshots; DELETE FROM collector_names; DELETE FROM d1_budget");
   }
-  assert.deepEqual(raw.prepare("SELECT latest FROM observation_marks WHERE provider = 'claude'").all().map((r) => ({ ...r })),
-    [{ latest: "2026-11-16T14:00:00.000Z" }]);
-  const accepted = fixture();
-  accepted.providers.claude!.history_since = "2026-11-16T12:30:00.000Z";
-  await call("PUT", "/v2/snapshots/mac", MAC, upload(1, accepted), new Date("2026-11-16T12:31:00Z"));
-  // After Cron deletes the previous account's observations, resends of observations from when the clock was ahead don't come back
-  for (let i = 0; i < 3; i++) await runCron(env, new Date("2026-11-16T12:35:00Z"));
-  assert.equal((raw.prepare("SELECT COUNT(*) AS n FROM observations WHERE provider = 'claude'").get() as { n: number }).n, 0);
-  await call("PUT", "/v2/snapshots/win-desktop", WIN, upload(10, fixture(), [obs("five_hour", 95, "2026-11-16T14:00:00.000Z")]), new Date("2026-11-16T12:40:00Z"));
-  assert.equal((await loadObservations(env.DB, "claude", new Date(0))).length, 0);
+  const s = snapAt("2026-11-16T12:59:00.000Z");
+  const res = await call("PUT", "/v2/snapshots/mac", MAC, skewed(upload(1, s, [obs("five_hour", 5, "2026-11-16T12:59:00.000Z")])), new Date("2026-11-16T12:00:00Z"));
+  assert.deepEqual(await res.json(), { error: "clock_skew", offset_s: 3540 });
+  assert.equal((raw.prepare("SELECT COUNT(*) AS n FROM d1_budget").get() as { n: number }).n, 0, "no budget reserved");
+  assert.equal((raw.prepare("SELECT COUNT(*) AS n FROM observations").get() as { n: number }).n, 0);
+});
+
+test("after a switch, values stamped within the guard are left out, except the accepting PC's own latest values", async () => {
+  const { call, db } = await setup();
+  // mac accepts a switch at 12:00 and fetches the new account at 12:01
+  const accepted = snapAt("2026-11-16T12:01:00.000Z");
+  accepted.providers.claude!.history_since = "2026-11-16T12:00:00.000Z";
+  await call("PUT", "/v2/snapshots/mac", MAC, upload(1, accepted, [obs("five_hour", 3, "2026-11-16T12:01:00.000Z")]), new Date("2026-11-16T12:01:00Z"));
+  // win-desktop (not switched yet as far as the endpoint knows) fetched at 12:02; it may be a minute or two ahead
+  await call("PUT", "/v2/snapshots/win-desktop", WIN, upload(1, snapAt("2026-11-16T12:02:00.000Z"), [obs("five_hour", 90, "2026-11-16T12:02:00.000Z")]), new Date("2026-11-16T12:02:00Z"));
+  const merged = (await (await call("GET", "/v2/snapshot", READ, undefined, new Date("2026-11-16T12:02:30Z"))).json()) as Snapshot;
+  assert.equal(merged.providers.claude?.collector, "mac", "the accepting PC's own new values are shown");
+  assert.deepEqual((await loadObservations(db, "claude", new Date(0))).map((o) => o.used_percent), [], "history starts after the guard");
+  // After the guard, both PCs' values count
+  await call("PUT", "/v2/snapshots/win-desktop", WIN, upload(2, snapAt("2026-11-16T12:06:00.000Z"), [obs("five_hour", 4, "2026-11-16T12:06:00.000Z")]), new Date("2026-11-16T12:06:00Z"));
+  assert.deepEqual((await loadObservations(db, "claude", new Date(0))).map((o) => o.used_percent), [4]);
+});
+
+test("an observation of a refused window is dropped before its fields are checked", async () => {
+  const { call, raw } = await setup();
+  const snap = fixture();
+  snap.providers.codex!.windows.push({ ...snap.providers.codex!.windows[0]!, id: "codex_other_five_hour_primary", scope: "codex_other_five_hour" });
+  const observations = [
+    obs("five_hour", 10, "2026-11-16T12:59:00.000Z"),
+    { provider: "codex", window_id: "codex_other_five_hour_primary", used_percent: 5, resets_at: null, observed_at: "" },
+  ];
+  assert.equal((await call("PUT", "/v2/snapshots/mac", MAC, upload(1, snap, observations))).status, 204);
+  assert.equal((raw.prepare("SELECT count(*) AS n FROM observations").get() as { n: number }).n, 1);
+});
+
+test("the guarded boundary in SQL and in TypeScript agree", async () => {
+  const { guarded } = await import("../src/store.ts");
+  const db = new DatabaseSync(":memory:");
+  for (const since of ["2026-11-16T12:00:00.000Z", "2026-11-16T23:58:30.123Z"]) {
+    const row = db.prepare("SELECT strftime('%Y-%m-%dT%H:%M:%fZ', julianday(?) + 300000 / 86400000.0) AS v").get(since) as { v: string };
+    assert.equal(row.v, guarded(since), since);
+  }
+  assert.equal(guarded(""), "");
+});
+
+test("an older Claude agent's limit flag set by a per-model window sent without its model is not a reached limit", async () => {
+  const { call } = await setup();
+  const snap = fixture();
+  const claude = snap.providers.claude!;
+  claude.windows = claude.windows.filter((w) => w.scope === null).map((w) => ({ ...w, used_percent: 20 }));
+  claude.windows.push({ ...claude.windows[0]!, id: "seven_day_opus", label: "Weekly Opus", kind: "other", scope: null, used_percent: 100 });
+  claude.blocked = true;
+  assert.equal((await call("PUT", "/v2/snapshots/mac", MAC, upload(1, snap))).status, 204);
+  const merged = (await (await call("GET", "/v2/snapshot", READ)).json()) as Snapshot;
+  assert.equal(merged.providers.claude?.windows.find((w) => w.id === "seven_day_opus")?.scope, "Opus");
+  assert.equal(merged.providers.claude?.blocked, null);
+});
+
+test("dropping an older agent's window takes Claude's fetch time from the remaining windows", async () => {
+  const { call } = await setup();
+  const old = snapAt("2026-11-16T12:15:00.000Z");
+  old.providers.claude!.windows.push({ ...old.providers.claude!.windows[0]!, id: "extra_usage", kind: "other", fetched_at: "2026-11-16T11:00:00.000Z" });
+  old.providers.claude!.fetched_at = "2026-11-16T11:00:00.000Z";
+  await call("PUT", "/v2/snapshots/mac", MAC, upload(1, old), new Date("2026-11-16T12:16:00Z"));
+  await call("PUT", "/v2/snapshots/win-desktop", WIN, upload(1, snapAt("2026-11-16T11:55:00.000Z")), new Date("2026-11-16T12:16:00Z"));
+  const merged = (await (await call("GET", "/v2/snapshot", READ, undefined, new Date("2026-11-16T12:17:00Z"))).json()) as Snapshot;
+  assert.equal(merged.providers.claude?.collector, "mac");
+  assert.equal(merged.providers.claude?.fetched_at, "2026-11-16T12:15:00.000Z");
+});
+
+test("an older agent's unknown group whose name starts with a known group's is not stored", async () => {
+  const { call, raw } = await setup();
+  const snap = fixture();
+  snap.providers.codex!.windows.push({ ...snap.providers.codex!.windows[0]!, id: "codex_other_five_hour_primary", scope: "codex_other_five_hour" });
+  const observations = [{ ...obs("codex_other_five_hour_primary", 5, "2026-11-16T12:59:00.000Z"), provider: "codex" }];
+  assert.equal((await call("PUT", "/v2/snapshots/mac", MAC, upload(1, snap, observations))).status, 204);
+  const merged = (await (await call("GET", "/v2/snapshot", READ)).json()) as Snapshot;
+  assert.equal(merged.providers.codex?.windows.some((w) => w.id === "codex_other_five_hour_primary"), false);
+  // Its observation in the same upload is not stored either
+  assert.equal((raw.prepare("SELECT count(*) AS n FROM observations WHERE window_id = 'codex_other_five_hour_primary'").get() as { n: number }).n, 0);
+});
+
+test("Cron rebuilds a public row an earlier Worker put, even with no PC sending", async () => {
+  const { call, raw, env } = await setup();
+  assert.equal((await call("PUT", "/v2/snapshots/mac", MAC, upload(1, fixture()))).status, 204);
+  const row = raw.prepare("SELECT body FROM public_state WHERE id = 1").get() as { body: string };
+  const body = JSON.parse(row.body) as Snapshot;
+  body.providers.claude!.windows.push({ ...body.providers.claude!.windows[0]!, id: "extra_usage", label: "Extra usage", kind: "other", used_percent: 100 });
+  body.providers.claude!.blocked = true;
+  raw.prepare("UPDATE public_state SET body = ? WHERE id = 1").run(JSON.stringify(body));
+  await repairPublicState(env.DB, env);
+  const after = JSON.parse((raw.prepare("SELECT body FROM public_state WHERE id = 1").get() as { body: string }).body) as Snapshot;
+  assert.equal(after.providers.claude?.windows.some((w) => w.id === "extra_usage"), false);
+  assert.equal(after.providers.claude?.blocked, false);
 });
 
 test("a run starting just before 00:00 UTC reserves two days and doesn't exceed the next day's remainder", async () => {
@@ -914,6 +1227,68 @@ test("a run starting just before 00:00 UTC reserves two days and doesn't exceed 
   assert.deepEqual(rows().map((r) => r.writes), [608 * 2, 608]);
 });
 
+test("D1_BUDGET_PERCENT gives this D1 a share of the daily budget, and a bad value gives none", async () => {
+  assert.deepEqual(budgetLimit(undefined), DAILY_BUDGET);
+  assert.deepEqual(budgetLimit(" "), DAILY_BUDGET);
+  assert.deepEqual(budgetLimit("80"), { reads: 3_200_000, writes: 64_000 });
+  assert.deepEqual(budgetLimit("20"), { reads: 800_000, writes: 16_000 });
+  for (const bad of ["0", "101", "50%", "-5", "1e2", "abc", 0, 20.5, true, {}, null]) {
+    assert.deepEqual(budgetLimit(bad), { reads: 0, writes: 0 }, String(bad));
+  }
+  // wrangler.toml may give a number
+  assert.deepEqual(budgetLimit(20), budgetLimit("20"));
+  // At the smallest documented share every run fits
+  for (const r of Object.values(RESERVE)) assert.ok(budgetLimit(String(MIN_BUDGET_PERCENT)).writes >= r.writes);
+  assert.ok(budgetLimit(String(MIN_BUDGET_PERCENT - 1)).writes < RESERVE.cron.writes);
+  const share = budgetLimit("80").writes + budgetLimit("20").writes;
+  assert.ok(share <= DAILY_BUDGET.writes, "shares that add up to 100 stay within one D1's budget");
+
+  const { call, raw, env } = await setup();
+  env.D1_BUDGET_PERCENT = "20";
+  raw.prepare("INSERT INTO d1_budget (day, reads, writes) VALUES ('2026-11-16', 0, ?)").run(16_000 - RESERVE.put.writes + 1);
+  const res = await call("PUT", "/v2/snapshots/win-desktop", WIN, upload(1, fixture(), [obs("five_hour", 1, "2026-11-16T12:00:00.000Z")]));
+  assert.equal(res.status, 503);
+  assert.equal(((await res.json()) as { error: string }).error, "d1_budget");
+  assert.equal((raw.prepare("SELECT COUNT(*) AS n FROM observations").get() as { n: number }).n, 0);
+  env.D1_BUDGET_PERCENT = "40";
+  assert.equal((await call("PUT", "/v2/snapshots/win-desktop", WIN, upload(1, fixture()))).status, 204);
+  env.D1_BUDGET_PERCENT = "forty";
+  assert.equal((await call("PUT", "/v2/snapshots/win-desktop", WIN, upload(2, fixture()))).status, 503);
+  // Two days are reserved together or not at all
+  raw.prepare("INSERT INTO d1_budget (day, reads, writes) VALUES ('2026-11-17', 0, ?)").run(16_000);
+  const before = raw.prepare("SELECT day, writes FROM d1_budget ORDER BY day").all().map((r) => ({ ...r }));
+  assert.equal(await reserve(env.DB, ["2026-11-16", "2026-11-17"], RESERVE.put, budgetLimit("20")), "exhausted");
+  assert.deepEqual(raw.prepare("SELECT day, writes FROM d1_budget ORDER BY day").all().map((r) => ({ ...r })), before);
+});
+
+test("a body over 1 MB is cut off while reading, even without Content-Length", async () => {
+  const { readBody } = await import("../src/index.ts");
+  let pulled = 0;
+  const chunk = new Uint8Array(64 * 1024).fill(0x20);
+  const endless = new ReadableStream<Uint8Array>({
+    pull(controller) {
+      pulled++;
+      controller.enqueue(chunk);
+    },
+  });
+  const request = new Request("https://headroom.example/v2/snapshots/mac", { method: "PUT", body: endless, duplex: "half" } as RequestInit);
+  assert.equal(request.headers.get("content-length"), null);
+  await assert.rejects(readBody(request), RangeError);
+  assert.ok(pulled <= 1_000_000 / chunk.byteLength + 3, `stopped right after the limit (${pulled} chunks)`);
+  // Just under the limit is read, and multibyte text split across chunks decodes intact
+  const text = JSON.stringify({ note: "あ".repeat(1000) });
+  const bytes = new TextEncoder().encode(text);
+  const split = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(bytes.slice(0, 11));
+      controller.enqueue(bytes.slice(11));
+      controller.close();
+    },
+  });
+  const ok = new Request("https://headroom.example/", { method: "PUT", body: split, duplex: "half" } as RequestInit);
+  assert.deepEqual(await readBody(ok), JSON.parse(text));
+});
+
 test("d1_budget's limit (CHECK constraint) equals DAILY_BUDGET in budget.ts", () => {
   const sql = readFileSync(new URL("../migrations/0003_derived_and_turns.sql", import.meta.url), "utf8");
   assert.match(sql, new RegExp(`reads BETWEEN 0 AND ${DAILY_BUDGET.reads}\\)`));
@@ -926,7 +1301,7 @@ test("an upload past the reserved day aborts without starting D1 statements (no 
   // An upload started at 23:40 continues into the next day (no budget) midway
   let calls = 0;
   const clock = () => new Date(++calls <= 1 ? "2026-11-16T23:40:00Z" : "2026-11-17T00:01:00Z");
-  const body = JSON.stringify(upload(1, fixture(), [obs("five_hour", 1, "2026-11-16T23:39:00.000Z")]));
+  const body = JSON.stringify(sentAt(upload(1, fixture(), [obs("five_hour", 1, "2026-11-16T23:39:00.000Z")]), new Date("2026-11-16T23:40:00Z")));
   const res = await handle(new Request("https://headroom.example/v2/snapshots/win-desktop", {
     method: "PUT", headers: { authorization: `Bearer ${WIN}`, "content-type": "application/json" }, body,
   }), env, clock);
@@ -967,7 +1342,7 @@ test("no D1 statement starts within 60 seconds of the reserved day's end (D1 abo
   const clock = () => new Date(++calls <= 1 ? "2026-11-16T23:40:00Z" : "2026-11-16T23:59:10Z");
   const res = await handle(new Request("https://headroom.example/v2/snapshots/win-desktop", {
     method: "PUT", headers: { authorization: `Bearer ${WIN}`, "content-type": "application/json" },
-    body: JSON.stringify(upload(1, fixture(), [obs("five_hour", 1, "2026-11-16T23:39:00.000Z")])),
+    body: JSON.stringify(sentAt(upload(1, fixture(), [obs("five_hour", 1, "2026-11-16T23:39:00.000Z")]), new Date("2026-11-16T23:40:00Z"))),
   }), env, clock);
   assert.equal(res.status, 503);
   assert.equal((raw.prepare("SELECT COUNT(*) AS n FROM observations").get() as { n: number }).n, 0);
@@ -1078,6 +1453,8 @@ function withSession(used: number, fetchedAt = "2026-11-16T12:59:30.000Z"): Snap
   const w = s.providers.claude!.windows.find((x) => x.id === "five_hour")!;
   w.used_percent = used;
   w.fetched_at = fetchedAt;
+  // Sent right after the fetch (the PC's clock is right)
+  s.generated_at = fetchedAt;
   return s;
 }
 
@@ -1111,7 +1488,7 @@ test("Cron records an event once, and GET /v2/events returns only those after `a
   assert.equal((await call("PUT", "/v2/events", READ)).status, 405);
 });
 
-test("GET /v2/history returns only the weekly 7-day series (provider required, hours 1-168, weekly window only)", async () => {
+test("GET /v2/history returns only the weekly 7-day series (provider required, hours 1-170, weekly window only)", async () => {
   const { call, env } = await setup();
   await call("PUT", "/v2/snapshots/win-desktop", WIN, upload(1, fixture(), [obs("seven_day", 10, "2026-11-16T12:30:00.000Z")]));
   await runCron(env, NOW);
@@ -1121,7 +1498,7 @@ test("GET /v2/history returns only the weekly 7-day series (provider required, h
   assert.deepEqual(Object.keys(body.windows), ["seven_day"]);
   assert.equal((await call("GET", "/v2/history", READ)).status, 400);
   assert.equal((await call("GET", "/v2/history?provider=claude&hours=0", READ)).status, 400);
-  assert.equal((await call("GET", "/v2/history?provider=claude&hours=169", READ)).status, 400, "up to 7 days (168 hours)");
+  assert.equal((await call("GET", "/v2/history?provider=claude&hours=171", READ)).status, 400, "up to 7 days and 2 hours (170 hours)");
   assert.equal((await call("GET", "/v2/history?provider=claude&hours=24&window=five_hour", READ)).status, 400, "weekly only");
 });
 
@@ -1474,7 +1851,7 @@ function failPublicOnce(db: D1Like): { db: D1Like; failed: () => boolean } {
 
 const putWith = (env: Env, db: D1Like, token: string, collector: string, body: unknown, at: Date) =>
   handle(new Request(`https://headroom.example/v2/snapshots/${collector}`, {
-    method: "PUT", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" }, body: JSON.stringify(body),
+    method: "PUT", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" }, body: JSON.stringify(sentAt(body, at)),
   }), { ...env, DB: db }, () => at).catch(() => null);
 
 test("even if an upload that read an old latest value writes after another upload's boundary, the previous account's values aren't shown", async () => {
@@ -1532,7 +1909,7 @@ test("if an upload puts a new value after the re-putting Cron read the latest va
           const result = await st.all<T>();
           injected = true;
           // After Cron reads 4%, a new upload puts 12%
-          const res = await call("PUT", "/v2/snapshots/win-desktop", WIN, upload(3, withSession(12, "2026-11-16T13:06:00.000Z")), at);
+          const res = await call("PUT", "/v2/snapshots/win-desktop", WIN, upload(3, withSession(12, "2026-11-16T13:04:30.000Z")), at);
           assert.equal(res.status, 204);
           return result;
         },
@@ -1583,20 +1960,20 @@ test("even if the first upload fails to create the latest-value row, the next Cr
 
 test("even if a second PC's switch at the same received time doesn't change the boundary time, excluded observations aren't used for derived values", async () => {
   const { call, env } = await setup();
-  const at = new Date("2026-11-16T13:05:00Z");
+  const at = new Date("2026-11-16T13:09:00Z");
   const accepted = (used: number, fetched: string) => {
     const s = withSession(used, fetched);
     s.providers.claude!.history_since = "2026-11-16T13:00:00.000Z";
     return s;
   };
-  await call("PUT", "/v2/snapshots/mac", MAC, upload(1, accepted(8, "2026-11-16T13:04:00.000Z"), [obs("five_hour", 8, "2026-11-16T13:04:00.000Z")]), at);
-  // win hasn't accepted the switch yet and sends the previous account's observations (after the boundary time)
-  await call("PUT", "/v2/snapshots/win-desktop", WIN, upload(1, withSession(4, "2026-11-16T13:01:00.000Z"), [obs("five_hour", 4, "2026-11-16T13:01:00.000Z")]), at);
+  await call("PUT", "/v2/snapshots/mac", MAC, upload(1, accepted(8, "2026-11-16T13:08:00.000Z"), [obs("five_hour", 8, "2026-11-16T13:08:00.000Z")]), at);
+  // win hasn't accepted the switch yet and sends the previous account's observations (after the boundary time and its guard)
+  await call("PUT", "/v2/snapshots/win-desktop", WIN, upload(1, withSession(4, "2026-11-16T13:05:30.000Z"), [obs("five_hour", 4, "2026-11-16T13:05:30.000Z")]), at);
   await runCron(env, at);
   const consumed = async () => (await fiveHour(call, at))?.recent_consumed_percent ?? null;
   assert.equal(await consumed(), 4, "before the switch, computed from both PCs' observations (4% -> 8%)");
   // win also accepts the switch at the same received time (the boundary time doesn't change; only win's exclusion marker advances)
-  assert.equal((await call("PUT", "/v2/snapshots/win-desktop", WIN, upload(2, accepted(8, "2026-11-16T13:04:30.000Z")), at)).status, 204);
+  assert.equal((await call("PUT", "/v2/snapshots/win-desktop", WIN, upload(2, accepted(8, "2026-11-16T13:08:30.000Z")), at)).status, 204);
   assert.equal(await consumed(), null, "values computed from the excluded previous-account observations are not used");
   await runCron(env, at);
   assert.equal(await consumed(), null, "the next Cron doesn't use excluded observations either (once the boundary advances to the received time, earlier observations are dropped for all PCs)");
@@ -1607,7 +1984,7 @@ test("the latest value is put only if no save happened after reading (an old val
   await call("PUT", "/v2/snapshots/win-desktop", WIN, upload(1, withSession(8)));
   const before = Number((raw.prepare("SELECT version FROM data_versions WHERE provider = 'all'").get() as { version: number }).version);
   // Before the upload that read 8% puts it, another upload saved and put 12%
-  await call("PUT", "/v2/snapshots/win-desktop", WIN, upload(2, withSession(12, "2026-11-16T13:01:00.000Z")));
+  await call("PUT", "/v2/snapshots/win-desktop", WIN, upload(2, withSession(12, "2026-11-16T12:59:45.000Z")));
   assert.equal(await savePublicState(env.DB, withSession(8), before), false, "an old read is not put");
   const row = await loadPublicRow(env.DB);
   assert.equal(row?.snapshot.providers.claude?.windows.find((w) => w.id === "five_hour")?.used_percent, 12);
@@ -1617,7 +1994,7 @@ test("if the re-put of the upload that saved 12% fails and an upload that read 8
   const { call, env } = await setup();
   await call("PUT", "/v2/snapshots/win-desktop", WIN, upload(1, withSession(8)));
   const flaky = failPublicOnce(env.DB);
-  await putWith(env, flaky.db, WIN, "win-desktop", upload(2, withSession(12, "2026-11-16T13:01:00.000Z")), NOW);
+  await putWith(env, flaky.db, WIN, "win-desktop", upload(2, withSession(12, "2026-11-16T12:59:45.000Z")), NOW);
   assert.equal(flaky.failed(), true);
   await runCron(env, NOW);
   const view = (await (await call("GET", "/v2/view", READ)).json()) as { claude: { windows: Record<string, { used_percent: number }> } };
@@ -1650,16 +2027,17 @@ test("change counters advance in the same batch as the save; even if the re-put 
 
 test("if the same switch from the same PC arrives twice concurrently, the boundary advances once and post-switch observations remain", async () => {
   const { call, env, raw } = await setup();
-  const accepted = (seq: number, used: number) => {
-    const s = withSession(used, "2026-11-16T12:20:00.000Z");
+  // Fetched and received after the switch (12:10); the two observations are far enough apart not to count as simultaneous
+  const accepted = (seq: number, used: number, fetched: string) => {
+    const s = withSession(used, fetched);
     s.providers.claude!.history_since = "2026-11-16T12:10:00.000Z";
-    return upload(seq, s, [obs("five_hour", used, `2026-11-16T12:2${seq}:00.000Z`)]);
+    return upload(seq, s, [obs("five_hour", used, fetched)]);
   };
-  const at = new Date("2026-11-16T12:15:00Z");
+  const at = new Date("2026-11-16T12:15:30Z");
   // After both pass the pre-check, the batches run in order
   await Promise.all([
-    call("PUT", "/v2/snapshots/win-desktop", WIN, accepted(1, 39), at),
-    call("PUT", "/v2/snapshots/win-desktop", WIN, accepted(2, 40), new Date("2026-11-16T12:25:00Z")),
+    call("PUT", "/v2/snapshots/win-desktop", WIN, accepted(1, 39, "2026-11-16T12:15:00.000Z"), at),
+    call("PUT", "/v2/snapshots/win-desktop", WIN, accepted(2, 40, "2026-11-16T12:22:00.000Z"), new Date("2026-11-16T12:25:00Z")),
   ]);
   const epoch = raw.prepare("SELECT epoch FROM boundary_epochs WHERE provider = 'claude'").get() as { epoch: number };
   assert.equal(epoch.epoch, 1, "the same acceptance only once");
@@ -1746,7 +2124,7 @@ test("GET /v2/view returns the counter (data_version) of the latest-value row it
   const { call } = await setup();
   await call("PUT", "/v2/snapshots/win-desktop", WIN, upload(1, withSession(10)));
   const a = (await (await call("GET", "/v2/view", READ)).json()) as { data_version: number };
-  await call("PUT", "/v2/snapshots/win-desktop", WIN, upload(2, withSession(12, "2026-11-16T13:01:00.000Z")));
+  await call("PUT", "/v2/snapshots/win-desktop", WIN, upload(2, withSession(12, "2026-11-16T12:59:45.000Z")));
   const b = (await (await call("GET", "/v2/view", READ)).json()) as { data_version: number };
   assert.ok(Number.isSafeInteger(a.data_version) && b.data_version > a.data_version, `${a.data_version} → ${b.data_version}`);
 });
@@ -1892,21 +2270,20 @@ test("aggregated times are limited to 8 days before through 5 minutes after rece
   assert.deepEqual(hourlyOf(raw).map((r) => r.hour), ["2026-11-16T12"]);
 });
 
-test("pre-switch observations from a PC with a fast clock don't mix into the post-switch weekly trend", async () => {
+test("pre-switch observations don't mix into the post-switch weekly trend", async () => {
   const { call, env, raw } = await setup();
-  // win-desktop (clock ahead) sends a pre-switch 90% at 12:00, recorded as 12:10
-  await call("PUT", "/v2/snapshots/win-desktop", WIN, upload(1, fixture(), [weekObs(90, "2026-11-16T12:10:00.000Z")]), new Date("2026-11-16T12:00:00Z"));
-  // mac accepts the switch at 12:05 and sends 3%
-  const accepted = fixture();
+  // win-desktop sends a pre-switch 90% at 12:04
+  await call("PUT", "/v2/snapshots/win-desktop", WIN, upload(1, snapAt("2026-11-16T12:04:00.000Z"), [weekObs(90, "2026-11-16T12:04:00.000Z")]), new Date("2026-11-16T12:04:00Z"));
+  // mac accepts the switch at 12:05 and sends 3% after the guard
+  const accepted = snapAt("2026-11-16T12:11:00.000Z");
   accepted.providers.claude!.history_since = "2026-11-16T12:05:00.000Z";
-  await call("PUT", "/v2/snapshots/mac", MAC, upload(1, accepted, [weekObs(3, "2026-11-16T12:05:00.000Z")]), new Date("2026-11-16T12:05:00Z"));
+  await call("PUT", "/v2/snapshots/mac", MAC, upload(1, accepted, [weekObs(3, "2026-11-16T12:11:00.000Z")]), new Date("2026-11-16T12:11:00Z"));
   assert.deepEqual(hourlyOf(raw).map((r) => [r.hour, r.used_percent, r.collector]), [["2026-11-16T12", 3, "mac"]], "the pre-switch representative of the boundary hour is removed and replaced by the post-switch observation");
   await runCron(env, new Date("2026-11-16T13:00:00Z"));
   const res = await call("GET", "/v2/history?provider=claude&hours=168", READ, undefined, new Date("2026-11-16T13:00:00Z"));
   const body = (await res.json()) as { windows: Record<string, { used_percent: number }[]> };
   assert.deepEqual(body.windows.seven_day!.map((p) => p.used_percent), [3]);
 });
-
 test("late-finishing old computations and computations after a boundary move don't replace the 7-day series", async () => {
   const { call, db } = await setup();
   await call("PUT", "/v2/snapshots/win-desktop", WIN, upload(1, fixture(), [weekObs(10, "2026-11-16T12:30:00.000Z")]));
@@ -1953,15 +2330,15 @@ test("an aggregation statement gets at most 100 values (even with many hours and
 
 test("aggregates use the saved observation values; the time is the earlier of observation and first receipt (no future points)", async () => {
   const { call, raw } = await setup();
-  // At 12:00, a 10% recorded by the PC as 12:04 arrives (clock ahead)
-  await call("PUT", "/v2/snapshots/win-desktop", WIN, upload(1, fixture(), [weekObs(10, "2026-11-16T12:04:00.000Z")]), new Date("2026-11-16T12:00:00Z"));
+  // At 12:00, a 10% recorded by the PC as 12:01 arrives (clock a minute ahead)
+  await call("PUT", "/v2/snapshots/win-desktop", WIN, skewed(upload(1, snapAt("2026-11-16T12:01:00.000Z"), [weekObs(10, "2026-11-16T12:01:00.000Z")])), new Date("2026-11-16T12:00:00Z"));
   // A resend of the same observation (same unique key) with a different value isn't saved (and doesn't change the aggregate)
-  await call("PUT", "/v2/snapshots/win-desktop", WIN, upload(2, fixture(), [weekObs(90, "2026-11-16T12:04:00.000Z")]), new Date("2026-11-16T12:01:00Z"));
+  await call("PUT", "/v2/snapshots/win-desktop", WIN, skewed(upload(2, snapAt("2026-11-16T12:02:00.000Z"), [weekObs(90, "2026-11-16T12:01:00.000Z")])), new Date("2026-11-16T12:01:00Z"));
   const rows = raw.prepare("SELECT hour, used_percent, effective_at AS observed_at FROM observation_hourly").all() as { hour: string; used_percent: number; observed_at: string }[];
   assert.deepEqual(rows.map((r) => [r.hour, r.used_percent, r.observed_at]), [["2026-11-16T12", 10, "2026-11-16T12:00:00.000Z"]]);
 });
 
-/** Aligns snapshot fetch times (so per-PC exclusion markers land on times set by the test) */
+/** A snapshot whose send and fetch times are all the given time */
 function snapAt(iso: string): Snapshot {
   const s = fixture();
   s.generated_at = iso;
@@ -1972,37 +2349,18 @@ function snapAt(iso: string): Snapshot {
   }
   return s;
 }
-
 test("at most 16 writing PCs (a config over the limit accepts no credential)", () => {
   const entry = (i: number) => ({ name: `pc${i}`, sha256: "a".repeat(64), role: "write", collector: `pc-${i}` });
   assert.equal(parseTokens(JSON.stringify(Array.from({ length: MAX_COLLECTORS }, (_, i) => entry(i)))).length, MAX_COLLECTORS);
   assert.deepEqual(parseTokens(JSON.stringify(Array.from({ length: MAX_COLLECTORS + 1 }, (_, i) => entry(i)))), []);
 });
 
-test("per-PC exclusion is checked by the observation time the PC recorded (valid points aren't removed by the clamped time)", async () => {
-  const { call, env, raw } = await setup();
-  const t = (m: number) => `2026-11-16T12:${String(m).padStart(2, "0")}:00.000Z`;
-  // An observation win (clock ahead) recorded as 12:04 at 12:00
-  await call("PUT", "/v2/snapshots/win-desktop", WIN, upload(1, snapAt(t(4)), [weekObs(10, t(4))]), new Date(t(0)));
-  // mac accepts the switch at 12:02 (win's exclusion marker is 12:04)
-  const accepted = snapAt(t(2));
-  accepted.providers.claude!.history_since = t(2);
-  await call("PUT", "/v2/snapshots/mac", MAC, upload(1, accepted, []), new Date(t(2)));
-  // An observation win recorded as 12:06 at 12:03 (after 12:04, so valid; clamped time 12:03)
-  await call("PUT", "/v2/snapshots/win-desktop", WIN, upload(2, snapAt(t(6)), [weekObs(11, t(6))]), new Date(t(3)));
-  await runCron(env, new Date("2026-11-16T13:00:00Z"));
-  const body = (await (await call("GET", "/v2/history?provider=claude&hours=168", READ, undefined, new Date("2026-11-16T13:00:00Z"))).json()) as { windows: Record<string, { used_percent: number; at: string }[]> };
-  assert.deepEqual(body.windows.seven_day!.map((p) => [p.used_percent, p.at]), [[11, t(3)]]);
-  assert.equal(hourlyOf(raw).length, 1);
-});
-
 test("if the current representative is invalid under the current boundary, even an older valid candidate replaces it", async () => {
   const { call, raw } = await setup();
-  // Boundary 12:30, win's exclusion marker 12:55. win's 12:50 representative is invalid
+  // Boundary 12:30. win's 12:31 representative is within the guard, so it is invalid
   raw.prepare("INSERT INTO history_boundaries (provider, since, collector) VALUES ('claude', '2026-11-16T12:30:00.000Z', 'mac')").run();
-  raw.prepare("INSERT INTO boundary_watermarks (provider, collector, until) VALUES ('claude', 'win-desktop', '2026-11-16T12:55:00.000Z')").run();
   raw.prepare(`INSERT INTO observation_hourly (provider, window_id, hour, used_percent, resets_at, observed_at, effective_at, first_received_at, collector, priority)
-    VALUES ('claude', 'seven_day', '2026-11-16T12', 60, NULL, '2026-11-16T12:50:00.000Z', '2026-11-16T12:50:00.000Z', '2026-11-16T12:50:00.000Z', 'win-desktop', 0)`).run();
+    VALUES ('claude', 'seven_day', '2026-11-16T12', 60, NULL, '2026-11-16T12:31:00.000Z', '2026-11-16T12:31:00.000Z', '2026-11-16T12:31:00.000Z', 'win-desktop', 0)`).run();
   // mac sends a valid 12:40 observation at 13:00
   await call("PUT", "/v2/snapshots/mac", MAC, upload(1, snapAt("2026-11-16T12:40:00.000Z"), [weekObs(3, "2026-11-16T12:40:00.000Z")]), new Date("2026-11-16T13:00:00Z"));
   assert.deepEqual(hourlyOf(raw).map((r) => [r.hour, r.used_percent, r.collector]), [["2026-11-16T12", 3, "mac"]]);
@@ -2010,10 +2368,10 @@ test("if the current representative is invalid under the current boundary, even 
 
 test("the hour bucket is decided by the saved first receipt (a resent observation doesn't drop a point from another hour)", async () => {
   const { call, raw } = await setup();
-  // An observation recorded as 13:01 at 12:59 (clamped 12:59 -> the 12:xx hour)
-  await call("PUT", "/v2/snapshots/win-desktop", WIN, upload(1, fixture(), [weekObs(10, "2026-11-16T13:01:00.000Z")]), new Date("2026-11-16T12:59:00Z"));
+  // An observation recorded as 13:00:30 at 12:59 (clock ahead; clamped 12:59 -> the 12:xx hour)
+  await call("PUT", "/v2/snapshots/win-desktop", WIN, skewed(upload(1, snapAt("2026-11-16T13:00:30.000Z"), [weekObs(10, "2026-11-16T13:00:30.000Z")])), new Date("2026-11-16T12:59:00Z"));
   // At 13:05, its resend and a new 13:00 observation
-  await call("PUT", "/v2/snapshots/win-desktop", WIN, upload(2, fixture(), [weekObs(10, "2026-11-16T13:01:00.000Z"), weekObs(12, "2026-11-16T13:00:00.000Z")]), new Date("2026-11-16T13:05:00Z"));
+  await call("PUT", "/v2/snapshots/win-desktop", WIN, upload(2, fixture(), [weekObs(10, "2026-11-16T13:00:30.000Z"), weekObs(12, "2026-11-16T13:00:00.000Z")]), new Date("2026-11-16T13:05:00Z"));
   assert.deepEqual(hourlyOf(raw).map((r) => [r.hour, r.used_percent]), [["2026-11-16T12", 10], ["2026-11-16T13", 12]]);
 });
 
@@ -2075,43 +2433,28 @@ test("migration 0012 registers existing PC names (without reading the observatio
   assert.deepEqual(raw.prepare("SELECT name, slot FROM collector_names ORDER BY slot").all().map((r) => ({ ...r })), [{ name: "mac", slot: 0 }, { name: "win-desktop", slot: 1 }]);
 });
 
-test("even with many saved names, acceptance exclusion markers are created for every PC (pre-switch values don't remain in the weekly trend)", async () => {
-  const { call, env, raw } = await setup();
-  // win's pre-switch 90% (12:40)
-  await call("PUT", "/v2/snapshots/win-desktop", WIN, upload(1, snapAt("2026-11-16T12:40:00.000Z"), [weekObs(90, "2026-11-16T12:40:00.000Z")]), new Date("2026-11-16T12:40:00Z"));
-  // 32 names of removed PCs (observation marks at 12:50)
-  const mark = raw.prepare("INSERT INTO observation_marks (provider, collector, latest) VALUES ('claude', ?, '2026-11-16T12:50:00.000Z')");
-  for (let i = 0; i < 32; i++) mark.run(`old-${i}`);
-  // mac accepts boundary 12:10 at 13:00
-  const accepted = snapAt("2026-11-16T13:00:00.000Z");
-  accepted.providers.claude!.history_since = "2026-11-16T12:10:00.000Z";
-  await call("PUT", "/v2/snapshots/mac", MAC, upload(1, accepted, []), new Date("2026-11-16T13:00:00Z"));
-  const win = raw.prepare("SELECT until FROM boundary_watermarks WHERE provider = 'claude' AND collector = 'win-desktop'").get() as { until: string } | undefined;
-  assert.ok(win !== undefined && win.until >= "2026-11-16T12:40:00.000Z", "win's exclusion marker");
-  await runCron(env, new Date("2026-11-16T13:00:00Z"));
-  const body = (await (await call("GET", "/v2/history?provider=claude&hours=168", READ, undefined, new Date("2026-11-16T13:00:00Z"))).json()) as { windows: Record<string, { used_percent: number }[]> };
-  assert.deepEqual((body.windows.seven_day ?? []).map((p) => p.used_percent), [], "the pre-switch 90% is not returned");
-});
-
 test("among observations with the same time and priority, the one with the newer PC-recorded observation time is the representative (regardless of arrival order)", async () => {
   const at = new Date("2026-11-16T12:00:00Z");
+  const early = "2026-11-16T12:01:00.000Z";
+  const late = "2026-11-16T12:01:30.000Z";
+  // Both recorded after the receipt by a PC whose clock runs ahead, so both are placed at 12:00
+  const sent = (rows: unknown[]) => skewed(upload(1, snapAt(late), rows));
   for (const order of [[0, 1], [1, 0]]) {
     const { call, raw } = await setup();
-    const list = [weekObs(10, "2026-11-16T12:01:00.000Z"), weekObs(40, "2026-11-16T12:04:00.000Z")];
-    await call("PUT", "/v2/snapshots/win-desktop", WIN, upload(1, fixture(), order.map((i) => list[i])), at);
+    const list = [weekObs(10, early), weekObs(40, late)];
+    await call("PUT", "/v2/snapshots/win-desktop", WIN, sent(order.map((i) => list[i])), at);
     assert.deepEqual(hourlyOf(raw).map((r) => [r.hour, r.used_percent]), [["2026-11-16T12", 40]], `order ${order}`);
   }
   // Comparison with the saved representative works the same (replaced by a newer one, not by an older one)
-  for (const [stored, incoming, expected] of [["12:01", "12:04", 40], ["12:04", "12:01", 40]] as const) {
+  for (const [stored, incoming, expected] of [[early, late, 40], [late, early, 40]] as const) {
     const { call, raw } = await setup();
     raw.prepare(`INSERT INTO observation_hourly (provider, window_id, hour, used_percent, resets_at, observed_at, effective_at, first_received_at, collector, priority)
       VALUES ('claude', 'seven_day', '2026-11-16T12', ?, NULL, ?, '2026-11-16T12:00:00.000Z', '2026-11-16T12:00:00.000Z', 'win-desktop', 0)`)
-      .run(stored === "12:01" ? 10 : 40, `2026-11-16T${stored}:00.000Z`);
-    await call("PUT", "/v2/snapshots/win-desktop", WIN, upload(1, fixture(), [weekObs(stored === "12:01" ? 40 : 10, `2026-11-16T${incoming}:00.000Z`)]), at);
+      .run(stored === early ? 10 : 40, stored);
+    await call("PUT", "/v2/snapshots/win-desktop", WIN, sent([weekObs(stored === early ? 40 : 10, incoming)]), at);
     assert.deepEqual(hourlyOf(raw).map((r) => r.used_percent), [expected], `saved ${stored}, incoming ${incoming}`);
   }
 });
-
 test("migration 0012 fails on an old D1 with more than 32 names (stops reading at 33 distinct names per table)", () => {
   const raw = new DatabaseSync(":memory:");
   const dir = new URL("../migrations/", import.meta.url);
@@ -2219,4 +2562,55 @@ test("the 24-hour series (derived_history) is removed: no table, and GET /v2/his
   assert.equal(res.status, 200);
   const body = (await res.json()) as { windows: Record<string, unknown[]> };
   assert.deepEqual(Object.keys(body.windows), ["seven_day"], "defaults to the weekly 7-day series");
+});
+
+test("a late acceptance doesn't remove another PC's values received after the boundary time", async () => {
+  const { call, env } = await setup();
+  // mac sends the new account's weekly value at 12:06 without a switch of its own
+  await call("PUT", "/v2/snapshots/mac", MAC, upload(1, snapAt("2026-11-16T12:06:00.000Z"), [weekObs(13, "2026-11-16T12:06:00.000Z")]), new Date("2026-11-16T12:06:00Z"));
+  // win-desktop accepted a switch at 12:00, but its upload arrives at 12:10
+  const accepted = snapAt("2026-11-16T12:00:00.000Z");
+  accepted.providers.claude!.history_since = "2026-11-16T12:00:00.000Z";
+  accepted.generated_at = "2026-11-16T12:10:00.000Z";
+  await call("PUT", "/v2/snapshots/win-desktop", WIN, upload(1, accepted), new Date("2026-11-16T12:10:00Z"));
+  assert.deepEqual((await loadObservations(env.DB, "claude", new Date(0))).map((o) => o.used_percent), [13]);
+  const merged = (await (await call("GET", "/v2/snapshot", READ, undefined, new Date("2026-11-16T12:11:00Z"))).json()) as Snapshot;
+  assert.equal(merged.providers.claude?.windows.length ? merged.providers.claude?.collector : null, "mac");
+});
+
+test("an upload received just before a boundary but saved after it doesn't bring its windows back on a resend", async () => {
+  const { call } = await setup();
+  const accepted = snapAt("2026-11-16T12:00:00.000Z");
+  accepted.providers.claude!.history_since = "2026-11-16T12:00:00.000Z";
+  await call("PUT", "/v2/snapshots/mac", MAC, upload(1, accepted), new Date("2026-11-16T12:00:00Z"));
+  // win-desktop runs a minute ahead: fetched at 12:00:10 on its clock, received 11:59:59 but saved after the boundary
+  const old = snapAt("2026-11-16T12:00:10.000Z");
+  old.generated_at = "2026-11-16T12:00:59.000Z";
+  await call("PUT", "/v2/snapshots/win-desktop", WIN, skewed(upload(1, old)), new Date("2026-11-16T11:59:59Z"));
+  const resend = { ...old, generated_at: "2026-11-16T12:15:59.000Z" };
+  await call("PUT", "/v2/snapshots/win-desktop", WIN, skewed(upload(2, resend)), new Date("2026-11-16T12:14:59Z"));
+  const merged = (await (await call("GET", "/v2/snapshot", READ, undefined, new Date("2026-11-16T12:15:30Z"))).json()) as Snapshot;
+  assert.equal(merged.providers.claude?.collector, "mac");
+});
+
+test("an observation stamped after its own send time (clock turned back) is not stored even after a switch", async () => {
+  const { call, env } = await setup();
+  const accepted = snapAt("2026-11-16T12:00:00.000Z");
+  accepted.providers.claude!.history_since = "2026-11-16T12:00:00.000Z";
+  await call("PUT", "/v2/snapshots/mac", MAC, upload(1, accepted), new Date("2026-11-16T12:00:00Z"));
+  const s = snapAt("2026-11-16T12:04:00.000Z");
+  s.generated_at = "2026-11-16T12:04:30.000Z";
+  await call("PUT", "/v2/snapshots/win-desktop", WIN, skewed(upload(1, s, [weekObs(94, "2026-11-16T12:10:00.000Z")])), new Date("2026-11-16T12:05:00Z"));
+  assert.equal((await loadObservations(env.DB, "claude", new Date(0))).some((o) => o.used_percent === 94), false);
+});
+
+
+test("a merged value left after an earlier Worker already deleted every PC's latest value is removed by the next Cron", async () => {
+  const { call, env, raw } = await setup();
+  await call("PUT", "/v2/snapshots/mac", MAC, upload(1, fixture()));
+  // As an earlier Worker left it: the PC rows were deleted, the merged value and counters stay as they were
+  raw.exec("DELETE FROM collector_snapshots");
+  assert.equal((await call("GET", "/v2/snapshot", READ)).status, 200);
+  await runCron(env, NOW);
+  assert.equal((await call("GET", "/v2/snapshot", READ)).status, 404);
 });

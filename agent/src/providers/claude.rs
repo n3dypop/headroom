@@ -25,7 +25,8 @@ use std::time::{Duration, Instant, SystemTime};
 use super::{Event, Provider};
 use crate::config::{ClaudeConfig, claude_json_path};
 use crate::schema::{
-    ErrorCode, ProviderSnapshot, ProviderStatus, UsageWindow, known_window, make_window,
+    ErrorCode, ProviderSnapshot, ProviderStatus, UsageWindow, known_scope, known_window,
+    make_window,
 };
 use crate::statusline::read_capture;
 use crate::store::{Logger, backoff_ms, fnv1a_hex, read_json, write_json_atomic};
@@ -72,6 +73,9 @@ pub enum Diag {
     AccountChanged,
     /// Cannot write the state file (the attempt marker can't be saved, so /usage is not run)
     StateWriteFailed,
+    /// The state file exists but can't be read, or a stop flag in it has an unexpected type. Earlier safety stops can't be
+    /// confirmed, so auto-fetch stops
+    StateUnreadable,
     /// `/usage` couldn't get new values and showed previous ones (`Showing last-known usage`). Not treated as a new observation
     LastKnownUsage,
     /// `/usage` fetching was rate limited (`rate limited until …`)
@@ -83,6 +87,8 @@ pub enum Diag {
     ManagedPolicy,
     /// The plan or organization managed settings can't be verified (err on the side of not running /usage; resumes on the next check)
     PolicyUnknown,
+    /// `claude auth status` doesn't confirm a claude.ai subscription sign-in (unknown `authMethod`). /usage is not run
+    AuthUnknown,
 }
 
 impl Diag {
@@ -123,12 +129,18 @@ impl Diag {
                 "Fetching stopped because the Claude account changed. If this is the right account, resume with headroom collect --provider claude --accept-account"
             }
             Diag::StateWriteFailed => "Not running /usage: cannot write the state file",
+            Diag::StateUnreadable => {
+                "Auto-fetch stopped: the state file couldn't be read, so earlier safety stops can't be confirmed. Resume with headroom collect --provider claude --force"
+            }
             Diag::LastKnownUsage => {
                 "/usage couldn't get new values and showed previous ones (not treated as a new observation)"
             }
             Diag::RateLimited => "/usage fetching was temporarily rate limited",
             Diag::NotSubscription => {
                 "Claude CLI is signed in with something other than a claude.ai subscription (API keys etc. have no usage-limit display)"
+            }
+            Diag::AuthUnknown => {
+                "Not running /usage: claude auth status doesn't confirm a claude.ai subscription sign-in (resumes once confirmed)"
             }
             Diag::PolicyUnknown => {
                 "Not running /usage: the plan or organization managed settings can't be verified (resumes once verified)"
@@ -157,6 +169,7 @@ impl Diag {
             | Diag::Unverifiable
             | Diag::NotLocal
             | Diag::Interrupted
+            | Diag::StateUnreadable
             | Diag::ManagedPolicy => ErrorCode::SafetyStop,
             Diag::AccountChanged => ErrorCode::AccountChanged,
             _ => ErrorCode::FetchFailed,
@@ -224,13 +237,33 @@ pub struct ClaudeState {
 }
 
 /// Read the state file field by field. Even if observations can't be read (old format etc.), stop flags, intervals and backoff carry over.
+/// Only a missing file starts from the initial state. A file that can't be read or parsed, or a stop flag of the wrong type,
+/// keeps auto-fetch stopped (a corrupt file must not clear a safety stop)
 pub fn load_state(path: &Path) -> ClaudeState {
-    let Some(v) = read_json::<Value>(path) else {
-        return ClaudeState {
-            state_version: STATE_VERSION,
-            ..Default::default()
-        };
+    let initial = ClaudeState {
+        state_version: STATE_VERSION,
+        ..Default::default()
     };
+    let unreadable = ClaudeState {
+        guard_tripped: true,
+        last_error: Some(Diag::StateUnreadable),
+        ..initial.clone()
+    };
+    let v = match std::fs::read(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return initial,
+        Err(_) => return unreadable,
+        Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
+            Ok(v) if v.is_object() => v,
+            _ => return unreadable,
+        },
+    };
+    // A stop flag that is present but not a boolean (or a marker that is not a number) is treated as "stopped"
+    let flag_ok = |k: &str| v.get(k).is_none_or(Value::is_boolean);
+    let flags_ok = ["guard_tripped", "account_changed", "managed_policy"]
+        .iter()
+        .all(|k| flag_ok(k))
+        && v.get("usage_in_flight_ms")
+            .is_none_or(|x| x.is_null() || x.is_i64());
     let i = |k: &str| v[k].as_i64().unwrap_or(0);
     fn from<T: serde::de::DeserializeOwned>(v: &Value, k: &str) -> Option<T> {
         serde_json::from_value(v[k].clone()).ok()
@@ -244,10 +277,14 @@ pub fn load_state(path: &Path) -> ClaudeState {
             .map_or(0, |n| n.min(u32::MAX as u64) as u32),
         last_attempt_ms: i("last_attempt_ms"),
         // Drop the old free-text last_error (it may contain CLI text)
-        last_error: from(&v, "last_error"),
+        last_error: if flags_ok {
+            from(&v, "last_error")
+        } else {
+            Some(Diag::StateUnreadable)
+        },
         account_hash: v["account_hash"].as_str().map(str::to_string),
         account_switched_ms: i("account_switched_ms"),
-        guard_tripped: v["guard_tripped"].as_bool().unwrap_or(false),
+        guard_tripped: v["guard_tripped"].as_bool().unwrap_or(false) || !flags_ok,
         account: from(&v, "account"),
         last_auth_ms: i("last_auth_ms"),
         cli_version: v["cli_version"].as_str().map(str::to_string),
@@ -425,7 +462,7 @@ impl ClaudeProvider {
             || self.state.cli_supported != Some(true)
             || self.state.managed_policy
             || !self.state.auth_verified
-            || account.is_some_and(|a| a.subscription == Some(false) || a.logged_in == Some(false))
+            || account.is_none_or(|a| a.subscription != Some(true) || a.logged_in == Some(false))
         {
             return i64::MAX;
         }
@@ -589,6 +626,9 @@ impl ClaudeProvider {
         if !self.state.auth_verified {
             return Some(Diag::PolicyUnknown);
         }
+        if account.and_then(|a| a.subscription) != Some(true) {
+            return Some(Diag::AuthUnknown);
+        }
         match plan {
             Some(p) if ORGANIZATION_PLANS.contains(&p) => return Some(Diag::ManagedPolicy),
             Some(p) if PERSONAL_PLANS.contains(&p) => {}
@@ -610,7 +650,7 @@ impl ClaudeProvider {
             Some(d) => self.set_check_error(d),
             None if matches!(
                 self.state.last_error,
-                Some(Diag::ManagedPolicy | Diag::PolicyUnknown)
+                Some(Diag::ManagedPolicy | Diag::PolicyUnknown | Diag::AuthUnknown)
             ) =>
             {
                 self.state.last_error = None
@@ -696,14 +736,17 @@ impl ClaudeProvider {
             );
         }
         let usage = self.state.last_ok.as_ref();
+        // Only Claude's usage-limit windows (values saved by an older version may hold others, such as extra usage).
+        // blocked is computed from these alone
         let mut windows: Vec<_> = usage
             .into_iter()
             .flat_map(|u| u.windows.iter().map(|w| (w.clone(), u.fetched_ms)))
+            .filter(|(w, _)| is_claude_window(&w.id))
             .collect();
         if let Some((at, ws)) = &self.capture
             && usage.is_none_or(|u| *at > u.fetched_ms)
         {
-            for w in ws {
+            for w in ws.iter().filter(|w| is_claude_window(&w.id)) {
                 let sample = (w.clone(), *at);
                 match windows.iter_mut().find(|(m, _)| m.id == w.id) {
                     Some(m) => *m = sample,
@@ -835,7 +878,8 @@ impl Provider for ClaudeProvider {
         self.capture_dirty = false;
         let allowed = self.state.cli_supported == Some(true)
             && !self.state.account_changed
-            && self.state.account.as_ref().and_then(|a| a.subscription) != Some(false)
+            // Only a confirmed claude.ai subscription sign-in (an unknown sign-in method is not enough)
+            && self.state.account.as_ref().and_then(|a| a.subscription) == Some(true)
             // Don't run when signed out
             && self.state.account.as_ref().and_then(|a| a.logged_in) != Some(false)
             && !self.state.managed_policy
@@ -1222,26 +1266,28 @@ pub fn check_usage_result(v: &Value) -> Result<String, UsageError> {
             _ => return stop(Diag::Unverifiable),
         }
     }
+    // Additional counters: when present, an object whose values are all integer 0. Any other shape or type can't confirm zero use
     for key in ["output_tokens_details", "server_tool_use", "cache_creation"] {
-        let Some(obj) = usage[key].as_object() else {
+        let Some(value) = usage.get(key) else {
             continue;
         };
-        for n in obj.values().filter(|n| n.is_number()) {
-            if n.as_u64() != Some(0) {
-                return stop(if n.as_u64().is_some() {
-                    Diag::NotLocal
-                } else {
-                    Diag::Unverifiable
-                });
+        let Some(obj) = value.as_object() else {
+            return stop(Diag::Unverifiable);
+        };
+        for n in obj.values() {
+            match n.as_u64() {
+                Some(0) => {}
+                Some(_) => return stop(Diag::NotLocal),
+                None => return stop(Diag::Unverifiable),
             }
         }
     }
-    if usage
-        .get("iterations")
-        .and_then(Value::as_array)
-        .is_some_and(|a| !a.is_empty())
-    {
-        return stop(Diag::NotLocal);
+    // Model calls made by the command: when present, an empty array
+    match usage.get("iterations") {
+        None => {}
+        Some(Value::Array(a)) if a.is_empty() => {}
+        Some(Value::Array(_)) => return stop(Diag::NotLocal),
+        Some(_) => return stop(Diag::Unverifiable),
     }
     // Zero use is confirmed at this point. Anything after this can be treated as an ordinary failure
     let text = v["result"].as_str().unwrap_or_default();
@@ -1297,7 +1343,11 @@ pub fn parse_usage_text(text: &str, now_ms: i64, default_tz: &TimeZone) -> Vec<U
         let resets = lower
             .find("resets ")
             .and_then(|i| parse_reset(after[i + 7..].trim(), now_ms, default_tz));
-        let ident = window_identity(label.trim());
+        // Only the session / weekly / monthly limits. Extra usage and other headings are not sent (Codex sends no
+        // counterpart, and a maxed-out extra usage must not read as a reached limit)
+        let Some(ident) = window_identity(label.trim()) else {
+            continue;
+        };
         let mut w = make_window(&ident.id, pct, resets).with_seconds(ident.secs);
         w.label = ident.label;
         w.scope = ident.model;
@@ -1315,36 +1365,60 @@ struct WindowIdentity {
     model: Option<String>,
 }
 
-/// `/usage` heading -> window id, display label, length and model
-fn window_identity(label: &str) -> WindowIdentity {
-    let make = |id: &str, label: &str, secs: Option<i64>, model: Option<String>| WindowIdentity {
-        id: id.to_string(),
-        label: label.to_string(),
-        secs,
-        model,
+/// `/usage` heading -> window id, display label, length and model. None for headings that are not a usage-limit window
+fn window_identity(label: &str) -> Option<WindowIdentity> {
+    let make = |id: &str, label: &str, secs: Option<i64>, model: Option<String>| {
+        Some(WindowIdentity {
+            id: id.to_string(),
+            label: label.to_string(),
+            secs,
+            model,
+        })
     };
+    // Whole headings only, so a heading that merely contains these words (an extra allowance, a spend line) is never read as a limit.
     // The official wording renamed "session limit" to "5-hour limit" (2.1.312). Read either heading as the 5-hour window
     let lower = label.to_ascii_lowercase();
-    if label == "Current session" || lower.contains("5-hour") || lower.contains("5 hour") {
+    if matches!(
+        lower.as_str(),
+        "current session" | "current 5-hour limit" | "current 5 hour limit"
+    ) {
         return make("five_hour", "5h", Some(5 * 60 * 60), None);
     }
-    if let Some(rest) = label.strip_prefix("Current week") {
-        let model = rest
-            .trim()
-            .trim_start_matches('(')
-            .trim_end_matches(')')
-            .trim();
-        if model.is_empty() || model.eq_ignore_ascii_case("all models") {
-            return make("seven_day", "Weekly", Some(WEEK_SECS), None);
-        }
-        let id = format!("seven_day_{}", slug(model));
-        let name = known_window(&id).map_or_else(|| format!("Weekly {model}"), |k| k.0.to_string());
-        return make(&id, &name, Some(WEEK_SECS), Some(model.to_string()));
+    if lower == "current week" || lower == "current week (all models)" {
+        return make("seven_day", "Weekly", Some(WEEK_SECS), None);
     }
-    if label.starts_with("Current month") {
+    // `Current week (<model>)` for a known model only. An unknown model name (e.g. one with a version number) is not read,
+    // so it can never be taken for a known one
+    if let Some(model) = label
+        .strip_prefix("Current week (")
+        .and_then(|r| r.strip_suffix(')'))
+    {
+        // The whole name must be a known model (e.g. "Opus"); a name with anything else is another model
+        let model_slug = slug(model);
+        if !CLAUDE_MODELS.contains(&model_slug.as_str()) {
+            return None;
+        }
+        let name = known_scope(&model_slug).filter(|n| n.eq_ignore_ascii_case(model.trim()))?;
+        let id = format!("seven_day_{model_slug}");
+        let label = known_window(&id).map_or_else(|| format!("Weekly {name}"), |k| k.0.to_string());
+        return make(&id, &label, Some(WEEK_SECS), Some(name.to_string()));
+    }
+    if lower == "current month" {
         return make("monthly", "Monthly", None, None);
     }
-    make(&slug(label), label, None, None)
+    None
+}
+
+/// Model names Claude's per-model weekly windows may carry (a subset of `KNOWN_SCOPES`)
+const CLAUDE_MODELS: &[&str] = &["fable", "opus", "sonnet", "haiku"];
+
+/// Whether an id is a Claude window: `five_hour`, `seven_day`, `monthly` or `seven_day_<known model>`. Windows from older
+/// versions' saved values and statusLine names are checked against this too, so nothing else (extra usage, other names) is used
+pub fn is_claude_window(id: &str) -> bool {
+    matches!(id, "five_hour" | "seven_day" | "monthly")
+        || id
+            .strip_prefix("seven_day_")
+            .is_some_and(|m| CLAUDE_MODELS.contains(&m))
 }
 
 /// Take only the needed fields from the `claude auth status` JSON (email and organization are dropped).
@@ -1531,7 +1605,7 @@ mod tests {
         AccountInfo {
             plan: Some("max".into()),
             logged_in: Some(true),
-            subscription: None,
+            subscription: Some(true),
         }
     }
 
@@ -1664,10 +1738,33 @@ mod tests {
         assert_eq!(ws[0].id, "seven_day_sonnet");
         assert_eq!(ws[0].label, "Weekly Sonnet");
         assert_eq!(
-            (ws[1].id.as_str(), ws[1].resets_at.as_deref()),
-            ("extra_usage", None)
+            ws.len(),
+            1,
+            "extra usage and unknown headings are not windows"
         );
-        assert_eq!(ws.len(), 2);
+    }
+
+    #[test]
+    fn maxed_out_extra_usage_is_not_a_reached_limit() {
+        let text = "Current session: 20% used · resets Nov 17, 1am (Asia/Tokyo)\nCurrent week (all models): 30% used · resets Nov 20, 4pm (Asia/Tokyo)\nExtra usage: 100% used · resets Dec 1 (Asia/Tokyo)\nAcme Corp pool: 100% used\n";
+        let ws = parse_usage_text(text, NOW, &tokyo());
+        let ids: Vec<_> = ws.iter().map(|w| w.id.as_str()).collect();
+        assert_eq!(ids, ["five_hour", "seven_day"]);
+        // Headings that only contain the words of a limit, and unknown models, are not read
+        let lookalikes = "Current monthly spend: 100% used
+Extra 5-hour allowance: 100% used
+Current week (Opus 4): 5% used
+Current week (Acme): 5% used
+Current week (Opus 試用): 5% used
+Current week (Opus-4): 5% used
+Current session limit for org: 100% used
+";
+        assert!(parse_usage_text(lookalikes, NOW, &tokyo()).is_empty());
+        let (p, _, _h) = provider("extra-usage", vec![Ok(text.into())]);
+        let mut p = p;
+        let snap = p.collect(NOW, false);
+        assert_eq!(snap.blocked, Some(false), "{snap:?}");
+        assert!(snap.windows.iter().all(|w| w.used_percent < 100.0));
     }
 
     #[test]
@@ -1789,6 +1886,111 @@ mod tests {
         p.collect(NOW + 121 * MINUTE_MS, true);
         assert_eq!(fake.calls(), 1, "resumes with a manual --force");
         let _ = std::fs::remove_dir_all(h);
+    }
+
+    #[test]
+    fn a_maxed_out_model_week_from_statusline_does_not_block() {
+        let h = home("statusline-model");
+        crate::statusline::save_capture(
+            &h,
+            &json!({"five_hour": {"used_percentage": 20}, "seven_day": {"used_percentage": 20}, "seven_day_opus": {"used_percentage": 100}}),
+            NOW,
+        )
+        .unwrap();
+        let fake = Fake::new(vec![Ok(usage_text(10))]);
+        let mut p = provider_with(&h, &fake, Logger::stderr());
+        p.collect(NOW - MINUTE_MS, false);
+        let snap = p.collect(NOW, false);
+        let opus = snap
+            .windows
+            .iter()
+            .find(|w| w.id == "seven_day_opus")
+            .unwrap();
+        assert_eq!(opus.scope.as_deref(), Some("Opus"));
+        assert_eq!(snap.blocked, Some(false), "{snap:?}");
+    }
+
+    #[test]
+    fn extra_usage_saved_by_an_older_version_does_not_block() {
+        let h = home("old-extra");
+        let mut five = make_window("five_hour", 20.0, None);
+        five.kind = crate::schema::WindowKind::Session;
+        let extra = UsageWindow {
+            id: "extra_usage".into(),
+            label: "Extra usage".into(),
+            kind: crate::schema::WindowKind::Other,
+            scope: None,
+            used_percent: 100.0,
+            resets_at: None,
+            fetched_at: None,
+        };
+        let saved = ClaudeState {
+            state_version: STATE_VERSION,
+            last_ok: Some(Observation {
+                fetched_ms: NOW - MINUTE_MS,
+                windows: vec![five, extra],
+            }),
+            cli_supported: Some(true),
+            ..Default::default()
+        };
+        write_json_atomic(&h.join(STATE_FILE), &saved).unwrap();
+        crate::statusline::save_capture(&h, &json!({"extra_usage": {"used_percentage": 100}}), NOW)
+            .unwrap();
+        let fake = Fake::new(vec![]);
+        let p = provider_with(&h, &fake, Logger::stderr());
+        let snap = p.build(NOW);
+        assert_eq!(snap.blocked, Some(false), "{snap:?}");
+        let ids: Vec<_> = snap.windows.iter().map(|w| w.id.as_str()).collect();
+        assert_eq!(ids, ["five_hour"]);
+    }
+
+    #[test]
+    fn corrupt_state_keeps_auto_fetch_stopped() {
+        let stopped = json!({"guard_tripped": true, "last_error": "not_local", "cli_supported": true, "last_auth_ms": NOW - MINUTE_MS});
+        let cases: Vec<(&str, String)> = vec![
+            ("truncated", stopped.to_string()[..20].to_string()),
+            ("not an object", "[1, 2]".into()),
+            ("empty", String::new()),
+            (
+                "stop flag of another type",
+                json!({"guard_tripped": "true", "cli_supported": true}).to_string(),
+            ),
+            (
+                "account stop of another type",
+                json!({"account_changed": 1}).to_string(),
+            ),
+            (
+                "marker of another type",
+                json!({"usage_in_flight_ms": "123"}).to_string(),
+            ),
+            (
+                "stop flag null",
+                json!({"guard_tripped": null, "cli_supported": true}).to_string(),
+            ),
+        ];
+        for (name, content) in cases {
+            let h = home("corrupt-state");
+            std::fs::write(h.join(STATE_FILE), &content).unwrap();
+            let fake = Fake::new(vec![]);
+            let mut p = provider_with(&h, &fake, Logger::stderr());
+            let snap = p.collect(NOW, false);
+            // A restart reads the state the first run saved
+            let mut again = provider_with(&h, &fake, Logger::stderr());
+            again.collect(NOW + 120 * MINUTE_MS, false);
+            assert_eq!(
+                fake.calls(),
+                0,
+                "{name}: no automatic /usage after a restart"
+            );
+            assert_eq!(snap.error_code, Some(ErrorCode::SafetyStop), "{name}");
+            assert!(load_state(&h.join(STATE_FILE)).guard_tripped, "{name}");
+            again.collect(NOW + 121 * MINUTE_MS, true);
+            assert_eq!(fake.calls(), 1, "{name}: resumes with a manual --force");
+        }
+        // Only a missing file starts fresh
+        let (mut p, fake, _h) = provider("fresh-state", vec![]);
+        p.collect(NOW, false);
+        assert_eq!(fake.calls(), 1);
     }
 
     // ---- The resident agent recovers from a temporarily missing CLI ----
@@ -2072,6 +2274,21 @@ mod tests {
             parse_auth_status(&json!({"authMethod": "claude.ai"}), true).subscription,
             Some(true)
         );
+        // An unknown or missing sign-in method doesn't confirm a subscription, so /usage is never run
+        for auth in [
+            json!({"authMethod": "new_method", "loggedIn": true, "subscriptionType": "max"}),
+            json!({"loggedIn": true, "subscriptionType": "max"}),
+        ] {
+            let unknown = parse_auth_status(&auth, true);
+            assert_eq!(unknown.subscription, None);
+            let (mut p, fake, _h) = provider("auth-unknown", vec![Ok(usage_text(10))]);
+            fake.set_auth(Ok(unknown));
+            let snap = p.collect(NOW, false);
+            p.collect(NOW + 10 * MINUTE_MS, true);
+            assert_eq!(fake.calls(), 0, "not even with --force: {auth}");
+            assert_eq!(snap.error.as_deref(), Some(Diag::AuthUnknown.message()));
+            assert_eq!(p.usage_due_ms(NOW), i64::MAX);
+        }
 
         let (mut p, fake, h) = provider("api-key", vec![Ok(usage_text(10))]);
         fake.set_auth(Ok(api_key));
@@ -2457,6 +2674,31 @@ mod tests {
                 Box::new(|v| v["usage"]["iterations"] = json!([{"input_tokens": 1}])),
                 Diag::NotLocal,
             ),
+            (
+                "iterations is not an array",
+                Box::new(|v| v["usage"]["iterations"] = json!({"count": 1})),
+                Diag::Unverifiable,
+            ),
+            (
+                "iterations null",
+                Box::new(|v| v["usage"]["iterations"] = Value::Null),
+                Diag::Unverifiable,
+            ),
+            (
+                "additional counter is a string",
+                Box::new(|v| v["usage"]["server_tool_use"] = json!({"web_search_requests": "1"})),
+                Diag::Unverifiable,
+            ),
+            (
+                "additional counter is nested",
+                Box::new(|v| v["usage"]["cache_creation"] = json!({"ephemeral": {"tokens": 1}})),
+                Diag::Unverifiable,
+            ),
+            (
+                "additional counters are not an object",
+                Box::new(|v| v["usage"]["output_tokens_details"] = json!(3)),
+                Diag::Unverifiable,
+            ),
         ];
         for (name, mutate, want) in cases {
             let mut v = zero_result();
@@ -2655,7 +2897,7 @@ mod tests {
         ]);
         // When auth status also contains unexpected values (an email address)
         fake.set_auth(Ok(parse_auth_status(
-            &json!({"planTier": "x@example.com", "loggedIn": true, "subscriptionType": "max"}),
+            &json!({"authMethod": "claude.ai", "planTier": "x@example.com", "loggedIn": true, "subscriptionType": "max"}),
             true,
         )));
         let mut p = provider_with(&h, &fake, Logger::file(&h));

@@ -196,9 +196,12 @@ function makeStack(kind: string): any {
 const findStack = (node: Node, pred: (n: Node) => boolean): Node | undefined =>
   node.kind !== "text" && pred(node) ? node : node.children.map((c) => findStack(c, pred)).find(Boolean);
 /** Columns of the stack that puts Claude and Codex side by side */
+/** The two provider columns: a stack whose two fixed-width children each name one provider (not the chart's legend or day labels) */
 const columnsOf = (root: Node): Node[] =>
-  findStack(root, (n) => n.children.filter((c) => c.kind === "stack" && c.props.size).length === 2 && texts(n).includes("Claude") && texts(n).includes("Codex"))!
-    .children.filter((c) => c.kind === "stack");
+  findStack(root, (n) => {
+    const kids = n.children.filter((c) => c.kind === "stack" && c.props.size);
+    return kids.length === 2 && kids.every((k) => texts(k).includes("Claude") !== texts(k).includes("Codex"));
+  })!.children.filter((c) => c.kind === "stack");
 
 const textNodes = (node: Node): Node[] => [...(node.kind === "text" ? [node] : []), ...node.children.flatMap(textNodes)];
 /** Methods available on Scriptable's Font (https://docs.scriptable.app/font/) */
@@ -806,12 +809,12 @@ test("Per-size content: small is compact with one forecast; medium adds reset, m
   const l = texts(large.widget.node);
   assert.ok(l.some((x) => x.includes("%/h")), l.join(" | "));
   assert.ok(l.includes("Fable weekly"), "large always shows scoped limits");
-  assert.ok(l.includes("Last 7d · Weekly") && l.includes("Claude") && l.includes("Codex"), l.join(" | "));
+  assert.ok(l.includes("This week · Weekly") && l.includes("Claude") && l.includes("Codex"), l.join(" | "));
   const asked = large.requests.map((r: any) => r.url).filter((u: string) => u.includes("/v2/history")).map((u: string) => new URL(u).searchParams.get("window"));
   assert.deepEqual(asked, ["seven_day", "seven_day"], "Claude and Codex overlay the same weekly trend (Codex has no 5h)");
   const urls = large.requests.map((r: any) => r.url);
   assert.deepEqual(urls.filter((u: string) => u.includes("/v2/history")).map((u: string) => new URL(u).search),
-    ["?provider=codex&window=seven_day&hours=168", "?provider=claude&window=seven_day&hours=168"]);
+    ["?provider=codex&window=seven_day&hours=170", "?provider=claude&window=seven_day&hours=170"]);
   for (const r of large.requests) assert.equal(r.onRedirect({}), null, "trend requests don't follow redirects either");
   assert.ok(images(large.widget.node).some((n) => (n.props.strokes as number) > 0), "draws the polyline");
   // Other display continues even if the trend can't be read
@@ -1165,7 +1168,7 @@ test("All chart lines have the same width", async () => {
 test("(After fixing the chart to weekly) even when only a scoped limit is named, the chart shows that provider's weekly limit for 7 days", async () => {
   const run = await runWidget({ family: "large", parameter: "claude.seven_day_fable", responder: historyFor([{ at: "2026-11-16T12:00:00.000Z", used_percent: 1 }]) });
   const all = texts(run.widget.node);
-  assert.ok(all.includes("Fable weekly") && all.includes("Last 7d · Weekly") && all.includes("Claude"), all.join(" | "));
+  assert.ok(all.includes("Fable weekly") && all.includes("This week · Weekly") && all.includes("Claude"), all.join(" | "));
   const asked = run.requests.map((r: any) => r.url).filter((u: string) => u.includes("/v2/history")).map((u: string) => new URL(u).searchParams.get("window"));
   assert.deepEqual(asked, ["seven_day"]);
 });
@@ -1198,7 +1201,7 @@ test("The rate is omitted when showing the run-out time or when the column is na
 test("If one trend is missing it uses a short label; if both are missing, one line", async () => {
   const partial = await runWidget({ family: "large", responder: (url) => (url.includes("provider=codex") ? { status: 503, body: "" } : historyFor([{ at: "2026-11-16T12:00:00.000Z", used_percent: 4 }])(url)) });
   const p = texts(partial.widget.node);
-  assert.ok(p.includes("Last 7d · Weekly") && p.includes("Claude") && p.includes("Codex –"), p.join(" | "));
+  assert.ok(p.includes("This week · Weekly") && p.includes("Claude") && p.includes("Codex –"), p.join(" | "));
   const none = await runWidget({ family: "large", responder: (url) => (url.includes("/v2/history") ? { status: 503, body: "" } : undefined) });
   assert.ok(texts(none.widget.node).includes("No weekly data yet") && !texts(none.widget.node).includes("Last 24h"));
 });
@@ -1230,8 +1233,8 @@ test("The first piece is at least as wide as the bar height (never sticks out of
 test("The chart is fixed to the weekly limit's 7 days (5h and weekly are not mixed)", async () => {
   const run = await runWidget({ family: "large" });
   const asked = run.requests.map((r: any) => r.url).filter((u: string) => u.includes("/v2/history")).map((u: string) => new URL(u).search);
-  assert.deepEqual(asked, ["?provider=codex&window=seven_day&hours=168", "?provider=claude&window=seven_day&hours=168"]);
-  assert.equal(lib.TREND_HOURS, 168);
+  assert.deepEqual(asked, ["?provider=codex&window=seven_day&hours=170", "?provider=claude&window=seven_day&hours=170"]);
+  assert.equal(lib.TREND_HOURS, 170);
 });
 
 test("Remaining at 99.7% used is 0.3% (not 0.2% from floating-point error, even through draw-time recomputation)", () => {
@@ -1646,7 +1649,7 @@ test("Version 46: weekday times to the minute; chart heading (Usage) on the left
   const run = await runWidget({ family: "large", parameter: "demo:normal", now });
   const all = texts(run.widget.node);
   const usage = all.indexOf("Usage");
-  assert.ok(usage >= 0 && all.indexOf("Last 7d · Weekly") > usage, all.join(" | "));
+  assert.ok(usage >= 0 && all.indexOf("This week · Weekly") > usage, all.join(" | "));
   // Legend row: heading -> flexible spacer -> legend (right-aligned)
   const rows = (node: any): any[] => [...(node.kind === "stack" ? [node] : []), ...node.children.flatMap(rows)];
   const legend = rows(run.widget.node).find((s) => s.children.some((c: any) => c.kind === "text" && c.props.text === "Usage"));
@@ -1818,4 +1821,34 @@ test("If no provider shown in large has a weekly limit, no chart height is reser
   // With a weekly limit, chart height is reserved
   const withWeek = lib.layoutGroups(lib.sanitizeView(sampleView()), "large", "claude", NOW, { screen });
   assert.ok(withWeek.trendHeight > 0);
+});
+
+test("The large chart runs from this week's Sunday to Saturday in local time, with a label under each day", async () => {
+  const range = lib.weekRange(NOW);
+  const start = new Date(range.start);
+  assert.equal(start.getDay(), 0, "starts on Sunday");
+  assert.equal(start.getHours() + start.getMinutes() + start.getSeconds() + start.getMilliseconds(), 0, "at local midnight");
+  assert.ok(range.start <= NOW.getTime() && NOW.getTime() < range.end);
+  const end = new Date(range.end);
+  assert.equal(end.getDay(), 0);
+  assert.equal(plain(lib.dayStarts(range)).length, 6);
+  // Points before Sunday or from next week aren't drawn; one at the start of the week is at the left edge
+  const lines = plain(lib.sparkLines([
+    { at: range.start - 3600000, used: 50, brk: false },
+    { at: range.start, used: 10, brk: false },
+    { at: range.end + 5000, used: 20, brk: false },
+  ], NOW, 260, 60, 3, 168, range));
+  assert.deepEqual(lines.map((l: number[][]) => l.length), [1]);
+  assert.equal(lines[0][0][0], 3);
+  // Every day starts at its own local midnight
+  for (const t of range.days) assert.equal(new Date(t).getHours() + new Date(t).getMinutes(), 0);
+  const run = await runWidget({ family: "large", responder: historyFor([{ at: "2026-11-16T12:00:00.000Z", used_percent: 4 }]) });
+  const all = texts(run.widget.node);
+  for (const day of lib.WEEKDAYS) assert.ok(all.includes(day), `${day}: ${all.join(" | ")}`);
+});
+
+test("Without points this week, the legend says there is no weekly data yet", async () => {
+  const range = lib.weekRange(NOW);
+  const run = await runWidget({ family: "large", responder: historyFor([{ at: new Date(range.start - 60000).toISOString(), used_percent: 4 }]) });
+  assert.ok(texts(run.widget.node).includes("No weekly data yet"), texts(run.widget.node).join(" | "));
 });

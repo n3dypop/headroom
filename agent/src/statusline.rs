@@ -7,7 +7,8 @@ use std::io::{Read, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
 
-use crate::schema::{UsageWindow, make_window};
+use crate::providers::claude::is_claude_window;
+use crate::schema::{UsageWindow, WindowKind, known_scope, make_window};
 use crate::store::{read_json, write_json_atomic};
 use crate::time::{iso_from_ms, ms_from_epoch, now_ms};
 
@@ -34,9 +35,7 @@ pub fn run(args: &[String], home: &Path) -> i32 {
     let parsed: Option<Value> = serde_json::from_slice(&input).ok();
 
     // rate_limits is absent until the session's first API response. When absent, keep the previous capture.
-    if let Some(rl) = parsed.as_ref().and_then(|v| v.get("rate_limits"))
-        && rl.as_object().is_some_and(|o| !o.is_empty())
-    {
+    if let Some(rl) = parsed.as_ref().and_then(|v| v.get("rate_limits")) {
         let _ = save_capture(home, rl, now_ms());
     }
 
@@ -52,18 +51,41 @@ pub fn run(args: &[String], home: &Path) -> i32 {
     0
 }
 
-/// Don't write if the value is unchanged (keeps captured_at as "when this value appeared").
+/// The part of statusLine's rate_limits that is kept: entries named like a Claude window (`is_claude_window`) and only their `used_percentage` and
+/// `resets_at` numbers. Other fields Claude Code may add are not stored. None if nothing remains
+pub fn capture_fields(rate_limits: &Value) -> Option<Value> {
+    let kept: serde_json::Map<String, Value> = rate_limits
+        .as_object()?
+        .iter()
+        .filter(|(id, _)| is_claude_window(id))
+        .filter_map(|(id, w)| {
+            let pct = w.get("used_percentage").filter(|v| v.is_number())?;
+            let mut out = serde_json::Map::new();
+            out.insert("used_percentage".into(), pct.clone());
+            if let Some(r) = w.get("resets_at").filter(|v| v.is_number()) {
+                out.insert("resets_at".into(), r.clone());
+            }
+            Some((id.clone(), Value::Object(out)))
+        })
+        .collect();
+    (!kept.is_empty()).then_some(Value::Object(kept))
+}
+
+/// Stores only `capture_fields`. Don't write if nothing is left or the value is unchanged (keeps captured_at as "when this value appeared").
 pub fn save_capture(home: &Path, rate_limits: &Value, now: i64) -> std::io::Result<bool> {
+    let Some(rate_limits) = capture_fields(rate_limits) else {
+        return Ok(false);
+    };
     let path = home.join(CAPTURE_FILE);
     if let Some(prev) = read_json::<Capture>(&path)
-        && &prev.rate_limits == rate_limits
+        && prev.rate_limits == rate_limits
     {
         return Ok(false);
     }
     let cap = Capture {
         captured_at: iso_from_ms(now),
         captured_at_ms: now,
-        rate_limits: rate_limits.clone(),
+        rate_limits,
     };
     write_json_atomic(&path, &cap)?;
     Ok(true)
@@ -87,13 +109,23 @@ pub fn windows_from_rate_limits(rl: &Value) -> Vec<UsageWindow> {
         return Vec::new();
     };
     obj.iter()
+        .filter(|(id, _)| is_claude_window(id))
         .filter_map(|(id, w)| {
             let pct = w.get("used_percentage")?.as_f64()?;
             let resets = w
                 .get("resets_at")
                 .and_then(Value::as_f64)
                 .and_then(ms_from_epoch);
-            Some(make_window(id, pct, resets))
+            let mut window = make_window(id, pct, resets);
+            // A per-model weekly window carries its model, as from /usage (so it never counts as the overall limit)
+            if let Some(model) = id.strip_prefix("seven_day_") {
+                window.scope = known_scope(model).map(str::to_string);
+                window.kind = WindowKind::Weekly;
+                if window.label == *id {
+                    window.label = format!("Weekly {}", window.scope.as_deref().unwrap_or(model));
+                }
+            }
+            Some(window)
         })
         .collect()
 }
@@ -171,6 +203,53 @@ mod tests {
         );
         assert_eq!(read_capture(&home).unwrap().0, 3_000);
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn capture_keeps_only_window_numbers() {
+        let home = crate::test_util::TempHome::new("headroom-test-capture-fields");
+        let rl = json!({
+            "five_hour": {"used_percentage": 3, "resets_at": 1, "org": "Acme Corp"},
+            "Acme Corp": {"used_percentage": 9},
+            "acme_corp": {"used_percentage": 9},
+            "seven_day_opus_4": {"used_percentage": 9},
+            "extra_usage": {"used_percentage": 100},
+            "seven_day": {"used_percentage": "9"},
+            "note": "Acme Corp"
+        });
+        assert!(save_capture(&home, &rl, 1_000).unwrap());
+        let text = std::fs::read_to_string(home.join(CAPTURE_FILE)).unwrap();
+        assert!(!text.to_ascii_lowercase().contains("acme"), "{text}");
+        assert!(
+            !text.contains("opus_4") && !text.contains("extra_usage"),
+            "{text}"
+        );
+        let saved: Capture = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            saved.rate_limits,
+            json!({"five_hour": {"used_percentage": 3, "resets_at": 1}})
+        );
+        assert!(!save_capture(&home, &json!({"note": "x"}), 2_000).unwrap());
+    }
+
+    #[test]
+    fn model_weeks_from_statusline_carry_their_model() {
+        let ws = windows_from_rate_limits(&json!({
+            "seven_day": {"used_percentage": 20},
+            "seven_day_opus": {"used_percentage": 100},
+            "seven_day_fable": {"used_percentage": 5}
+        }));
+        let opus = ws.iter().find(|w| w.id == "seven_day_opus").unwrap();
+        assert_eq!(
+            (opus.scope.as_deref(), opus.kind),
+            (Some("Opus"), WindowKind::Weekly)
+        );
+        let fable = ws.iter().find(|w| w.id == "seven_day_fable").unwrap();
+        assert_eq!(
+            (fable.scope.as_deref(), fable.label.as_str()),
+            (Some("Fable"), "Weekly Fable")
+        );
+        assert_eq!(ws.iter().find(|w| w.id == "seven_day").unwrap().scope, None);
     }
 
     #[test]

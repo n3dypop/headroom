@@ -1,6 +1,7 @@
 // D1 reads and writes. Only the parts of the Worker's D1 binding we use are typed (no external type definitions).
 import {
   EVENT_RETENTION_MS,
+  BOUNDARY_GUARD_MS,
   effectiveObservedAt,
   emptyEventState,
   observationKey,
@@ -15,7 +16,7 @@ import {
   type Snapshot,
   type UsageObservation,
 } from "../../core/src/index.ts";
-import type { CleanUpload } from "./sanitize.ts";
+import { settleLimits, withoutUnstored, type CleanUpload } from "./sanitize.ts";
 
 export interface D1Statement {
   bind(...values: unknown[]): D1Statement;
@@ -42,11 +43,10 @@ export const PRUNE_ROWS = 300;
 export const ROLLUP_WINDOWS: readonly string[] = ["seven_day"];
 /**
  * Number of PC names that can be registered in D1 (twice the writing-PC limit of 16, to allow replacing PCs). A name, once registered
- * in collector_names, is never deleted (deleting it would drop that name's exclusion markers and acceptance records, bringing back the
- * previous account's values or turning a past acceptance into a new switch). Reuse the same name when replacing a PC. If used up, recreate D1 (see docs/install.md).
+ * in collector_names, is never deleted (deleting it would drop that name's acceptance records, turning a past acceptance into a new
+ * switch). Reuse the same name when replacing a PC. If used up, recreate D1 (see docs/install.md).
  * A new name is registered in the first statement of the upload batch, and the CHECK on the number (slot) keeps it within the limit (even with concurrent uploads).
- * Per-PC table names never exceed this number, so it also bounds the exclusion markers created when accepting a boundary
- * and the per-PC rows read on upload
+ * Per-PC table names never exceed this number, so it also bounds the per-PC rows read on upload
  */
 export const MAX_STORED_COLLECTORS = 32;
 /** Rows per aggregation statement (5 values per row; fits D1's limit of 100 values per statement) */
@@ -56,25 +56,28 @@ export const ROLLUP_FUTURE_MS = 5 * 60_000;
 
 /** Rows that fit D1's per-statement bind limit (100) */
 const ROWS_PER_INSERT = 14;
-/** A boundary ahead of the received time is treated as PC clock skew and accepted only up to this margin */
-const BOUNDARY_FUTURE_MS = 10 * 60_000;
+
+/** The boundary moved forward by the guard (BOUNDARY_GUARD_MS), in SQL over a column or subquery giving the boundary */
+const guardedSql = (since: string) => `strftime('%Y-%m-%dT%H:%M:%fZ', julianday(${since}) + ${BOUNDARY_GUARD_MS} / 86400000.0)`;
+/** The same in code ('' when there is no boundary) */
+export const guarded = (since: string): string =>
+  since === "" ? "" : new Date(Date.parse(since) + BOUNDARY_GUARD_MS).toISOString();
 
 /**
- * History boundaries. Kept in 3 tables (times only, no account information):
+ * History boundaries. Kept in 2 tables (times only, no account information):
  * - `since` (per provider): the boundary in the endpoint's time. Observations before it are deleted. Moves forward only. `setters` is the PC
  *   that created the boundary (that PC's provider stays in the merge right after acceptance even without windows)
  * - `sources` (per provider and PC): the last `history_since` accepted from that PC. Repeats of the same value are not new acceptances.
  *   An acceptance after a clock fix (a smaller value than before) is also a new acceptance if the value changed
- * - `watermarks` (per provider and PC): the latest observation time, in that PC's clock, among observations deleted by the boundary. If deleted
- *   observations are resent (with a newer received time), comparing in that PC's clock keeps them out. The fetch times of current values saved
- *   at the boundary are included in the marker, so a resent current value without observations doesn't bring windows back
- * Boundaries are not updated from uploads whose seq has become stale by save time (checked inside SQL)
+ * Uploads from PCs whose clock is off by more than CLOCK_TOLERANCE_MS are refused, so a PC's times are within the guard
+ * (BOUNDARY_GUARD_MS) of the real ones: values stamped before the boundary plus the guard may be from before the switch and are left out
+ * (except the setting PC's own values after its acceptance). Boundaries are not updated from uploads whose seq has become stale by save
+ * time (checked inside SQL)
  */
 export interface Boundaries {
   since: Map<string, string>;
   setters: Map<string, string>;
   sources: Map<string, string>;
-  watermarks: Map<string, string>;
 }
 
 const pcKey = (provider: string, collector: string) => `${provider}/${collector}`;
@@ -86,14 +89,10 @@ export async function loadBoundaries(db: D1Like): Promise<Boundaries> {
   const sources = await db
     .prepare("SELECT provider, collector, source FROM boundary_sources")
     .all<{ provider: string; collector: string; source: string }>();
-  const marks = await db
-    .prepare("SELECT provider, collector, until FROM boundary_watermarks")
-    .all<{ provider: string; collector: string; until: string }>();
   return {
     since: new Map(since.results.map((r) => [r.provider, r.since])),
     setters: new Map(since.results.map((r) => [r.provider, r.collector])),
     sources: new Map(sources.results.map((r) => [pcKey(r.provider, r.collector), r.source])),
-    watermarks: new Map(marks.results.map((r) => [pcKey(r.provider, r.collector), r.until])),
   };
 }
 
@@ -152,23 +151,20 @@ export async function saveUpload(
   // The seq compared is the last accepted seq kept in the registration table (it survives the latest value expiring after 30 days)
   const fresh = named === null || upload.seq > named.seq;
   const notStale = "NOT EXISTS (SELECT 1 FROM collector_names n0 WHERE n0.name = ? AND n0.seq >= ?)";
-  const latestAllowed = new Date(receivedAt.getTime() + BOUNDARY_FUTURE_MS).toISOString();
   for (const [provider, p] of Object.entries(upload.snapshot.providers)) {
     const source = p?.history_since ?? null;
-    if (source === null || !fresh || source > latestAllowed) continue;
+    if (source === null || !fresh) continue;
     if (acceptedSource.get(provider) === source) continue;
-    // A new acceptance. The boundary is never after the received time. If it doesn't move past the boundary at save time, use the received time
-    // (acceptance after a clock fix). The comparison target is read inside SQL (so the correction isn't lost if a concurrent request moved the boundary first)
+    // A new acceptance. The boundary is never after the received time (an acceptance time ahead of it was recorded while the PC's clock
+    // ran ahead). If it doesn't move past the boundary at save time, use the received time (acceptance after a clock fix). The comparison target is read inside SQL (so the correction isn't lost if a concurrent request moved the boundary first)
     const candidate = source < received ? source : received;
     const currentSince = "(SELECT since FROM history_boundaries WHERE provider = ?)";
-    const windowsPath = `$.providers.${provider}.windows`;
-    const fetchedPath = `$.providers.${provider}.fetched_at`;
     // Don't apply the same acceptance (PC, provider, history_since) twice. Even if two concurrent uploads both pass the pre-check, the batch
     // checks the acceptance record (boundary_sources), which is written last (batch statements run one by one in order)
     const unseen =
       "NOT EXISTS (SELECT 1 FROM boundary_sources s WHERE s.provider = ? AND s.collector = ? AND s.source = ?)";
     statements.push(
-      // Advance the boundary epoch on every acceptance (even if since doesn't change, per-PC exclusion markers change the valid range)
+      // Advance the boundary epoch on every acceptance (even if since doesn't change, the setting PC and its acceptance time change)
       db
         .prepare(
           `INSERT INTO boundary_epochs (provider, epoch) SELECT ?, 1 WHERE ${notStale} AND ${unseen}
@@ -187,30 +183,10 @@ export async function saveUpload(
           `INSERT INTO history_boundaries (provider, since, collector)
            SELECT ?, CASE WHEN ? > coalesce(${currentSince}, '') THEN ? ELSE ? END, ? WHERE ${notStale} AND ${unseen}
            ON CONFLICT (provider) DO UPDATE SET since = excluded.since, collector = excluded.collector
-           WHERE excluded.since > history_boundaries.since`,
+           -- A later acceptance at the same boundary time also becomes the setting PC
+           WHERE excluded.since >= history_boundaries.since`,
         )
         .bind(provider, candidate, provider, candidate, received, collector, collector, upload.seq, provider, collector, source),
-      // Markers are built from the updated (save-time) boundary: each PC's latest saved observation time (observation_marks;
-      // no scan of the observation table, nothing missed) and the current values saved at the boundary (window and provider fetch times).
-      // Observations before the boundary are not deleted here (the amount is unbounded). They are filtered on read and Cron deletes them gradually.
-      // Markers are created for every saved name (not cut off by count; the number of names is bounded by MAX_STORED_COLLECTORS)
-      db
-        .prepare(
-          `INSERT INTO boundary_watermarks (provider, collector, until)
-           SELECT ?, pc, max(at) FROM (
-             SELECT collector AS pc, latest AS at, '' AS received FROM observation_marks WHERE provider = ?
-             UNION ALL
-             SELECT c.collector, json_extract(w.value, '$.fetched_at'), c.received_at
-               FROM collector_snapshots c, json_each(c.snapshot, ?) w
-             UNION ALL
-             SELECT c.collector, json_extract(c.snapshot, ?), c.received_at FROM collector_snapshots c
-           )
-           WHERE at IS NOT NULL AND min(at, received) < ${currentSince} AND ${notStale} AND ${unseen}
-           GROUP BY pc
-           ON CONFLICT (provider, collector) DO UPDATE SET until = excluded.until
-           WHERE excluded.until > boundary_watermarks.until`,
-        )
-        .bind(provider, provider, windowsPath, fetchedPath, provider, collector, upload.seq, provider, collector, source),
       // The acceptance record goes last (the statements above only apply to an acceptance not yet recorded)
       db
         .prepare(
@@ -235,12 +211,10 @@ export async function saveUpload(
           `INSERT OR IGNORE INTO observations
              (provider, window_id, collector, observed_at, first_received_at, resets_at, used_percent)
            SELECT column1, column2, column3, column4, column5, column6, column7 FROM (VALUES ${placeholders}) AS v
+           -- Received before the boundary, or stamped before the boundary plus the guard (may be from before the switch)
            WHERE NOT EXISTS (
              SELECT 1 FROM history_boundaries b
-             WHERE b.provider = v.column1 AND min(v.column4, v.column5) < b.since
-           ) AND NOT EXISTS (
-             SELECT 1 FROM boundary_watermarks w
-             WHERE w.provider = v.column1 AND w.collector = v.column3 AND v.column4 <= w.until
+             WHERE b.provider = v.column1 AND (v.column5 < b.since OR v.column4 < ${guardedSql("b.since")})
            )`,
         )
         .bind(
@@ -250,25 +224,9 @@ export async function saveUpload(
         ),
     );
   }
-  // Advance each PC's latest saved observation time. Check by primary key whether this upload's latest observation per provider was saved
-  // (no index scan). If the latest observation isn't saved due to the boundary, earlier observations aren't either
-  for (const provider of new Set(rows.map((o) => o.provider))) {
-    const last = rows.filter((o) => o.provider === provider).reduce((a, b) => (b.observed_at > a.observed_at ? b : a));
-    statements.push(
-      db
-        .prepare(
-          `INSERT INTO observation_marks (provider, collector, latest)
-           SELECT ?, ?, ? WHERE EXISTS (
-             SELECT 1 FROM observations WHERE provider = ? AND window_id = ? AND collector = ? AND observed_at = ?)
-           ON CONFLICT (provider, collector) DO UPDATE SET latest = max(observation_marks.latest, excluded.latest)`,
-        )
-        .bind(provider, collector, last.observed_at, provider, last.window_id, last.collector, last.observed_at),
-    );
-  }
   // Hourly aggregation of the weekly limit (7-day trend). For the weekly observations in this upload (up to 200),
   // look up the saved observations by primary key (values and first receipt as saved; unsaved observations aren't found; no scan of the observation table).
-  // The hour bucket and chart time are the earlier of observation and first receipt; per-PC exclusion is checked by the observation time
-  // the PC recorded. Per hour the best valid observation is the representative, written only if better than the current one or the current
+  // The hour bucket and chart time are the earlier of observation and first receipt. Per hour the best valid observation is the representative, written only if better than the current one or the current
   // one became invalid under the current boundary. Better means: newer time (effective_at), higher PC priority, newer observation time
   // recorded by the PC, then smaller PC name (so arrival order doesn't change the representative even when rounded to the same time).
   // From 8 days before to 5 minutes after the received time
@@ -282,10 +240,10 @@ export async function saveUpload(
   const lookup = (column: string) =>
     `(SELECT o.${column} FROM observations o
        WHERE o.provider = v.column1 AND o.window_id = v.column2 AND o.collector = v.column3 AND o.observed_at = v.column4)`;
-  /** Whether the row is valid under the current boundary and per-PC exclusion (same condition as reads) */
+  /** Whether the row is valid under the current boundary (same condition as saving and reads) */
   const valid = (t: string) =>
-    `min(${t}.observed_at, ${t}.first_received_at) >= coalesce((SELECT since FROM history_boundaries b WHERE b.provider = ${t}.provider), '')
-     AND NOT EXISTS (SELECT 1 FROM boundary_watermarks w WHERE w.provider = ${t}.provider AND w.collector = ${t}.collector AND ${t}.observed_at <= w.until)`;
+    `NOT EXISTS (SELECT 1 FROM history_boundaries b
+       WHERE b.provider = ${t}.provider AND (${t}.first_received_at < b.since OR ${t}.observed_at < ${guardedSql("b.since")}))`;
   for (let i = 0; i < candidates.length; i += ROLLUP_ROWS_PER_INSERT) {
     const chunk = candidates.slice(i, i + ROLLUP_ROWS_PER_INSERT);
     statements.push(
@@ -328,6 +286,7 @@ export async function saveUpload(
         .bind(...chunk.flatMap((o) => [o.provider, o.window_id, o.collector, o.observed_at, rank])),
     );
   }
+  // The latest value is stored as sent
   const body = JSON.stringify(upload.snapshot);
   // Change counters advance in the same batch as the save (never a case where only the counter fails and nothing is recomputed or published).
   // The global counter advances per upload (used by the latest-value re-put to detect a save after reading)
@@ -421,8 +380,8 @@ export async function mayWrite(db: D1Like, collector: string): Promise<boolean> 
 }
 
 /**
- * Per-PC latest values. For providers with a boundary, windows fetched before the boundary (endpoint time) or at/before the deleted-observation
- * marker (that PC's clock) are removed. For a PC that hasn't accepted the switch, a provider with no remaining windows and a provider fetch time
+ * Per-PC latest values. For providers with a boundary, a value received before the boundary is removed, and windows fetched before the
+ * boundary plus the guard are removed (the setting PC's windows: before its own acceptance time, in its own clock). For a PC that hasn't accepted the switch, a provider with no remaining windows and a provider fetch time
  * before the boundary is omitted (so the merge never picks the previous account's value; a post-boundary "no windows, limit only" value is kept)
  */
 export async function loadSnapshots(db: D1Like): Promise<{ snapshots: Snapshot[]; received: Map<string, string> }> {
@@ -431,7 +390,10 @@ export async function loadSnapshots(db: D1Like): Promise<{ snapshots: Snapshot[]
     .prepare("SELECT collector, snapshot, received_at FROM collector_snapshots")
     .all<{ collector: string; snapshot: string; received_at: string }>();
   return {
-    snapshots: results.map((r) => applyBoundaries(JSON.parse(r.snapshot) as Snapshot, r.received_at, boundaries)),
+    // Held to today's rules (rows saved by an earlier Worker), then boundaries applied
+    snapshots: results.map((r) =>
+      settleLimits(applyBoundaries(withoutUnstored(JSON.parse(r.snapshot) as Snapshot), r.received_at, boundaries))
+    ),
     // Each PC's last received time (liveness marker)
     received: new Map(results.map((r) => [r.collector, r.received_at])),
   };
@@ -448,9 +410,11 @@ export function applyBoundaries(snapshot: Snapshot, receivedAt: string, boundari
       providers[id] = p;
       continue;
     }
-    const mark = boundaries.watermarks.get(pcKey(id, collector));
-    const after = (t: string | null) =>
-      t !== null && (t < receivedAt ? t : receivedAt) >= since && (mark === undefined || t > mark);
+    // The PC that set the boundary: from its own acceptance time (its clock). Others: received after the boundary (a row kept by an
+    // earlier Worker may have been received before it) and stamped after the boundary plus the guard
+    const source = boundaries.setters.get(id) === collector ? boundaries.sources.get(pcKey(id, collector)) : undefined;
+    const from = source ?? guarded(since);
+    const after = (t: string | null) => t !== null && t >= from && (source !== undefined || receivedAt >= since);
     const windows = p.windows.filter((w) => after(w.fetched_at));
     const providerAfter = after(p.fetched_at);
     if (windows.length === p.windows.length && providerAfter) {
@@ -472,8 +436,8 @@ export function applyBoundaries(snapshot: Snapshot, receivedAt: string, boundari
 }
 
 /**
- * A provider's observations received since `since`. Times used for computation are clamped to the first received time. Observations before
- * the history boundary or at/before the deleted-observation marker (PC clock) are not returned (same as the save-time check).
+ * A provider's observations received since `since`. Times used for computation are clamped to the first received time. Observations received
+ * before the history boundary or stamped before it plus the guard are not returned (same as the save-time check).
  * Reads only that provider's range via the (provider, first_received_at) index (keeps D1 rows read down)
  */
 export async function loadObservations(
@@ -500,11 +464,9 @@ export async function loadObservations(
       used_percent: number;
     }>();
   const cut = b.since.get(provider);
+  const guard = cut === undefined ? "" : guarded(cut);
   return results.flatMap((r) => {
-    const earliest = r.observed_at < r.first_received_at ? r.observed_at : r.first_received_at;
-    if (cut !== undefined && earliest < cut) return [];
-    const mark = b.watermarks.get(pcKey(provider, r.collector));
-    if (mark !== undefined && r.observed_at <= mark) return [];
+    if (cut !== undefined && (r.first_received_at < cut || r.observed_at < guard)) return [];
     const at = effectiveObservedAt(r.observed_at, r.first_received_at);
     return at === null
       ? []
@@ -754,6 +716,8 @@ export async function prune(db: D1Like, now: Date): Promise<void> {
     beforeBoundary("claude"),
     beforeBoundary("codex"),
     db.prepare("DELETE FROM collector_snapshots WHERE received_at < ?").bind(snapshotCutoff),
+    // A PC's latest value removed: the merged latest value is rebuilt by the next Cron (repairPublicState sees the counter move)
+    db.prepare(`UPDATE data_versions SET version = version + 1 WHERE provider = '${ALL_VERSION}' AND changes() > 0`),
   ]);
 }
 
@@ -910,8 +874,8 @@ export async function loadWeekly(
 }
 
 /**
- * Reads hourly aggregates for hours fromHour..toHour only, by primary-key range (bounded). Rows observed or received before the boundary (since),
- * and rows hit by per-PC exclusion (boundary_watermarks), are excluded (same conditions as regular history)
+ * Reads hourly aggregates for hours fromHour..toHour only, by primary-key range (bounded). Rows received before the boundary (since) or stamped
+ * before it plus the guard are excluded (same conditions as regular history)
  */
 export async function loadHourly(
   db: D1Like,
@@ -925,13 +889,10 @@ export async function loadHourly(
     .prepare(
       `SELECT effective_at AS observed_at, used_percent, resets_at FROM observation_hourly h
        WHERE provider = ? AND window_id = ? AND hour >= ? AND hour <= ?
-         AND min(observed_at, first_received_at) >= ?
-         AND NOT EXISTS (
-           SELECT 1 FROM boundary_watermarks w WHERE w.provider = h.provider AND w.collector = h.collector AND h.observed_at <= w.until
-         )
+         AND first_received_at >= ? AND observed_at >= ?
        ORDER BY hour LIMIT ?`,
     )
-    .bind(provider, windowId, fromHour, toHour, since, HOURLY_READ_LIMIT)
+    .bind(provider, windowId, fromHour, toHour, since, guarded(since), HOURLY_READ_LIMIT)
     .all<HourlyRow>();
   return results ?? [];
 }

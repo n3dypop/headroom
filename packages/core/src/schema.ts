@@ -104,9 +104,7 @@ export const KNOWN_SCOPES: Readonly<Record<string, string>> = {
   sonnet: "Sonnet",
   haiku: "Haiku",
   codex_other: "codex_other",
-  // Codex's additional group (limitId). An unofficial real-device record says Spark, but the public types don't confirm a
-  // fixed mapping to a model name, so don't hard-code a model name; show it as "Codex extra"
-  // https://github.com/rjwalters/llm-monitor/blob/main/docs/spikes/2026-07-30-codex-usage-probe.md
+  // An additional Codex limit group (limitId). Its model isn't fixed by the public types, so it is shown as "Codex extra"
   codex_bengalfox: "Codex extra",
 };
 
@@ -116,6 +114,4 @@ export const KNOWN_WINDOWS: Readonly<Record<string, KnownWindow>> = {
   monthly: { label: "Monthly", kind: "monthly", window_seconds: null },
   seven_day_opus: { label: "Weekly Opus", kind: "weekly", window_seconds: WEEK },
   seven_day_sonnet: { label: "Weekly Sonnet", kind: "weekly", window_seconds: WEEK },
-  spend_limit: { label: "Spend limit", kind: "other", window_seconds: null },
-  extra_usage: { label: "Extra usage", kind: "other", window_seconds: null },
 };

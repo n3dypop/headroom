@@ -37,7 +37,7 @@ export function parseTokens(raw: string | undefined): TokenEntry[] {
     }
     return [];
   });
-  // At most MAX_COLLECTORS writing PCs (bounds how many per-PC and exclusion markers one upload writes at once).
+  // At most MAX_COLLECTORS writing PCs (bounds how many per-PC rows one upload writes at once).
   // A config over the limit is treated as an error and no credential is accepted (so it gets noticed)
   const collectors = new Set(entries.flatMap((e) => (e.role === "write" ? [e.collector] : [])));
   return collectors.size > MAX_COLLECTORS ? [] : entries;

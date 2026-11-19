@@ -169,10 +169,176 @@ pub fn known_window(id: &str) -> Option<(&'static str, WindowKind, Option<i64>)>
         "monthly" => ("Monthly", Monthly, None),
         "seven_day_opus" => ("Weekly Opus", Weekly, Some(WEEK)),
         "seven_day_sonnet" => ("Weekly Sonnet", Weekly, Some(WEEK)),
-        "spend_limit" => ("Spend limit", Other, None),
-        "extra_usage" => ("Extra usage", Other, None),
         _ => return None,
     })
+}
+
+/// Names of per-model / per-group windows: (slug in the window id, display name). Keep in sync with KNOWN_SCOPES in TS.
+/// Only these names leave the PC; windows of other models or groups are not sent
+pub const KNOWN_SCOPES: &[(&str, &str)] = &[
+    ("fable", "Fable"),
+    ("opus", "Opus"),
+    ("sonnet", "Sonnet"),
+    ("haiku", "Haiku"),
+    ("codex_other", "codex_other"),
+    ("codex_bengalfox", "Codex extra"),
+];
+
+/// Plan names that may be sent (keep in sync with KNOWN_PLANS in TS). Anything else is sent as null
+pub const KNOWN_PLANS: &[&str] = &[
+    "free",
+    "go",
+    "plus",
+    "pro",
+    "prolite",
+    "max",
+    "ultra",
+    "team",
+    "business",
+    "enterprise",
+    "edu",
+];
+
+/// Display name of a known per-model / per-group slug
+pub fn known_scope(slug: &str) -> Option<&'static str> {
+    KNOWN_SCOPES
+        .iter()
+        .find(|(s, _)| *s == slug)
+        .map(|(_, name)| *name)
+}
+
+/// The id shape the destination accepts: 1–64 of `a-z`, `0-9`, `_`
+pub fn is_window_id(id: &str) -> bool {
+    (1..=64).contains(&id.len())
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+}
+
+/// Base forms that express a window's length (`primary` / `secondary` are Codex limits of unknown duration)
+fn is_base_window(s: &str) -> bool {
+    matches!(
+        s,
+        "five_hour" | "seven_day" | "monthly" | "primary" | "secondary"
+    ) || s
+        .strip_prefix("window_")
+        .and_then(|r| r.strip_suffix('m'))
+        .is_some_and(|d| (1..=6).contains(&d.len()) && d.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Removes the suffix Codex appends on an id collision: `_primary` / `_secondary`, optionally followed by `_<1–2 digits>`.
+/// A number alone is not a collision suffix (`seven_day_opus_4` is not `seven_day_opus`)
+fn strip_collision_suffix(id: &str) -> &str {
+    let mut s = id;
+    if let Some((head, n)) = s.rsplit_once('_')
+        && (1..=2).contains(&n.len())
+        && n.bytes().all(|b| b.is_ascii_digit())
+        && (head.ends_with("_primary") || head.ends_with("_secondary"))
+    {
+        s = head;
+    }
+    s.strip_suffix("_primary")
+        .or_else(|| s.strip_suffix("_secondary"))
+        .unwrap_or(s)
+}
+
+/// Whether a window id has the collision form `<sendable id>_primary` / `_secondary` (optionally `_N`). An older version gave
+/// such ids to groups it didn't know, so they can't be told apart from a real collision without the window itself
+pub fn is_collision_id(id: &str) -> bool {
+    let core = strip_collision_suffix(id);
+    core != id && sendable_scope(core).is_some()
+}
+
+/// Whether a window id may leave the PC, and its scope's display name (same rule as `parseWindowId` in the Worker).
+/// None: not sent (not a length form or known id, or a model/group name that isn't known).
+/// Some(None): an overall limit. Some(Some(name)): a per-model / per-group limit with a known name
+pub fn sendable_scope(id: &str) -> Option<Option<&'static str>> {
+    if !is_window_id(id) {
+        return None;
+    }
+    if known_window(id).is_some() && !is_base_window(id) {
+        return Some(
+            KNOWN_SCOPES
+                .iter()
+                .find(|(s, _)| id.strip_suffix(s).is_some_and(|r| r.ends_with('_')))
+                .map(|(_, name)| *name),
+        );
+    }
+    for core in [id, strip_collision_suffix(id)] {
+        if is_base_window(core) {
+            return Some(None);
+        }
+        for (slug, name) in KNOWN_SCOPES {
+            let prefixed = core.strip_prefix(slug).and_then(|r| r.strip_prefix('_'));
+            let suffixed = core.strip_suffix(slug).and_then(|r| r.strip_suffix('_'));
+            if prefixed.is_some_and(is_base_window) || suffixed.is_some_and(is_base_window) {
+                return Some(Some(name));
+            }
+        }
+    }
+    None
+}
+
+impl UsageWindow {
+    /// The window as sent to the destination. None if the destination would not store it, including a per-model /
+    /// per-group limit without a known name. The label and scope are rebuilt from known names, so no text from a CLI leaves the PC
+    pub fn for_upload(&self) -> Option<UsageWindow> {
+        let scope = sendable_scope(&self.id)?;
+        // A per-model / per-group window must carry the same known name its id has (an unknown group whose id happens to
+        // contain a known name, such as `codex_other_five_hour_primary` with scope `codex_other_five_hour`, is not sent)
+        match (&self.scope, scope) {
+            (Some(_), None) => return None,
+            (Some(own), Some(name)) if own != name => return None,
+            _ => {}
+        }
+        Some(UsageWindow {
+            id: self.id.clone(),
+            label: known_window(&self.id).map_or_else(|| self.id.clone(), |k| k.0.to_string()),
+            kind: self.kind,
+            scope: scope.map(str::to_string),
+            used_percent: clamp_percent(self.used_percent),
+            resets_at: self.resets_at.clone(),
+            fetched_at: self.fetched_at.clone(),
+        })
+    }
+}
+
+/// Fixed text sent in place of a provider's error message (the destination stores only whether there is one)
+pub const WITHHELD_ERROR: &str = "See headroom status on the PC for details";
+
+impl ProviderSnapshot {
+    /// The provider's value as sent to the destination: windows through `UsageWindow::for_upload`, the error message
+    /// replaced with fixed text and only known plan names
+    pub fn for_upload(&self) -> ProviderSnapshot {
+        ProviderSnapshot {
+            error: self.error.as_ref().map(|_| WITHHELD_ERROR.to_string()),
+            plan: self
+                .plan
+                .as_deref()
+                .map(str::to_ascii_lowercase)
+                .filter(|p| KNOWN_PLANS.contains(&p.as_str())),
+            windows: self
+                .windows
+                .iter()
+                .filter_map(UsageWindow::for_upload)
+                .collect(),
+            ..self.clone()
+        }
+    }
+}
+
+impl Snapshot {
+    /// The snapshot as sent to the destination (see `ProviderSnapshot::for_upload`)
+    pub fn for_upload(&self) -> Snapshot {
+        Snapshot {
+            providers: self
+                .providers
+                .iter()
+                .map(|(k, p)| (k.clone(), p.for_upload()))
+                .collect(),
+            ..self.clone()
+        }
+    }
 }
 
 /// Derives the kind from the window length (same as kindFromSeconds in TS)
@@ -299,6 +465,73 @@ mod tests {
         for key in ["plan", "blocked", "error_code"] {
             assert_eq!(p.get(key), Some(&serde_json::Value::Null));
         }
+    }
+}
+
+#[cfg(test)]
+mod upload_tests {
+    use super::*;
+
+    #[test]
+    fn sendable_ids_follow_the_worker_rule() {
+        let cases: &[(&str, Option<Option<&str>>)] = &[
+            ("five_hour", Some(None)),
+            ("seven_day", Some(None)),
+            ("window_90m", Some(None)),
+            ("primary", Some(None)),
+            ("five_hour_primary", Some(None)),
+            ("seven_day_secondary_2", Some(None)),
+            ("seven_day_opus", Some(Some("Opus"))),
+            ("seven_day_fable", Some(Some("Fable"))),
+            ("codex_bengalfox_five_hour", Some(Some("Codex extra"))),
+            ("codex_other_seven_day_primary", Some(Some("codex_other"))),
+            ("extra_usage", None),
+            ("spend_limit", None),
+            ("seven_day_acme", None),
+            ("seven_day_opus_4", None),
+            ("seven_day_2", None),
+            (
+                "codex_bengalfox_five_hour_primary_3",
+                Some(Some("Codex extra")),
+            ),
+            ("acme_five_hour", None),
+            ("Five_hour", None),
+            ("codex-bengalfox_five_hour", None),
+            ("window_1234567m", None),
+            ("", None),
+        ];
+        for (id, want) in cases {
+            assert_eq!(sendable_scope(id), *want, "{id}");
+        }
+        assert_eq!(sendable_scope(&"a".repeat(65)), None);
+    }
+
+    #[test]
+    fn upload_drops_unknown_scopes_and_rebuilds_text() {
+        let mut model = make_window("seven_day_opus", 5.0, None);
+        model.label = "Weekly Opus (Acme)".into();
+        model.scope = Some("Opus".into());
+        let up = model.for_upload().unwrap();
+        assert_eq!(
+            (up.label.as_str(), up.scope.as_deref()),
+            ("Weekly Opus", Some("Opus"))
+        );
+        // A per-group window whose id parses as an overall limit is still dropped when it carries an unknown scope
+        let mut group = make_window("five_hour", 5.0, None);
+        group.scope = Some("Acme".into());
+        assert_eq!(group.for_upload(), None);
+        // An unknown group whose id contains a known group's name
+        let mut lookalike = make_window("codex_other_five_hour_primary", 5.0, None);
+        lookalike.scope = Some("codex_other_five_hour".into());
+        assert_eq!(lookalike.for_upload(), None);
+        let mut known = make_window("codex_other_five_hour_primary", 5.0, None);
+        known.scope = Some("codex_other".into());
+        assert!(known.for_upload().is_some());
+        let mut p = ProviderSnapshot::empty(ProviderStatus::Error, "raw CLI text", None);
+        p.plan = Some("MAX".into());
+        let up = p.for_upload();
+        assert_eq!(up.error.as_deref(), Some(WITHHELD_ERROR));
+        assert_eq!(up.plan.as_deref(), Some("max"));
     }
 }
 

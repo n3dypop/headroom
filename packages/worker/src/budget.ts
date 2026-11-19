@@ -7,6 +7,9 @@
 // - Everything else (uploads from PCs, the fetch turn, Cron) first reserves the per-run maximum (RESERVE) from the per-UTC-day d1_budget
 //   in one statement (if it doesn't fit, refuse without touching D1), then settles with the actual row counts D1 returns (meta.rows_read / rows_written)
 // - The write side may use 4M rows read and 80k rows written (excluding GET's 300k rows and a margin)
+// - The free tier is per Cloudflare account, while each D1 keeps its own d1_budget. When one account has more than one Headroom D1
+//   (e.g. a test D1 next to the real one), give each a share with D1_BUDGET_PERCENT so the shares add up to 100 or less.
+//   GET needs no share: the Workers request limit (100k a day) is per account as well
 
 import type { D1Like, D1Statement } from "./store.ts";
 
@@ -22,6 +25,23 @@ export interface Metered extends Usage {
 
 /** Daily amount the write side (uploads, turn, Cron) may use */
 export const DAILY_BUDGET: Usage = { reads: 4_000_000, writes: 80_000 };
+
+/** Smallest share at which every metered run (an upload, a turn and a Cron run) fits in the day's budget */
+export const MIN_BUDGET_PERCENT = 13;
+
+/**
+ * This deployment's share of DAILY_BUDGET from D1_BUDGET_PERCENT: a whole number 1-100 (a string, or a number when wrangler.toml
+ * gives one), unset or empty for 100. Any other value gives no budget (every metered run is refused), so a typo never lets the
+ * account go over the free tier. Below MIN_BUDGET_PERCENT the Cron run never fits
+ */
+export function budgetLimit(percent: unknown): Usage {
+  if (percent === undefined) return DAILY_BUDGET;
+  const text = typeof percent === "number" ? String(percent) : typeof percent === "string" ? percent.trim() : "x";
+  if (text === "") return DAILY_BUDGET;
+  const n = /^\d{1,3}$/.test(text) ? Number(text) : NaN;
+  if (!(n >= 1 && n <= 100)) return { reads: 0, writes: 0 };
+  return { reads: Math.floor((DAILY_BUDGET.reads * n) / 100), writes: Math.floor((DAILY_BUDGET.writes * n) / 100) };
+}
 
 /** Estimated maximum per run. If less than this remains, don't start (never cross the limit mid-run) */
 export const RESERVE = {
@@ -151,18 +171,28 @@ export function daysToReserve(at: Date): string[] {
  */
 export type Reservation = "reserved" | "exhausted" | "unavailable";
 
-export async function reserve(db: D1Like, days: readonly string[], amount: Usage): Promise<Reservation> {
+export async function reserve(
+  db: D1Like,
+  days: readonly string[],
+  amount: Usage,
+  limit: Usage = DAILY_BUDGET,
+): Promise<Reservation> {
   const placeholders = days.map(() => "?").join(", ");
   try {
     const results = await db.batch([
       ...days.map((day) => db.prepare("INSERT OR IGNORE INTO d1_budget (day, reads, writes) VALUES (?, 0, 0)").bind(day)),
+      // All days or none: nothing is added if any day would go over this deployment's share (the CHECK constraint is the hard limit)
       db
-        .prepare(`UPDATE d1_budget SET reads = reads + ?, writes = writes + ? WHERE day IN (${placeholders})`)
-        .bind(amount.reads, amount.writes, ...days),
+        .prepare(
+          `UPDATE d1_budget SET reads = reads + ?, writes = writes + ? WHERE day IN (${placeholders}) AND NOT EXISTS (` +
+            `SELECT 1 FROM d1_budget WHERE day IN (${placeholders}) AND (reads + ? > ? OR writes + ? > ?))`,
+        )
+        .bind(amount.reads, amount.writes, ...days, ...days, amount.reads, limit.reads, amount.writes, limit.writes),
       // Keep the previous day's row for one day (settlement target for runs that end after the day boundary)
       db.prepare("DELETE FROM d1_budget WHERE day < ?").bind(previousDay(days[0]!)),
     ]);
-    return changes(results[days.length]) === days.length ? "reserved" : "unavailable";
+    const updated = changes(results[days.length]);
+    return updated === days.length ? "reserved" : updated === 0 ? "exhausted" : "unavailable";
   } catch (e) {
     // Over the limit (CHECK constraint) means budget exhausted. Anything else (e.g. a transient D1 failure) is kept distinct
     return /CHECK constraint failed/i.test(String((e as Error)?.message ?? e)) ? "exhausted" : "unavailable";

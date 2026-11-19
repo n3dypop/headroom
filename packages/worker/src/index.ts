@@ -6,18 +6,28 @@
 //   GET  /v2/snapshot              Merged snapshot (read credential). Reads only the one public_state row
 //   GET  /v2/view?tz=Asia/Tokyo    Display view (same). Reads only public_state and the derived-value rows, never history
 //   GET  /v2/events?after=<seq>    Events (same). Only seq greater than after. Reads only the one event_feed row
-//   GET  /v2/history?provider=claude&window=seven_day&hours=168  7-day series of the weekly limit (same). Reads only one derived_weekly row
+//   GET  /v2/history?provider=claude&window=seven_day&hours=170  7-day series of the weekly limit (same). Reads only one derived_weekly row
 //                                  and one boundary row (the 24-hour series derived_history was removed)
 //   Cron (every 5 min)             Computes and saves derived values for changed providers, builds the weekly 7-day series once
 //                                  an hour, judges and records events, and gradually deletes rows past retention
 //
 // D1 always stays within the free tier (budget.ts): GET reads at most 3 rows; everything else runs only within the daily budget.
 // No credentials or bodies in logs. No CORS. Responses are not cacheable.
-import { EVENT_RETENTION_MS, computeMetrics, hourlySeries, judgeEvents, mergeSnapshots, toView, type ProviderId } from "../../core/src/index.ts";
+import {
+  CLOCK_TOLERANCE_MS,
+  EVENT_RETENTION_MS,
+  computeMetrics,
+  hourlySeries,
+  judgeEvents,
+  mergeSnapshots,
+  toView,
+  type ProviderId,
+} from "../../core/src/index.ts";
 import { COLLECTOR_NAME, authenticate, parseTokens } from "./auth.ts";
 import {
   BudgetDeadline,
   RESERVE,
+  budgetLimit,
   daysToReserve,
   endOfDays,
   metered,
@@ -26,7 +36,7 @@ import {
   settle,
   type Usage,
 } from "./budget.ts";
-import { sanitizeUpload, type CleanUpload } from "./sanitize.ts";
+import { sanitizeUpload, settleLimits, withoutUnstored, type CleanUpload } from "./sanitize.ts";
 import {
   ALL_VERSION,
   loadDerived,
@@ -70,6 +80,11 @@ export interface Env {
    * are rejected even with a valid Worker token. If unset, everything is rejected
    */
   ALLOWED_HOST?: string;
+  /**
+   * This D1's share of the daily budget in percent (1-100, unset for 100). Set it when one Cloudflare account has more than one
+   * Headroom D1, so the shares add up to 100 or less (the free tier is per account). Use 13 or more (below that the Cron run never fits). Any other value refuses metered runs
+   */
+  D1_BUDGET_PERCENT?: string | number;
 }
 
 const MAX_BODY_BYTES = 1_000_000;
@@ -131,7 +146,16 @@ async function publish(db: D1Like, env: Env): Promise<void> {
   const stamps = await loadBoundaryStamps(db);
   const loaded = await loadSnapshots(db);
   const merged = mergeSnapshots(loaded.snapshots, { collectorPriority: priority(env) });
-  if (!merged) return;
+  if (!merged) {
+    // No PC's latest value is left (all past retention): the old merged value is not shown either (unless an upload put a new one)
+    if (loaded.snapshots.length === 0) {
+      await db
+        .prepare("DELETE FROM public_state WHERE id = 1 AND version <= ? AND NOT EXISTS (SELECT 1 FROM collector_snapshots)")
+        .bind(version)
+        .run();
+    }
+    return;
+  }
   // Attach each PC's last received time (liveness marker, used by clients and to detect stopped collection)
   for (const c of merged.collectors ?? []) c.received_at = loaded.received.get(c.id) ?? null;
   await savePublicState(db, merged, version, stamps);
@@ -180,7 +204,7 @@ async function withinBudget<T>(
   // A run starting just before 00:00 UTC also reserves the next day
   const days = daysToReserve(at);
   // Refusals aren't metered (only the few rows the reserve statement reads; even at Workers' 100k requests/day that's a few hundred thousand rows, within the margin outside the write-side budget)
-  const reservation = await reserve(env.DB, days, amount);
+  const reservation = await reserve(env.DB, days, amount, budgetLimit(env.D1_BUDGET_PERCENT));
   if (reservation !== "reserved") return { ok: false, reason: reservation };
   // Once past the reserved day, abort without starting D1 statements
   const m = metered(env.DB, { clock, until: endOfDays(days) });
@@ -212,12 +236,35 @@ function parseTurns(body: unknown): Map<ProviderId, number> | null {
   return out.size === 0 ? null : out;
 }
 
-async function readBody(request: Request): Promise<unknown> {
+/**
+ * Reads the JSON body, at most MAX_BODY_BYTES. The size is counted while reading, so a larger body (with or without
+ * Content-Length) is cut off right after the limit instead of being read whole. RangeError if too large
+ */
+export async function readBody(request: Request): Promise<unknown> {
   const declared = Number(request.headers.get("content-length") ?? "0");
   if (declared > MAX_BODY_BYTES) throw new RangeError();
-  const text = await request.text();
-  if (new TextEncoder().encode(text).length > MAX_BODY_BYTES) throw new RangeError();
-  return JSON.parse(text);
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  if (request.body !== null) {
+    const reader = request.body.getReader();
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      size += value.byteLength;
+      if (size > MAX_BODY_BYTES) {
+        await reader.cancel().catch(() => {});
+        throw new RangeError();
+      }
+      chunks.push(value);
+    }
+  }
+  const bytes = new Uint8Array(size);
+  let offset = 0;
+  for (const c of chunks) {
+    bytes.set(c, offset);
+    offset += c.byteLength;
+  }
+  return JSON.parse(new TextDecoder().decode(bytes));
 }
 
 export async function handle(request: Request, env: Env, now: () => Date = () => new Date()): Promise<Response> {
@@ -277,6 +324,10 @@ export async function handle(request: Request, env: Env, now: () => Date = () =>
     const upload = sanitizeUpload(body, collector);
     if ("error" in upload) return problem(400, upload.error);
     const received = now();
+    // A PC whose clock is off by more than the tolerance is refused before D1 is touched (its times would be taken as they are).
+    // The PC keeps its observations and shows the offset until its clock is fixed
+    const offset = Date.parse(upload.snapshot.generated_at) - received.getTime();
+    if (Math.abs(offset) > CLOCK_TOLERANCE_MS) return json(422, { error: "clock_skew", offset_s: Math.round(offset / 1000) });
     const result = await withinBudget(env, received, RESERVE.put, (db) => receive(db, env, upload, received), now);
     // No D1 budget left today. The PC keeps observations and resends after the wait
     if (!result.ok) return refused(result.reason, received);
@@ -329,7 +380,7 @@ async function readEvents(db: D1Like, url: URL, now: Date): Promise<Response> {
 }
 
 /**
- * 7-day series of the weekly limit: provider (required), window (omitted or seven_day), hours (1-168, default 168). Reads only the two rows
+ * 7-day series of the weekly limit: provider (required), window (omitted or seven_day), hours (1-170, default 168). Reads only the two rows
  * of the series Cron built from hourly aggregates and the boundary (the 24-hour series was removed)
  */
 async function readHistory(db: D1Like, url: URL, now: Date): Promise<Response> {
@@ -337,7 +388,7 @@ async function readHistory(db: D1Like, url: URL, now: Date): Promise<Response> {
   if (!provider || !PROVIDERS.includes(provider)) return problem(400, "invalid_provider");
   const window = url.searchParams.get("window");
   if (window !== null && window !== "seven_day") return problem(400, "invalid_window");
-  const rawHours = url.searchParams.get("hours") ?? String(WEEKLY_HOURS);
+  const rawHours = url.searchParams.get("hours") ?? "168";
   const hours = /^[0-9]{1,3}$/.test(rawHours) ? Number(rawHours) : Number.NaN;
   if (!(hours >= 1 && hours <= WEEKLY_HOURS)) return problem(400, "invalid_hours");
   const weekly = await loadWeekly(db, provider);
@@ -372,18 +423,21 @@ export async function runCron(env: Env, at: Date, clock: () => Date = () => at):
   return result.ok;
 }
 
-/** Span of the weekly 7-day series (upper bound of GET /v2/history's hours) */
-const WEEKLY_HOURS = 7 * 24;
+/**
+ * Span of the weekly series (upper bound of GET /v2/history's hours): 7 days plus 2 hours, so a client showing a calendar week
+ * (169 hours when daylight saving time ends) still has its first hour late in the week
+ */
+const WEEKLY_HOURS = 7 * 24 + 2;
 
 /**
  * Builds the weekly 7-day series only once an hour. If the build time (UTC hour) and boundary stamp match the saved ones,
- * nothing is read. When building, reads at most 168 hourly-aggregate rows per provider
+ * nothing is read. When building, reads at most 170 hourly-aggregate rows per provider
  */
 export async function refreshWeekly(db: D1Like, at: Date): Promise<void> {
   const boundaries = await loadPublicBoundaries(db);
   if (!boundaries) return;
   const hour = at.toISOString().slice(0, 13);
-  // Read only 168 hours (including the current hour)
+  // Read only WEEKLY_HOURS hours (including the current hour)
   const from = new Date(at.getTime() - (WEEKLY_HOURS - 1) * 3_600_000);
   for (const provider of PROVIDERS) {
     const stamp = stampOf(boundaries, provider);
@@ -423,7 +477,9 @@ export async function judge(db: D1Like, env: Env, at: Date): Promise<void> {
       }
     }
     const view = toView(snapshot, at, { metrics, collectorPriority: priority(env) });
-    const judged = judgeEvents(view, state, { last_received_at: view.last_received_at }, at, { pending });
+    // The account-switch boundaries the view was built under (a switch starts the provider's notification state afresh)
+    const boundaries = { claude: stampOf(stamps, "claude"), codex: stampOf(stamps, "codex") };
+    const judged = judgeEvents(view, state, { last_received_at: view.last_received_at }, at, { pending, boundaries });
     if (judged.changed) await recordEvents(db, token, judged.state, judged.events, at);
   }
   await pruneEvents(db, at);
@@ -440,6 +496,10 @@ export async function repairPublicState(db: D1Like, env: Env): Promise<void> {
   const current = await loadBoundaryStamps(db);
   const row = await loadPublicRow(db);
   const same = (s: BoundaryStamps | null) => s !== null && JSON.stringify(s) === JSON.stringify(current);
-  if (row ? row.version === version && same(row.boundaries) && same(row.current) : !(await hasSnapshots(db))) return;
+  // A row an earlier Worker put may hold values today's rules drop (e.g. extra usage); rebuild it even if no PC is sending
+  const outdated = row !== null && JSON.stringify(settleLimits(withoutUnstored(row.snapshot))) !== JSON.stringify(row.snapshot);
+  // A row left after every PC's latest value expired (also when an earlier Worker deleted them) is removed by publish
+  if (row !== null && !(await hasSnapshots(db))) return publish(db, env);
+  if (row ? row.version === version && same(row.boundaries) && same(row.current) && !outdated : !(await hasSnapshots(db))) return;
   await publish(db, env);
 }

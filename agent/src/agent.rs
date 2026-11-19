@@ -107,6 +107,8 @@ pub fn run(home: &Path) -> i32 {
         // Stop requests are only honored between fetches (never in the middle of /usage)
         if take_stop_request(home) {
             log.log("Stop requested; exiting");
+            // Hand the fetch turns back so another PC takes over at its next check instead of waiting out the lease
+            coord.release_turns(pusher.as_mut().map(|x| x as &mut dyn TurnAsker));
             drop(session_file.take()); // releases the session lock
             let _ = std::fs::remove_file(home.join(SCHEDULE_FILE));
             let _ = std::fs::remove_file(home.join(SESSION_FILE));
@@ -150,9 +152,16 @@ pub fn run(home: &Path) -> i32 {
             log.log(&format!("Failed to write snapshot.json: {e}"));
         }
         if let Some(p) = pusher.as_mut() {
+            p.record(&latest, changed, now_ms());
+            // Stamped after saving the queue, right before sending (the destination checks the send time against its clock)
             let now = now_ms();
-            p.record(&latest, changed, now);
             p.push(&build_snapshot(latest.clone(), now, &collector), now);
+            // Values from a PC whose clock the destination refuses can't be delivered: hand back any turn it holds, and forget the
+            // latest values (stamped by that clock, they would pass as current once the clock is fixed; the next fetches replace them)
+            if p.clock_skewed() {
+                coord.release_turns(Some(p as &mut dyn TurnAsker));
+                latest.clear();
+            }
         }
 
         let now = now_ms();

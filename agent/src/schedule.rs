@@ -1,8 +1,9 @@
 //! Fetch coordination.
 //!
 //! - **Turn-taking:** if push is configured, ask the destination "may I fetch?" before each fetch (a query to Anthropic / OpenAI),
-//!   and defer until the turn expires if another PC holds it. If the destination is unreachable or push is not configured, fetch
-//!   on this PC as before (correctness does not depend on the destination). On a failed fetch, release the turn so another PC can take over.
+//!   and defer until the turn expires if another PC holds it, asking again at least once per normal turn (interval + 2 minutes) so a
+//!   long lease that was released is noticed. If the destination is unreachable or push is not configured, fetch on this PC as before
+//!   (correctness does not depend on the destination). On a failed fetch, and when the agent stops, release the turn so another PC can take over.
 //! - **Safety net:** even while deferring, fetch on this PC at least once per `own_fetch_min` (default 60 minutes) to notice account
 //!   switches, expired sign-ins or CLI version changes on this PC. The first fetch after startup is also done on this PC.
 //! - **Stretching the interval when nothing changes:** if values do not change for 30 minutes and overall limit usage is below 80 %,
@@ -218,14 +219,30 @@ impl Coordinator {
                 }
                 slot.holder = false;
                 slot.deferring = true;
-                // Never hold off past the safety-net time
-                slot.hold_until =
-                    (now + wait_ms.max(0) + RETRY_AFTER_MS).min(slot.last_fetch + own_ms);
+                // Ask again when the lease ends, but no later than one normal turn from now (a holder that stopped and
+                // released a long lease, e.g. while a limit is reached, is replaced within that time). Never hold off past the safety-net time
+                let recheck = now + (interval_min.max(1) + TURN_GRACE_MIN) * MINUTE_MS;
+                slot.hold_until = (now + wait_ms.max(0) + RETRY_AFTER_MS)
+                    .min(recheck)
+                    .min(slot.last_fetch + own_ms);
                 slot.hold_reason = Some(Waiting::Turn);
                 false
             }
             // Destination unreachable or answer unreadable: fetch on this PC
             None => true,
+        }
+    }
+
+    /// Releases every turn this PC holds, so another PC can take over at its next check (called when the agent stops)
+    pub fn release_turns(&mut self, asker: Option<&mut dyn TurnAsker>) {
+        let Some(asker) = asker else {
+            return;
+        };
+        for (id, slot) in self.slots.iter_mut().filter(|(_, s)| s.holder) {
+            let released = asker.ask_turn(id, 0).is_some();
+            slot.holder = false;
+            slot.granted_until = 0;
+            self.log.log(&release_message(id, released));
         }
     }
 
@@ -266,10 +283,10 @@ impl Coordinator {
             || snapshot.error_code.is_some();
         if failed || next_fetch_ms == i64::MAX {
             // Cannot fetch / stopped: release so another PC can take over
-            let _ = asker.ask_turn(id, 0);
+            let released = asker.ask_turn(id, 0).is_some();
             slot.holder = false;
             slot.granted_until = 0;
-            self.log.log(&format!("{id}: released the fetch turn"));
+            self.log.log(&release_message(id, released));
             return;
         }
         // If the next fetch is after the lease (limit reached or stretched interval), extend it (stretching is decided in the next before_fetch, so anticipate it)
@@ -299,6 +316,14 @@ impl Coordinator {
             slot.last_values = Some(values);
             slot.last_change = now;
         }
+    }
+}
+
+fn release_message(id: &str, released: bool) -> String {
+    if released {
+        format!("{id}: released the fetch turn")
+    } else {
+        format!("{id}: could not release the fetch turn (it ends when its lease expires)")
     }
 }
 
@@ -570,11 +595,151 @@ mod tests {
         assert!(!c.before_fetch("claude", 5, Some(&s), Some(&mut w), T0 + 5 * MINUTE_MS));
         assert_eq!(
             c.hold_until("claude"),
+            T0 + 12 * MINUTE_MS,
+            "a long lease is checked again after one normal turn (5 + 2 minutes)"
+        );
+        let mut t = T0 + 12 * MINUTE_MS;
+        while t < T0 + 60 * MINUTE_MS {
+            assert!(!c.before_fetch("claude", 5, Some(&s), Some(&mut w), t));
+            t = c.hold_until("claude");
+        }
+        assert_eq!(
+            t,
             T0 + 60 * MINUTE_MS,
             "never holds off past the safety net"
         );
-        assert!(c.before_fetch("claude", 5, Some(&s), Some(&mut w), T0 + 60 * MINUTE_MS));
-        assert_eq!(w.calls.len(), 1, "the safety-net fetch does not ask");
+        let asked = w.calls.len();
+        assert!(c.before_fetch("claude", 5, Some(&s), Some(&mut w), t));
+        assert_eq!(w.calls.len(), asked, "the safety-net fetch does not ask");
+    }
+
+    /// Stand-in destination holding one provider's lease on a clock the test sets, shared by two PCs
+    #[derive(Default)]
+    struct Lease {
+        holder: Option<&'static str>,
+        until: i64,
+        now: i64,
+        releases: usize,
+    }
+
+    struct Pc<'a> {
+        name: &'static str,
+        lease: &'a std::cell::RefCell<Lease>,
+    }
+
+    impl TurnAsker for Pc<'_> {
+        fn ask_turn(&mut self, _provider: &str, minutes: i64) -> Option<TurnReply> {
+            let mut l = self.lease.borrow_mut();
+            if minutes == 0 {
+                if l.holder == Some(self.name) {
+                    l.holder = None;
+                    l.releases += 1;
+                }
+                return Some(TurnReply {
+                    go: true,
+                    wait_ms: 0,
+                });
+            }
+            if l.holder.is_none() || l.holder == Some(self.name) || l.now >= l.until {
+                l.holder = Some(self.name);
+                l.until = l.now + minutes * MINUTE_MS;
+                return Some(TurnReply {
+                    go: true,
+                    wait_ms: 0,
+                });
+            }
+            Some(TurnReply {
+                go: false,
+                wait_ms: l.until - l.now,
+            })
+        }
+    }
+
+    #[test]
+    fn a_stopping_holder_releases_and_the_other_pc_takes_over_within_one_turn() {
+        let s = snap(10.0, ProviderStatus::Ok);
+        // Normal, stretched and limit-reached leases (the holder's next fetch in 5, 10 and 60 minutes)
+        for next_fetch_min in [5, 10, 60] {
+            for graceful in [true, false] {
+                let lease = std::cell::RefCell::new(Lease::default());
+                let mut a = Pc {
+                    name: "a",
+                    lease: &lease,
+                };
+                let mut b = Pc {
+                    name: "b",
+                    lease: &lease,
+                };
+                // PC a takes the turn and extends it to its next fetch + 2 minutes
+                let mut holder = coord(0);
+                holder.record_fetch("codex", T0);
+                lease.borrow_mut().now = T0 + 5 * MINUTE_MS;
+                assert!(holder.before_fetch(
+                    "codex",
+                    5,
+                    Some(&s),
+                    Some(&mut a),
+                    T0 + 5 * MINUTE_MS
+                ));
+                holder.after_fetch(
+                    "codex",
+                    &s,
+                    T0 + (5 + next_fetch_min) * MINUTE_MS,
+                    5,
+                    Some(&mut a),
+                    T0 + 5 * MINUTE_MS,
+                );
+                let lease_end = lease.borrow().until;
+                assert_eq!(lease_end, T0 + (5 + next_fetch_min.max(5) + 2) * MINUTE_MS);
+                // PC b fetched at startup; its fetch is due every 5 minutes. It asks only when due (the agent's path)
+                let mut other = coord(0);
+                other.record_fetch("codex", T0 + 30_000);
+                let mut due = T0 + 5 * MINUTE_MS + 30_000;
+                let stopped_at = T0 + 6 * MINUTE_MS;
+                let mut stopped = false;
+                let took_over = loop {
+                    if !stopped && due >= stopped_at {
+                        stopped = true;
+                        if graceful {
+                            holder.release_turns(Some(&mut a));
+                        }
+                    }
+                    lease.borrow_mut().now = due;
+                    if other.before_fetch("codex", 5, Some(&s), Some(&mut b), due) {
+                        break due;
+                    }
+                    // The next decision is the later of the hold and the next due time
+                    due = other.hold_until("codex").max(due + MINUTE_MS);
+                    assert!(due < T0 + 120 * MINUTE_MS, "never takes over");
+                };
+                let name = format!("next fetch {next_fetch_min}m, graceful {graceful}");
+                if graceful {
+                    assert_eq!(lease.borrow().releases, 1, "{name}");
+                    // The first ask was 30 s before the stop; the recheck is one turn (5 + 2 minutes) later at most
+                    assert!(
+                        took_over <= T0 + 5 * MINUTE_MS + 30_000 + 7 * MINUTE_MS,
+                        "{name}"
+                    );
+                } else {
+                    // An abrupt stop waits for the lease, checked once a turn, or the safety net (60 minutes) comes first
+                    let bound = (lease_end + 7 * MINUTE_MS).min(T0 + 30_000 + 60 * MINUTE_MS);
+                    assert!(took_over <= bound, "{name}: {took_over} > {bound}");
+                    assert!(
+                        took_over >= lease_end.min(T0 + 30_000 + 60 * MINUTE_MS),
+                        "{name}"
+                    );
+                }
+            }
+        }
+        // Releasing twice sends one release; a turn this PC doesn't hold isn't released
+        let lease = std::cell::RefCell::new(Lease::default());
+        let mut a = Pc {
+            name: "a",
+            lease: &lease,
+        };
+        let mut c = coord(0);
+        c.release_turns(Some(&mut a));
+        assert_eq!(lease.borrow().releases, 0);
     }
 
     #[test]

@@ -704,12 +704,15 @@ function trendY(used, height, inset = 0) {
 }
 
 /** Polyline of the 7-day weekly trend: point lists (pixels) split at each break (gap or reset) */
-function sparkLines(points, now, width, height, inset = 0, hours = TREND_HOURS) {
-  const span = hours * 60 * 60000;
-  const since = now.getTime() - span;
+function sparkLines(points, now, width, height, inset = 0, hours = TREND_HOURS, range = null) {
+  // The x axis: the given range (e.g. this week), or the last `hours` up to now
+  const span = range ? range.end - range.start : hours * 60 * 60000;
+  const since = range ? range.start : now.getTime() - span;
   const lines = [];
   let current = [];
   for (const p of points) {
+    // Points outside the range aren't drawn (they would pile up at an edge)
+    if (range && (p.at < range.start || p.at >= range.end)) continue;
     if (p.brk && current.length > 0) {
       lines.push(current);
       current = [];
@@ -1780,12 +1783,46 @@ function timerWidth(date, now, size) {
   return Math.ceil(size * 0.62 * chars + 4);
 }
 
-/** Limit and period of the large chart (fixed to the weekly limit's 7 days; 5h and weekly are not mixed) */
+/**
+ * Limit and period of the large chart (fixed to the weekly limit; 5h and weekly are not mixed). The chart shows this week from
+ * Sunday; 170 hours are read so the week is covered even when it has 169 hours (daylight saving time) late on Saturday
+ */
 const TREND_WINDOW = "seven_day";
-const TREND_HOURS = 7 * 24;
+const TREND_HOURS = 170;
 
 /** Spacing between the limits and the chart in large */
 const TREND_GAP = 20;
+/** Spacing between the chart and its day labels */
+const TREND_LABEL_GAP = 3;
+/** Day labels under the large chart (the week starts on Sunday) */
+const WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+
+/**
+ * Start of each day of this week in local time: Sunday 00:00 to the next Sunday 00:00 (8 times in ms). Each day is built from its own
+ * date, so a midnight skipped by daylight saving time (moved to 01:00) affects only that day
+ */
+function weekDays(now) {
+  const y = now.getFullYear();
+  const m = now.getMonth();
+  const sunday = now.getDate() - now.getDay();
+  return Array.from({ length: 8 }, (_, i) => new Date(y, m, sunday + i).getTime());
+}
+
+/** This week in local time ({ start, end } in ms; a day may be 23 or 25 hours with DST) */
+function weekRange(now) {
+  const days = weekDays(now);
+  return { start: days[0], end: days[7], days };
+}
+
+/** Local midnights inside the week (Monday to Saturday 00:00, ms), where the chart's day lines go */
+function dayStarts(range) {
+  return range.days.slice(1, 7);
+}
+
+/** Height the large chart needs besides its plot: spacing above, the heading row, and the day labels below */
+function trendChrome(scale) {
+  return TREND_GAP + scale.small * 1.25 + 4 + TREND_LABEL_GAP + scale.small * 1.25;
+}
 /** Height of the large trend chart (min and max) */
 const TREND_MIN_HEIGHT = 56;
 const TREND_MAX_HEIGHT = 150;
@@ -1794,13 +1831,23 @@ const TREND_MAX_HEIGHT = 150;
  * Overlaid trend image (large). Draws one line per provider (lightly filled below) in a single 0-100% frame, a faint line at 50%,
  * and a dot at each current position
  */
-function combinedTrendImage(series, width, height, inset = TREND_INSET) {
+function combinedTrendImage(series, width, height, inset = TREND_INSET, dayLines = []) {
   const ctx = newBar(width, height);
   const back = new Path();
   back.addRoundedRect(new Rect(0, 0, width, height), 8, 8);
   ctx.addPath(back);
   ctx.setFillColor(new Color(BAR_COLORS.track, 0.1));
   ctx.fillPath();
+  // Faint lines between days (x positions)
+  for (const x of dayLines) {
+    const day = new Path();
+    day.move(new Point(x, 0));
+    day.addLine(new Point(x, height));
+    ctx.addPath(day);
+    ctx.setStrokeColor(new Color(BAR_COLORS.track, 0.15));
+    ctx.setLineWidth(0.5);
+    ctx.strokePath();
+  }
   // Guide lines are drawn with the same coordinate calculation as the values (25%, 50%, 75%; lines are inset by inset)
   for (const level of [0.25, 0.5, 0.75]) {
     const y = trendY(level * 100, height, inset);
@@ -1870,9 +1917,18 @@ function trendSeries(groups, trends, view) {
   return out;
 }
 
-/** Large chart: legend (provider color dot, name, window) and the overlaid trend */
+/** x position of a time on the large chart (same calculation as sparkLines with a range) */
+function trendX(at, range, width, inset = TREND_INSET) {
+  const span = range.end - range.start;
+  return Math.round((inset + Math.max(0, Math.min(1, (at - range.start) / span)) * (width - 2 * inset)) * 10) / 10;
+}
+
+/** Large chart: legend (provider color dot, name, window), the overlaid trend for this week (Sunday start) and the day labels */
 function drawCombinedTrend(stack, groups, opts) {
-  const series = trendSeries(groups, opts.trends, opts.view).filter((s) => s.window);
+  const range = weekRange(opts.now);
+  // Only points within this week, for both the legend and the lines (a provider with none shows as without a trend)
+  const series = trendSeries(groups, opts.trends, opts.view).filter((s) => s.window)
+    .map((s) => ({ ...s, points: s.points ? s.points.filter((p) => p.at >= range.start && p.at < range.end) : null }));
   const has = (s) => Boolean(s.points && s.points.length > 0);
   const legend = stack.addStack();
   legend.layoutHorizontally();
@@ -1889,7 +1945,7 @@ function drawCombinedTrend(stack, groups, opts) {
     addSmallText(legend, "No weekly data yet", opts.scale.small, SUB());
   } else {
     // What the trend is (the weekly limit's 7 days) appears once at the start of the legend; each provider shows only its name
-    addSmallText(legend, "Last 7d · Weekly", opts.scale.small, SUB());
+    addSmallText(legend, "This week · Weekly", opts.scale.small, SUB());
     for (const s of series) {
       legend.addSpacer(10);
       // Providers without a trend get a gray dot and "–" (kept short)
@@ -1901,8 +1957,26 @@ function drawCombinedTrend(stack, groups, opts) {
   }
   stack.addSpacer(4);
   const drawn = trendDrawOrder(series.filter(has))
-    .map((s) => ({ lines: sparkLines(s.points, opts.now, opts.width, opts.height, TREND_INSET, TREND_HOURS), hex: BRAND_COLORS[s.provider], provider: s.provider }));
-  stack.addImage(combinedTrendImage(drawn, opts.width, opts.height));
+    .map((s) => ({ lines: sparkLines(s.points, opts.now, opts.width, opts.height, TREND_INSET, TREND_HOURS, range), hex: BRAND_COLORS[s.provider], provider: s.provider }));
+  const starts = range.days;
+  stack.addImage(combinedTrendImage(drawn, opts.width, opts.height, TREND_INSET, starts.slice(1, -1).map((t) => trendX(t, range, opts.width))));
+  stack.addSpacer(TREND_LABEL_GAP);
+  // Day labels, each centered under its day; today's stands out
+  const labels = stack.addStack();
+  labels.layoutHorizontally();
+  labels.size = new Size(opts.width, 0);
+  const today = new Date(opts.now.getTime()).getDay();
+  let left = 0;
+  for (let i = 0; i < 7; i++) {
+    const right = i === 6 ? opts.width : trendX(starts[i + 1], range, opts.width);
+    const cell = labels.addStack();
+    cell.size = new Size(Math.max(0, right - left), 0);
+    cell.addSpacer(null);
+    const t = addSmallText(cell, WEEKDAYS[i], opts.scale.small, i === today ? TEXT() : SUB());
+    if (i === today) t.font = Font.semiboldSystemFont(opts.scale.small);
+    cell.addSpacer(null);
+    left = right;
+  }
 }
 
 /** Order of drawing lines: lower values in front (drawn in descending order of 7-day average; later lines appear on top) */
@@ -1956,7 +2030,7 @@ function layoutGroups(view, family, parameter, now, { cached = false, screen = n
   let between = 0;
   // Reserve the large chart's share first (spacing, legend, minimum height). Not if it isn't drawn (no shown provider has a weekly limit)
   const withChart = large && content.trend && groups.some((g) => view?.[g.provider]?.windows?.[TREND_WINDOW]);
-  const chart = withChart ? TREND_GAP + scale.small * 1.25 + 4 + TREND_MIN_HEIGHT : 0;
+  const chart = withChart ? trendChrome(scale) + TREND_MIN_HEIGHT : 0;
   if (large && !two) {
     limits = fitRows(counts(MAX_WINDOWS_SINGLE.large), scale, available - chart, 0, groups.map((g) => (g.rows.length > 0 ? 0 : message)), ranks);
   } else if (large) {
@@ -1981,7 +2055,7 @@ function layoutGroups(view, family, parameter, now, { cached = false, screen = n
   // 0 means no chart
   const trendHeight = withChart
     // Allow 10% extra column height for estimation error (the chart can shrink, so the bars don't disappear on overflow)
-    ? Math.max(TREND_MIN_HEIGHT, Math.min(TREND_MAX_HEIGHT, Math.floor(available - columns * 1.1 - TREND_GAP - scale.small * 1.25 - 4)))
+    ? Math.max(TREND_MIN_HEIGHT, Math.min(TREND_MAX_HEIGHT, Math.floor(available - columns * 1.1 - trendChrome(scale))))
     : 0;
   return { content, scale, pad, size, inner, large, lift, showNote, two, between, trendHeight, groups: laid };
 }
@@ -2228,7 +2302,7 @@ if (typeof Script !== "undefined" && typeof ListWidget !== "undefined") {
     atDisplayTime, shortMark, selectWindows, groupsOf, barSegments, barWidths, windowName, limitLabel, shortName,
     percentText, compactPercent, demoName, demoResult, DEMO_SCENARIOS, rowPlan, textWidth, fittedSizes, ringOf, ringImage, LOCK_RINGS, lockPicks, drawLockPair, LOCK_TITLE_WIDTH, INLINE_WIDTH, SHORT_ERROR_NAMES, timeShort, whenShort, TIME_SYMBOLS, limitName, refreshAfter, inlineText, segmentShape, BRAND_COLORS, ICONS,
     SIZE_CONTENT, paceText, sanitizeHistory, sparkLines, trendWindows, clockText, widgetSize, PADDING, drawnJunction,
-    projectionOf, barSegmentsAt, barPieces, freshnessOf, resetShort, rowMark, SCALES, WARN_MARK, BAR_COLORS, PROVIDER_ORDER, NOT_AVAILABLE, trendDrawOrder, lineHeight, subHeight, rowHeightOf, FRESH_COLORS, fitRows, groupHeight, thinPoints, paceOf, visibleRows, sanitizeBoundaries, layoutGroups, rowRank, trendSeries, timerWidth, remainingText, trendY, TREND_HOURS,
+    projectionOf, barSegmentsAt, barPieces, freshnessOf, resetShort, rowMark, SCALES, WARN_MARK, BAR_COLORS, PROVIDER_ORDER, NOT_AVAILABLE, trendDrawOrder, lineHeight, subHeight, rowHeightOf, FRESH_COLORS, fitRows, groupHeight, thinPoints, paceOf, visibleRows, sanitizeBoundaries, layoutGroups, rowRank, trendSeries, timerWidth, remainingText, trendY, TREND_HOURS, weekRange, dayStarts, trendX, WEEKDAYS,
     resetDate, errorText, cachedNote, readCache, originTag, cacheTag, sameConfig, DEFAULT_CONFIG_ID, cacheFileName, seenFileName, pickCache, seenFrom, OWN_FILE, formatDuration,
   };
 }
