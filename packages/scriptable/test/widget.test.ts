@@ -421,7 +421,7 @@ test("When fetching fails, shows the same server's previous view with staleness 
   const all = texts(stale.widget.node);
   const i = all.indexOf("5h limit", all.indexOf("Claude"));
   assert.equal(all[i + 1], "100%", "0% used after reset (estimated)");
-  assert.ok(all.includes("Reset (est.)"));
+  assert.ok(all.includes("Reset?"));
   assert.ok(all.some((t) => /data from 3h 30m ago/.test(t)), all.join(" | "));
   const inline = await runWidget({ family: "accessoryInline", response: null, cached, now: late });
   assert.match(texts(inline.widget.node)[0]!, /^⚠︎ /, "the inline widget also shows the update failed");
@@ -809,7 +809,7 @@ test("Per-size content: small is compact with one forecast; medium adds reset, m
   const l = texts(large.widget.node);
   assert.ok(l.some((x) => x.includes("%/h")), l.join(" | "));
   assert.ok(l.includes("Fable weekly"), "large always shows scoped limits");
-  assert.ok(l.includes("This week · Weekly") && l.includes("Claude") && l.includes("Codex"), l.join(" | "));
+  assert.ok(l.includes("Weekly usage") && l.includes("Claude") && l.includes("Codex"), l.join(" | "));
   const asked = large.requests.map((r: any) => r.url).filter((u: string) => u.includes("/v2/history")).map((u: string) => new URL(u).searchParams.get("window"));
   assert.deepEqual(asked, ["seven_day", "seven_day"], "Claude and Codex overlay the same weekly trend (Codex has no 5h)");
   const urls = large.requests.map((r: any) => r.url);
@@ -1168,7 +1168,7 @@ test("All chart lines have the same width", async () => {
 test("(After fixing the chart to weekly) even when only a scoped limit is named, the chart shows that provider's weekly limit for 7 days", async () => {
   const run = await runWidget({ family: "large", parameter: "claude.seven_day_fable", responder: historyFor([{ at: "2026-11-16T12:00:00.000Z", used_percent: 1 }]) });
   const all = texts(run.widget.node);
-  assert.ok(all.includes("Fable weekly") && all.includes("This week · Weekly") && all.includes("Claude"), all.join(" | "));
+  assert.ok(all.includes("Fable weekly") && all.includes("Weekly usage") && all.includes("Claude"), all.join(" | "));
   const asked = run.requests.map((r: any) => r.url).filter((u: string) => u.includes("/v2/history")).map((u: string) => new URL(u).searchParams.get("window"));
   assert.deepEqual(asked, ["seven_day"]);
 });
@@ -1201,7 +1201,7 @@ test("The rate is omitted when showing the run-out time or when the column is na
 test("If one trend is missing it uses a short label; if both are missing, one line", async () => {
   const partial = await runWidget({ family: "large", responder: (url) => (url.includes("provider=codex") ? { status: 503, body: "" } : historyFor([{ at: "2026-11-16T12:00:00.000Z", used_percent: 4 }])(url)) });
   const p = texts(partial.widget.node);
-  assert.ok(p.includes("This week · Weekly") && p.includes("Claude") && p.includes("Codex –"), p.join(" | "));
+  assert.ok(p.includes("Weekly usage") && p.includes("Claude") && p.includes("Codex –"), p.join(" | "));
   const none = await runWidget({ family: "large", responder: (url) => (url.includes("/v2/history") ? { status: 503, body: "" } : undefined) });
   assert.ok(texts(none.widget.node).includes("No weekly data yet") && !texts(none.widget.node).includes("Last 24h"));
 });
@@ -1423,14 +1423,14 @@ test("Lock screen: circular progress around the icon. The rectangle shows the on
   // The test script has no PNG embedded, so the ring holds the initial (the icon if there is a PNG)
   assert.ok(rings[0]!.props.data || (rings[0]!.props.drawnTexts as string[]).includes("X"), "the icon is inside the ring");
   const r = texts(rect.widget.node);
-  assert.ok(r.includes("Codex · Weekly") && r.includes("71%") && r.includes("31m ago"), r.join(" | "));
+  assert.ok(r.includes("Codex · Weekly") && r.includes("71%") && r.includes("31m"), r.join(" | "));
   assert.ok(images(rect.widget.node).some((n) => n.props.symbol === lib.TIME_SYMBOLS.reset), "reset time");
   const inline = await runWidget({ family: "accessoryInline", parameter: "codex" });
   assert.deepEqual(texts(inline.widget.node), ["Codex Wk 71%"]);
   const circular = await runWidget({ family: "accessoryCircular", now: later });
   const ring = images(circular.widget.node).find((n) => n.props.ring);
   assert.equal((ring?.props.drawnTexts as string[]).at(-1), "71%", "remaining is inside the ring (below the icon)");
-  assert.deepEqual(texts(circular.widget.node), ["Wk 31m ago"]);
+  assert.deepEqual(texts(circular.widget.node), ["Wk 31m"]);
   // The ring is the shown limit's remaining (matches the number)
   const now = new Date("2026-11-16T13:05:00.000Z");
   const view = lib.demoResult("runout", now).view;
@@ -1445,8 +1445,12 @@ test("Lock screen: circular progress around the icon. The rectangle shows the on
 });
 
 test("Lock screen marks stack reset estimate, staleness and approximation (also with the previous-value ⚠)", async () => {
-  assert.equal(lib.shortMark({ value_status: "old", recent_quality: "approx" }), "old", "approximations get no mark");
-  assert.equal(lib.shortMark({ value_status: "stale", age_minutes: 20, recent_quality: "approx" }), "20m ago");
+  // The same as the text next to the home screen's dot: the age past 15 minutes, nothing when fresh, of unknown age or at the limit
+  assert.equal(lib.shortMark({ value_status: "old", age_minutes: 130, recent_quality: "approx" }), "2h 10m", "approximations get no mark");
+  assert.equal(lib.shortMark({ value_status: "stale", age_minutes: 20, recent_quality: "approx" }), "20m");
+  assert.equal(lib.shortMark({ value_status: "stale", age_minutes: 20, provider_blocked: true }), "", "at the limit, no age (the red dot alone at home)");
+  assert.equal(lib.shortMark({ value_status: null }), "", "unknown age (the gray dot alone at home)");
+  assert.equal(lib.shortMark({ value_status: "fresh", age_minutes: 3 }), "");
   assert.equal(lib.shortMark({ value_status: "reset_estimated", recent_quality: "unknown" }), "est.");
   const cached = JSON.stringify({ saved_at: NOW.toISOString(), origin: "https://headroom.example.com", view: lib.sanitizeView(sampleView()) });
   const late = new Date("2026-11-16T16:30:00.000Z");
@@ -1528,7 +1532,7 @@ test("Lock screen ⚠ times also trigger a redraw; long headings drop the provid
   const long = await runWidget({ family: "accessoryRectangular", parameter: "claude.seven_day_fable", now: late });
   const head = texts(long.widget.node)[0]!;
   assert.equal(head, "Fable weekly", "the provider name is dropped");
-  assert.ok(texts(long.widget.node).some((x) => /^\d+m ago$/.test(x)), "the staleness mark is next to the remaining value");
+  assert.ok(texts(long.widget.node).some((x) => /^\d+m$/.test(x)), "the staleness mark is next to the remaining value");
   assert.ok(lib.textWidth(head, 12) * 0.8 <= lib.LOCK_TITLE_WIDTH + 1, head);
   const short = await runWidget({ family: "accessoryRectangular", parameter: "codex weekly", now: late });
   assert.equal(texts(short.widget.node)[0], "Codex · Weekly", texts(short.widget.node).join(" | "));
@@ -1648,12 +1652,12 @@ test("Version 46: weekday times to the minute; chart heading (Usage) on the left
   assert.match(lib.whenShort(new Date("2026-11-20T07:00:00.000Z"), now).text, /^\w{3} \d{1,2}:\d{2} [AP]M$/, "Fri 4:00 PM form");
   const run = await runWidget({ family: "large", parameter: "demo:normal", now });
   const all = texts(run.widget.node);
-  const usage = all.indexOf("Usage");
-  assert.ok(usage >= 0 && all.indexOf("This week · Weekly") > usage, all.join(" | "));
+  const usage = all.indexOf("Weekly usage");
+  assert.ok(usage >= 0 && !all.some((t) => t.includes("This week")), all.join(" | "));
   // Legend row: heading -> flexible spacer -> legend (right-aligned)
   const rows = (node: any): any[] => [...(node.kind === "stack" ? [node] : []), ...node.children.flatMap(rows)];
-  const legend = rows(run.widget.node).find((s) => s.children.some((c: any) => c.kind === "text" && c.props.text === "Usage"));
-  assert.equal(legend.children[0].props.text, "Usage");
+  const legend = rows(run.widget.node).find((s) => s.children.some((c: any) => c.kind === "text" && c.props.text === "Weekly usage"));
+  assert.equal(legend.children[0].props.text, "Weekly usage");
   assert.equal(legend.children[1].kind, "spacer");
   assert.equal(legend.children[1].props.length, null, "flexible spacer (right-aligned)");
   // The lower value is drawn last (in front): the demo normal is Codex 41%, Claude 22%, so Claude last
@@ -1682,9 +1686,10 @@ test("Rows are fixed to the column width (remaining number and rate right-aligne
   assert.equal((sub.props.size as any)?.w, width, "time row is the column width");
   const line = rows(run.widget.node).find((s) => s.children.some((c: any) => c.kind === "text" && c.props.text === "5h limit"));
   assert.equal((line.props.size as any)?.w, width, "heading row is the column width too");
-  const header = rows(cols[0]!).find((x) => x.children.some((c: any) => c.kind === "stack" && c.children.some((d: any) => d.kind === "text" && d.props.text === "Codex")));
+  const hasName = (x: any) => x.kind === "stack" && x.children.some((d: any) => d.kind === "text" && d.props.text === "Codex");
+  const header = rows(cols[0]!).find((x) => x.children.some((c: any) => c.kind === "stack" && c.children.some(hasName)));
   assert.equal((header.props.size as any)?.w, width, "provider header row is the column width too");
-  const legend = rows(run.widget.node).find((x) => x.children.some((c: any) => c.kind === "text" && c.props.text === "Usage"));
+  const legend = rows(run.widget.node).find((x) => x.children.some((c: any) => c.kind === "text" && c.props.text === "Weekly usage"));
   assert.ok((legend.props.size as any)?.w > width, "chart heading row is the chart width");
 });
 
@@ -1751,8 +1756,10 @@ test("Codex and Claude columns have equal heights: header, limit name and time r
 test("Header: icon, name and freshness dot are centered; the plan aligns with the name's bottom edge (device feedback)", async () => {
   const run = await runWidget({ family: "medium" });
   const rows = (node: any): any[] => [...(node.kind === "stack" ? [node] : []), ...node.children.flatMap(rows)];
-  const names = rows(run.widget.node).find((x) => x.children.some((c: any) => c.kind === "text" && c.props.text === "Codex"));
+  const nameBox = rows(run.widget.node).find((x) => x.children.some((c: any) => c.kind === "text" && c.props.text === "Codex"));
+  const names = rows(run.widget.node).find((x) => x.children.includes(nameBox));
   assert.equal(names.props.align, "bottom", "name and plan at the bottom edge");
+  assert.ok((nameBox.props.size as any)?.w >= lib.textWidth("Codex", lib.SCALES.medium.name, true), "the name has a box as wide as its text (never shortened)");
   assert.ok(texts(names).includes("Pro Lite"), "the plan is in the same group as the name");
   const header = rows(run.widget.node).find((x) => x.children.includes(names));
   assert.equal(header.props.align, "center", "the row is centered");
@@ -1851,4 +1858,107 @@ test("Without points this week, the legend says there is no weekly data yet", as
   const range = lib.weekRange(NOW);
   const run = await runWidget({ family: "large", responder: historyFor([{ at: new Date(range.start - 60000).toISOString(), used_percent: 4 }]) });
   assert.ok(texts(run.widget.node).includes("No weekly data yet"), texts(run.widget.node).join(" | "));
+});
+
+test("A countdown asks for a redraw when it reaches zero (it would count up after that)", async () => {
+  const now = new Date("2026-11-16T13:05:00.000Z");
+  const view = lib.demoResult("normal", now).view;
+  view.claude.windows.five_hour.resets_at = new Date(now.getTime() + 7 * 60000).toISOString();
+  view.claude.windows.five_hour.rate_pace = 0;
+  const body = { ...view, data_version: 1, view_version: 1 };
+  const run = await runWidget({ family: "medium", response: { status: 200, body }, now });
+  assert.equal((run.widget as any).refreshAfterDate.getTime(), now.getTime() + 7 * 60000);
+});
+
+test("The large chart's scale is always 0-100% and says so at its ends", async () => {
+  const run = await runWidget({ family: "large", responder: historyFor([{ at: "2026-11-16T12:00:00.000Z", used_percent: 4 }]) });
+  const chart = images(run.widget.node).find((n) => Array.isArray((n.props as any).drawnTexts) && (n.props as any).drawnTexts.length > 0);
+  assert.deepEqual((chart?.props as any)?.drawnTexts, ["100%", "0%"]);
+  assert.equal(lib.trendY(100, 60, 3), 3);
+  assert.equal(lib.trendY(0, 60, 3), 57);
+});
+
+test("While a provider is at its limit, values that stopped updating get a red dot", () => {
+  const raw = sampleView();
+  raw.claude!.blocked = true;
+  const view = lib.sanitizeView(raw);
+  assert.equal(view.claude.blocked, true, "the limit flag survives reading the response");
+  assert.notEqual(lib.sanitizeView(sampleView()).claude.blocked, true);
+  assert.equal(lib.freshnessOf(view, "claude", NOW).level, "fresh", "still fresh right after a fetch");
+  assert.deepEqual(plain(lib.freshnessOf(view, "claude", new Date("2026-11-16T13:30:00.000Z"))), { level: "limit", text: "" }, "no age next to the red dot");
+  assert.equal(lib.FRESH_COLORS.limit, "#FF3B30");
+});
+
+test("After the run-out time passes with no newer value, the row says Limit?; after a reset time, Reset?", async () => {
+  const now = new Date("2026-11-16T13:05:00.000Z");
+  const view = lib.demoResult("runout", now).view;
+  const five = view.claude.windows.five_hour;
+  const at = lib.projectionOf(lib.atDisplayTime(five, now), now).at as number;
+  const later = new Date(at + 2 * 60000);
+  assert.deepEqual(plain(lib.timeShort(lib.atDisplayTime(five, later), later)), { warn: true, kind: "text", text: "Limit?" });
+  const run = await runWidget({ family: "medium", response: { status: 200, body: { ...view, data_version: 1, view_version: 1 } }, now: later });
+  assert.ok(texts(run.widget.node).includes("Limit?"), texts(run.widget.node).join(" | "));
+  // A newer value at 100% shows the reset again, and past the reset it is Reset?
+  assert.equal(lib.timeShort(lib.atDisplayTime({ ...five, used_percent: 100, fetched_at: later.toISOString() }, later), later).warn, false);
+  const afterReset = new Date(Date.parse(five.resets_at) + 60000);
+  assert.equal(lib.timeShort(lib.atDisplayTime(five, afterReset), afterReset), null);
+});
+
+test("The provider name is never cut off: when the header is too narrow, the plan is left out first", async () => {
+  const now = new Date("2026-11-16T13:05:00.000Z");
+  const view = lib.demoResult("normal", now).view;
+  // Values 2 hours old: the header shows "2h" next to the dot
+  for (const p of [view.codex, view.claude]) for (const w of Object.values(p.windows) as any[]) w.fetched_at = new Date(now.getTime() - 2 * 3_600_000).toISOString();
+  const body = { ...view, data_version: 1, view_version: 1 };
+  const narrow = await runWidget({ family: "medium", response: { status: 200, body }, now, screen: 320 });
+  const all = texts(narrow.widget.node);
+  assert.ok(all.includes("Codex") && all.includes("Claude"), all.join(" | "));
+  const wide = await runWidget({ family: "medium", response: { status: 200, body }, now, screen: 430 });
+  assert.ok(texts(wide.widget.node).includes("Plus"), "the plan stays when it fits");
+});
+
+test("Large uses medium's sizes throughout, and the chart takes the room left", () => {
+  for (const key of ["icon", "name", "headerSmall", "label", "pct", "small", "bar", "gapBar", "gapSub", "gapRow", "gapHeader", "header"] as const) {
+    assert.equal(lib.SCALES.large[key], lib.SCALES.medium[key], key);
+  }
+});
+
+test("At 100%, the gray part (recent use) goes away once its span has passed since the fetch: 1 hour for 5h, 1 day for the weekly limit", async () => {
+  const now = new Date("2026-11-19T13:00:00.000Z");
+  const at = (minutes: number) => new Date(now.getTime() - minutes * 60000).toISOString();
+  const win = (id: string, span: number, used: number, ago: number) => lib.sanitizeView({
+    view_version: 1, data_version: 1,
+    claude: { status: "ok", plan: "max", error_code: null, blocked: used >= 100, main_window_ids: id, window_ids: id, windows: {
+      [id]: { id, label: id, scope: null, used_percent: used, recent_consumed_percent: 30, recent_minutes: span, recent_quality: "exact",
+        confidence: "high", fetched_at: at(ago), resets_at: "2026-11-20T10:00:00.000Z" } } },
+    codex: null,
+  }).claude.windows[id];
+  assert.equal(lib.atDisplayTime(win("five_hour", 60, 100, 59), now).recent_consumed_percent, 30, "within the hour it stays");
+  assert.equal(lib.atDisplayTime(win("five_hour", 60, 100, 60), now).recent_consumed_percent, 0, "an hour after the fetch it is gone");
+  assert.equal(lib.atDisplayTime(win("seven_day", 1440, 100, 23 * 60), now).recent_consumed_percent, 30, "the weekly limit keeps it for a day");
+  assert.equal(lib.atDisplayTime(win("seven_day", 1440, 100, 24 * 60), now).recent_consumed_percent, 0);
+  assert.equal(lib.atDisplayTime(win("five_hour", 60, 90, 90), now).recent_consumed_percent, 30, "below the limit more may have been used, so it stays");
+  assert.equal(lib.recentSettledAt(win("five_hour", 60, 100, 50)), now.getTime() + 10 * 60000);
+});
+
+test("The widget asks to be redrawn when the gray part of a limit at 100% goes away", async () => {
+  const now = new Date("2026-11-16T13:05:00.000Z");
+  const view = lib.demoResult("normal", now).view;
+  const five = view.claude.windows.five_hour;
+  Object.assign(five, { used_percent: 100, recent_consumed_percent: 20, recent_minutes: 60, fetched_at: new Date(now.getTime() - 52 * 60000).toISOString() });
+  view.claude.blocked = true;
+  const body = { ...view, data_version: 1, view_version: 1 };
+  const run = await runWidget({ family: "medium", response: { status: 200, body }, now });
+  assert.equal((run.widget as any).refreshAfterDate.getTime(), now.getTime() + 8 * 60000);
+});
+
+test("Lock screen: a provider at its limit shows no age, like the red dot at home", async () => {
+  const later = new Date("2026-11-16T13:30:00.000Z");
+  const raw = sampleView();
+  raw.codex!.blocked = true;
+  const body = { ...raw, data_version: 1, view_version: 1 };
+  const rect = await runWidget({ family: "accessoryRectangular", parameter: "codex weekly", response: { status: 200, body }, now: later });
+  assert.ok(!texts(rect.widget.node).some((x) => /^\d+m$/.test(x)), texts(rect.widget.node).join(" | "));
+  const home = await runWidget({ family: "medium", response: { status: 200, body }, now: later });
+  assert.ok(images(home.widget.node).some((n) => (n.props.fills as any[])?.some((c) => c?.hex === lib.FRESH_COLORS.limit)), "the home screen shows the red dot");
 });

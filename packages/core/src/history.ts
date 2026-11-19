@@ -261,12 +261,15 @@ export interface HourlyRow {
   resets_at: string | null;
 }
 
-/** Interval treated as a "gap" in the hourly series (points are hourly, so over 90 minutes) */
+/** Interval treated as a "gap" in the hourly series: over 90 minutes with no observation */
 export const HOURLY_GAP_MS = 90 * 60_000;
+const HOUR_MS = 60 * 60_000;
 
 /**
  * Build a series from the hourly aggregate (chart of 7 days of the weekly window). Points before since are dropped.
- * break is a gap of over 90 minutes from the previous point (gap), or a cycle change (reset time differs by more than 5 minutes; reset)
+ * break is a gap (gap), or a cycle change (reset time differs by more than 5 minutes; reset). Each point is the last observation of its UTC hour,
+ * so points of adjacent hours can be up to 2 hours apart with observations in between: a gap is over 90 minutes with at least one whole hour
+ * between the points that has no point (no observation)
  */
 export function hourlySeries(rows: readonly HourlyRow[], since: Date): SeriesPoint[] {
   const points = rows
@@ -283,7 +286,8 @@ export function hourlySeries(rows: readonly HourlyRow[], since: Date): SeriesPoi
       at: new Date(p.at).toISOString(),
       used_percent: p.used,
       resets_at: p.reset === null ? null : new Date(p.reset).toISOString(),
-      break: before === undefined ? null : !sameCycle ? "reset" : p.at - before.at > HOURLY_GAP_MS ? "gap" : null,
+      break: before === undefined ? null : !sameCycle ? "reset"
+        : p.at - before.at > HOURLY_GAP_MS && Math.floor(p.at / HOUR_MS) - Math.floor(before.at / HOUR_MS) > 1 ? "gap" : null,
     };
   });
 }

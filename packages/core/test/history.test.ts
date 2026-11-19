@@ -223,3 +223,16 @@ test("builds the weekly series from the hourly aggregate (split at gaps over 90 
   ], new Date("2026-11-10T00:00:00.000Z"));
   assert.deepEqual(series.map((p) => [p.used_percent, p.break]), [[10, null], [12, null], [15, "gap"], [1, "reset"]], "points before since are dropped");
 });
+
+test("points of adjacent hours are joined even when over 90 minutes apart (each is the last observation of its hour)", () => {
+  const row = (iso: string, used: number) => ({ observed_at: iso, used_percent: used, resets_at: "2026-11-20T07:00:00.000Z" });
+  // 09:24 is the last observation of 09:xx and 10:56 of 10:xx (there were observations at 10:03 and 10:24 in between)
+  const joined = hourlySeries([row("2026-11-19T09:24:55.010Z", 43), row("2026-11-19T10:56:00.334Z", 46)], new Date("2026-11-19T00:00:00.000Z"));
+  assert.deepEqual(joined.map((p) => p.break), [null, null]);
+  // A whole hour without a point and over 90 minutes is a gap
+  const gap = hourlySeries([row("2026-11-19T09:24:00.000Z", 43), row("2026-11-19T11:00:00.000Z", 46)], new Date("2026-11-19T00:00:00.000Z"));
+  assert.deepEqual(gap.map((p) => p.break), [null, "gap"]);
+  // A missing hour but under 90 minutes apart is not
+  const close = hourlySeries([row("2026-11-19T09:59:00.000Z", 43), row("2026-11-19T11:01:00.000Z", 46)], new Date("2026-11-19T00:00:00.000Z"));
+  assert.deepEqual(close.map((p) => p.break), [null, null]);
+});

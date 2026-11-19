@@ -152,6 +152,8 @@ function sanitizeWindow(w) {
     scope: str(w.scope, 32),
     used_percent: w.used_percent,
     recent_consumed_percent: num(w.recent_consumed_percent),
+    // Span of the recent consumption (the gray part of the bar) in minutes: 60 for the 5-hour limit, 1440 for the weekly limit
+    recent_minutes: num(w.recent_minutes),
     recent_quality: oneOf(w.recent_quality, ["exact", "approx", "unknown"]) ?? "unknown",
     confidence: oneOf(w.confidence, ["high", "medium", "low", "insufficient"]),
     fetched_at: str(w.fetched_at, 40),
@@ -193,6 +195,8 @@ function sanitizeProvider(p) {
     status: oneOf(p.status, PROVIDER_STATUSES),
     plan: oneOf(p.plan, Object.keys(PLAN_NAMES)),
     error_code: oneOf(p.error_code, Object.keys(ERROR_NAMES)),
+    // At its limit (true / false / unknown); the header dot turns red while values stop updating at the limit
+    blocked: typeof p.blocked === "boolean" ? p.blocked : null,
     main_window_ids: main, window_ids: all, windows,
   };
 }
@@ -249,7 +253,10 @@ function atDisplayTime(w, now) {
     : age === null ? null
     : age <= FRESH_MAX_MINUTES ? "fresh" : age <= CAUTION_MAX_MINUTES ? "stale" : "old";
   const used = passed ? 0 : w.used_percent;
-  const recentQuality = passed ? "unknown" : w.recent_quality;
+  // A limit at 100% can't be used further, so once the recent span has passed since the fetch, nothing was used in it
+  const settledAt = recentSettledAt(w);
+  const settled = !passed && settledAt !== null && settledAt <= now.getTime();
+  const recentQuality = passed ? "unknown" : settled ? "exact" : w.recent_quality;
   const valueText = status === "stale" ? `${WARN_MARK} ${formatDuration(age)} ago`
     : status === "old" ? `Old (${formatDuration(age)} ago)`
     : status === "reset_estimated" ? "Reset (estimated)"
@@ -263,7 +270,7 @@ function atDisplayTime(w, now) {
     used_percent_int: usedInt,
     remaining_percent_int: Math.max(0, Math.min(100, 100 - usedInt)),
     remaining_percent: Math.max(0, Math.min(100, 100 - used)),
-    recent_consumed_percent: passed ? null : w.recent_consumed_percent,
+    recent_consumed_percent: passed ? null : settled ? 0 : w.recent_consumed_percent,
     recent_quality: recentQuality,
     reset_passed: passed,
     value_status: status,
@@ -272,14 +279,31 @@ function atDisplayTime(w, now) {
   };
 }
 
-/** Short mark (lock screen; stacks the reset estimate and staleness. Approximate values get no mark) */
+/**
+ * When the recent consumption of a limit at 100% becomes 0 (its fetch plus the recent span; nothing more can be used at the limit).
+ * null if the limit isn't at 100%, has no recent consumption, or its span or fetch time is unknown
+ */
+function recentSettledAt(w) {
+  const fetched = Date.parse(w.fetched_at ?? "");
+  const span = typeof w.recent_minutes === "number" && w.recent_minutes > 0 ? w.recent_minutes : null;
+  if (w.used_percent < 100 || !(w.recent_consumed_percent > 0) || span === null || !Number.isFinite(fetched)) return null;
+  return fetched + span * 60000;
+}
+
+/**
+ * Short mark (lock screen). The reset estimate (est.), or the age the home screen shows next to its gray dot (32m, 2h; over 15 minutes).
+ * The lock screen has no colors, so the dot itself isn't drawn: fresh values, values of unknown age (gray dot alone) and values at the limit
+ * (red dot alone) get no mark, as at home. Approximate values get no mark either
+ */
 function shortMark(w) {
-  const marks = [];
-  if (w.value_status === "reset_estimated") marks.push("est.");
-  else if (w.value_status === "old") marks.push("old");
-  else if (w.value_status === "stale") marks.push(`${formatDuration(w.age_minutes)} ago`);
-  else if (w.value_status === null) marks.push("time?");
-  return marks.join(" · ");
+  if (w.value_status === "reset_estimated") return "est.";
+  if ((w.value_status === "stale" || w.value_status === "old") && !w.provider_blocked) return formatDuration(w.age_minutes);
+  return "";
+}
+
+/** A limit as shown on the lock screen: its display-time values and whether its provider is at its limit (for the staleness mark) */
+function lockWindow(view, provider, w, now) {
+  return { ...atDisplayTime(w, now), provider_blocked: view?.[provider]?.blocked === true };
 }
 
 /**
@@ -292,7 +316,7 @@ function selectWindows(view, parameter, now) {
   const push = (provider, id) => {
     const w = view?.[provider]?.windows?.[id];
     if (w && !out.some((x) => x.provider === provider && x.window.id === id)) {
-      out.push({ provider, providerName: PROVIDER_NAMES[provider], window: atDisplayTime(w, now) });
+      out.push({ provider, providerName: PROVIDER_NAMES[provider], window: lockWindow(view, provider, w, now) });
     }
   };
   const main = (provider) => {
@@ -477,7 +501,11 @@ function barPieces(segments, width, height, brandHex) {
   return out;
 }
 
-/** Freshness of a provider's values (the header dot), by time since fetch: fresh, caution (over 15 min), old (over 60 min) */
+/**
+ * Freshness of a provider's values (the header dot), by time since fetch: fresh, caution (over 15 min), old (over 60 min).
+ * While the provider is at its limit, values past fresh are "limit" (red): fetching slows down until the reset, so they are expected
+ * to stop updating
+ */
 function freshnessOf(view, provider, now, ids = null) {
   const p = view?.[provider];
   const list = ids ?? (p?.main_window_ids?.length ? p.main_window_ids : Object.keys(p?.windows ?? {}));
@@ -489,6 +517,8 @@ function freshnessOf(view, provider, now, ids = null) {
   if (oldest === null) return { level: "unknown", text: "" };
   const age = Math.max(0, Math.floor((now.getTime() - oldest) / 60000));
   if (age <= FRESH_MAX_MINUTES) return { level: "fresh", text: "" };
+  // At the limit the red dot says enough (values are expected to stop updating), so no age is shown
+  if (p?.blocked === true) return { level: "limit", text: "" };
   return { level: age <= CAUTION_MAX_MINUTES ? "stale" : "old", text: formatDuration(age) };
 }
 
@@ -507,7 +537,8 @@ function whenShort(date, now) {
 /**
  * Time shown in the time row: if it will run out before reset, show the run-out time in place of the reset time,
  * in the same form, and replace the ↻ symbol with ⚠ (warn). "Soon" if less than a minute is left until run-out
- * (the widget cannot be redrawn sooner than a minute later). Otherwise the reset time
+ * (the widget cannot be redrawn sooner than a minute later). Once that time has passed without a newer value, "Limit?"
+ * (the limit is likely reached; the counterpart of "Reset?" once a reset time has passed) until the reset. Otherwise the reset time
  */
 function timeShort(window, now) {
   const p = projectionOf(window, now);
@@ -515,8 +546,19 @@ function timeShort(window, now) {
     if (p.at - now.getTime() < 60000) return { warn: true, kind: "text", text: "Soon" };
     return { warn: true, ...whenShort(new Date(p.at), now) };
   }
+  if (runOutPassed(window, now)) return { warn: true, kind: "text", text: "Limit?" };
   const reset = resetShort(window, now);
   return reset ? { warn: false, ...reset } : null;
+}
+
+/**
+ * Whether the forecast run-out time has passed with no newer value, before the reset (the same forecast projectionOf draws until then)
+ */
+function runOutPassed(w, now) {
+  const reset = Date.parse(w.resets_at ?? "");
+  if (!Number.isFinite(reset) || reset <= now.getTime()) return false;
+  const before = projectionOf(w, new Date(Date.parse(w.fetched_at ?? "")));
+  return Boolean(before?.runsOut && before.at !== null && before.at <= now.getTime() && before.at < reset);
 }
 
 /** Symbols for the time row (SF Symbols; both monochrome, tinted with the text color) */
@@ -588,7 +630,7 @@ function remainingText(window) {
 const INLINE_WIDTH = 225;
 
 /**
- * One line on the lock screen. Until the full text (including the demo prefix) fits: shorten the staleness mark (26m ago -> 26m) -> drop it ->
+ * One line on the lock screen. Until the full text (including the demo prefix) fits: drop the staleness mark ->
  * shorten scoped limit names (Wk Fable -> Fable) -> shorten the reset estimate to "~100%" -> drop limit names (5h, Wk) -> drop scoped names too.
  * The ⚠ for failed updates, the remaining value and the reset-estimate mark are kept
  */
@@ -598,7 +640,7 @@ function inlineText(items, cached, prefix = "") {
       if (x.missing) return `${x.providerName} ${x.label.startsWith("5h:") ? "5h N/A" : x.label}`;
       const full = shortMark(x.window);
       const est = full.includes("est.") ? "est." : "";
-      const mark = step === 0 ? full : step === 1 ? full.replace(/ ago$/, "") : step <= 3 ? est : "";
+      const mark = step <= 1 ? full : step <= 3 ? est : "";
       const scope = x.window.scope ? SCOPE_NAMES[x.window.scope] ?? x.window.scope : null;
       const name = step >= 6 ? "" : step >= 3 && scope ? scope : step >= 5 ? "" : shortName(x.window);
       const value = step >= 4 && est ? `~${compactPercent(x.window)}` : compactPercent(x.window);
@@ -1302,7 +1344,7 @@ function addSmallText(stack, text, size, color, shrink = 0.8) {
 
 /** Color of the freshness dot */
 // Green only when fresh, gray otherwise (staleness is conveyed by the elapsed time next to it; one way of showing it)
-const FRESH_COLORS = { fresh: "#34C759", stale: "#8E8E93", old: "#8E8E93", unknown: "#8E8E93" };
+const FRESH_COLORS = { fresh: "#34C759", stale: "#8E8E93", old: "#8E8E93", unknown: "#8E8E93", limit: "#FF3B30" };
 
 /** Freshness dot (round image) */
 function dotImage(hex, size) {
@@ -1376,7 +1418,7 @@ function lockPicks(view, parameter, now) {
       for (const id of ids) {
         const w = v.windows?.[id];
         if (!w) continue;
-        const shown = atDisplayTime(w, now);
+        const shown = lockWindow(view, p, w, now);
         if (best === null || shown.used_percent > best.window.used_percent) best = { provider: p, providerName: PROVIDER_NAMES[p], window: shown };
       }
     }
@@ -1474,7 +1516,7 @@ function drawLockPair(widget, picks, result, now, cached) {
     const img = col.addImage(ringImage(iconImage(pick.provider), ringOf(w), BRAND_COLORS[pick.provider], LOCK_RINGS.pair, pick.provider, w ? compactPercent(w) : "–"));
     img.imageSize = new Size(LOCK_RINGS.pair.size, LOCK_RINGS.pair.size);
     col.addSpacer(1);
-    const mark = w ? [cached ? WARN_MARK : "", shortMark(w).replace(/ ago$/, "")].filter(Boolean).join(" ") : "";
+    const mark = w ? [cached ? WARN_MARK : "", shortMark(w)].filter(Boolean).join(" ") : "";
     const demo = result.demo && index === 0 ? " · Demo" : "";
     const fits = (s) => textWidth(s, 9, true) * 0.8 <= 76;
     const shortWindow = w ? limitName(w).replace(/ weekly$/, " wk").replace(/^Weekly$/, "Weekly") : "";
@@ -1506,6 +1548,8 @@ function addLockTime(stack, w, now, size, outs = null) {
     const p = projectionOf(w, now);
     if (p?.at) outs.push(p.at);
   }
+  // A countdown keeps counting up after zero, so the widget asks to be redrawn then (the row then shows the reset as passed)
+  if (time.kind === "timer" && outs) outs.push(time.date.getTime());
   const symbol = symbolImage(time.warn ? TIME_SYMBOLS.warn : TIME_SYMBOLS.reset);
   if (symbol) {
     const a = stack.addImage(symbol);
@@ -1546,23 +1590,27 @@ function addHeader(stack, group, opts) {
   const names = row.addStack();
   names.layoutHorizontally();
   names.bottomAlignContent();
-  const name = names.addText(group.name);
+  // The name is never shortened: it gets a box as wide as its text. The plan, then "Demo", are left out when the row is too narrow
+  const nameBox = names.addStack();
+  nameBox.size = new Size(Math.ceil(textWidth(group.name, s.name, true)) + 2, 0);
+  const name = nameBox.addText(group.name);
   name.font = Font.semiboldSystemFont(s.name);
   name.textColor = new Color(BRAND_COLORS[group.provider]);
   name.lineLimit = 1;
-  if (group.plan && opts.content.plan) {
-    names.addSpacer(5);
-    addSmallText(names, group.plan, s.small, SUB());
+  const f = opts.content.freshness ? group.freshness : null;
+  const extras = [group.plan && opts.content.plan ? group.plan : null, opts.demo ? "Demo" : null].filter(Boolean);
+  if (opts.width) {
+    const fixed = (icon ? s.icon + 5 : 0) + textWidth(group.name, s.name, true) + 2 + (f ? 6 + (f.text ? textWidth(f.text, s.headerSmall) + 3 : 0) : 0) + 4;
+    while (extras.length > 0 && fixed + extras.reduce((sum, t) => sum + 5 + textWidth(t, s.headerSmall), 0) > opts.width) extras.shift();
   }
-  if (opts.demo) {
+  for (const text of extras) {
     names.addSpacer(5);
-    addSmallText(names, "Demo", s.small, SUB());
+    addSmallText(names, text, s.headerSmall, SUB());
   }
   row.addSpacer(null);
-  if (opts.content.freshness && group.freshness) {
-    const f = group.freshness;
+  if (f) {
     if (f.text) {
-      addSmallText(row, f.text, s.small, SUB());
+      addSmallText(row, f.text, s.headerSmall, SUB());
       row.addSpacer(3);
     }
     const dot = row.addImage(dotImage(FRESH_COLORS[f.level], 6));
@@ -1596,7 +1644,7 @@ function rowPlan(row, opts) {
   const reset = !missing && c.reset ? timeShort(w, opts.now) : null;
   const parts = [];
   if (!missing) {
-    if (c.reset && !reset && w.reset_passed) parts.push("Reset (est.)");
+    if (c.reset && !reset && w.reset_passed) parts.push("Reset?");
     if (c.marks && rowMark(w) && !w.reset_passed) parts.push(rowMark(w));
   }
   // The rate goes at the right end of the time row
@@ -1612,6 +1660,10 @@ function rowPlan(row, opts) {
     pace,
     // Run-out time of the drawn warning (decides when to redraw)
     outAt: runsOut ? projection.at : null,
+    // When the drawn countdown reaches zero (a countdown keeps counting up after it, so the widget asks to be redrawn then)
+    timerAt: reset?.kind === "timer" ? reset.date.getTime() : null,
+    // When the gray part of a limit at 100% goes away (the widget asks to be redrawn then)
+    grayEndsAt: missing ? null : recentSettledAt(w),
     missingText: missing ? row.text : "",
   };
 }
@@ -1683,6 +1735,8 @@ function addRow(stack, group, row, opts) {
   const p = rowPlan(row, opts);
   const w = p.w;
   if (p.outAt !== null && opts.outs) opts.outs.push(p.outAt);
+  if (p.timerAt !== null && opts.outs) opts.outs.push(p.timerAt);
+  if (p.grayEndsAt !== null && p.grayEndsAt > opts.now.getTime() && opts.outs) opts.outs.push(p.grayEndsAt);
   const line = stack.addStack();
   line.layoutHorizontally();
   line.bottomAlignContent();
@@ -1825,7 +1879,7 @@ function trendChrome(scale) {
 }
 /** Height of the large trend chart (min and max) */
 const TREND_MIN_HEIGHT = 56;
-const TREND_MAX_HEIGHT = 150;
+const TREND_MAX_HEIGHT = 320;
 
 /**
  * Overlaid trend image (large). Draws one line per provider (lightly filled below) in a single 0-100% frame, a faint line at 50%,
@@ -1848,17 +1902,23 @@ function combinedTrendImage(series, width, height, inset = TREND_INSET, dayLines
     ctx.setLineWidth(0.5);
     ctx.strokePath();
   }
-  // Guide lines are drawn with the same coordinate calculation as the values (25%, 50%, 75%; lines are inset by inset)
-  for (const level of [0.25, 0.5, 0.75]) {
+  // Guide lines are drawn with the same coordinate calculation as the values. The scale is always 0-100%: its ends (0%, 100%) and
+  // 50% are stronger, 25% and 75% fainter
+  for (const level of [0, 0.25, 0.5, 0.75, 1]) {
     const y = trendY(level * 100, height, inset);
     const grid = new Path();
     grid.move(new Point(0, y));
     grid.addLine(new Point(width, y));
     ctx.addPath(grid);
-    ctx.setStrokeColor(new Color(BAR_COLORS.track, level === 0.5 ? 0.3 : 0.15));
+    ctx.setStrokeColor(new Color(BAR_COLORS.track, level === 0.25 || level === 0.75 ? 0.15 : 0.3));
     ctx.setLineWidth(0.5);
     ctx.strokePath();
   }
+  // The ends of the scale, at the left edge (under the lines drawn next)
+  ctx.setFont(Font.systemFont(TREND_LABEL_SIZE));
+  ctx.setTextColor(new Color(BAR_COLORS.track, 0.9));
+  ctx.drawTextInRect("100%", new Rect(4, trendY(100, height, inset) + 1, 40, TREND_LABEL_SIZE + 3));
+  ctx.drawTextInRect("0%", new Rect(4, trendY(0, height, inset) - TREND_LABEL_SIZE - 4, 40, TREND_LABEL_SIZE + 3));
   for (const { lines, hex } of series) {
     for (const line of lines) {
       if (line.length < 2) continue;
@@ -1901,6 +1961,8 @@ function combinedTrendImage(series, width, height, inset = TREND_INSET, dayLines
 
 /** Inner margin for lines in the large chart (radius of the large current-position dot) */
 const TREND_INSET = 3;
+/** Font size of the scale labels (100%, 0%) inside the large chart */
+const TREND_LABEL_SIZE = 8;
 
 /**
  * Trends drawn in the large chart (per provider): each provider's weekly limit, only trends with the same boundary as the view.
@@ -1935,7 +1997,7 @@ function drawCombinedTrend(stack, groups, opts) {
   legend.centerAlignContent();
   legend.size = new Size(opts.width, 0); // fix the row width to the chart width so the legend is right-aligned
   // Chart heading on the left, legend right-aligned
-  const title = legend.addText("Usage");
+  const title = legend.addText("Weekly usage");
   title.font = Font.semiboldSystemFont(opts.scale.small);
   title.textColor = TEXT();
   title.lineLimit = 1;
@@ -1944,10 +2006,9 @@ function drawCombinedTrend(stack, groups, opts) {
     // Neither trend available: one line instead of the legend
     addSmallText(legend, "No weekly data yet", opts.scale.small, SUB());
   } else {
-    // What the trend is (the weekly limit's 7 days) appears once at the start of the legend; each provider shows only its name
-    addSmallText(legend, "This week · Weekly", opts.scale.small, SUB());
-    for (const s of series) {
-      legend.addSpacer(10);
+    // What the chart is (the weekly limit, this week) is said by the heading and the day labels; the legend shows only the providers
+    for (const [i, s] of series.entries()) {
+      if (i > 0) legend.addSpacer(10);
       // Providers without a trend get a gray dot and "–" (kept short)
       const dot = legend.addImage(dotImage(has(s) ? BRAND_COLORS[s.provider] : BAR_COLORS.track, 7));
       dot.imageSize = new Size(7, 7);
@@ -2110,9 +2171,10 @@ function centeredBody(widget, width, lift = 0) {
 /** Font, bar and spacing sizes per widget size (points) */
 const SCALES = {
   // header is the estimated header height (a text line is about 1.2x the font size). rowHeight is built below from the same formula used for drawing
-  small: { compact: true, icon: 13, name: 12, label: 10, pct: 10, small: 9, bar: 5, gapBar: 2, gapSub: 2, gapRow: 3, gapHeader: 3, header: 15 },
-  medium: { compact: false, icon: 15, name: 13, label: 12, pct: 13, small: 10, bar: 8, gapBar: 3, gapSub: 2, gapRow: 7, gapHeader: 6, header: 16 },
-  large: { compact: false, icon: 17, name: 15, label: 13, pct: 15, small: 11, bar: 10, gapBar: 3, gapSub: 2, gapRow: 8, gapHeader: 7, header: 18 },
+  // headerSmall is the plan and freshness text in the header. Large uses medium's sizes throughout (header, rows, bars); the chart takes the room left
+  small: { compact: true, icon: 13, name: 12, headerSmall: 9, label: 10, pct: 10, small: 9, bar: 5, gapBar: 2, gapSub: 2, gapRow: 3, gapHeader: 3, header: 15 },
+  medium: { compact: false, icon: 15, name: 13, headerSmall: 10, label: 12, pct: 13, small: 10, bar: 8, gapBar: 3, gapSub: 2, gapRow: 7, gapHeader: 6, header: 16 },
+  large: { compact: false, icon: 15, name: 13, headerSmall: 10, label: 12, pct: 13, small: 10, bar: 8, gapBar: 3, gapSub: 2, gapRow: 7, gapHeader: 6, header: 16 },
 };
 // The height of one limit (for estimating visible rows) is built from the same formula as the fixed height used when drawing (so they don't drift)
 for (const [family, s] of Object.entries(SCALES)) s.rowHeight = rowHeightOf(s, SIZE_CONTENT[family]);
@@ -2299,7 +2361,7 @@ if (typeof Script !== "undefined" && typeof ListWidget !== "undefined") {
 } else if (typeof module !== "undefined") {
   module.exports = {
     HEADROOM_VERSION, VIEW_VERSION, KEYCHAIN_CONFIG, KEYCHAIN_LEGACY, MAX_WINDOWS, normalizeBaseUrl, buildRequest, validateSetup, sanitizeView,
-    atDisplayTime, shortMark, selectWindows, groupsOf, barSegments, barWidths, windowName, limitLabel, shortName,
+    atDisplayTime, recentSettledAt, shortMark, selectWindows, groupsOf, barSegments, barWidths, windowName, limitLabel, shortName,
     percentText, compactPercent, demoName, demoResult, DEMO_SCENARIOS, rowPlan, textWidth, fittedSizes, ringOf, ringImage, LOCK_RINGS, lockPicks, drawLockPair, LOCK_TITLE_WIDTH, INLINE_WIDTH, SHORT_ERROR_NAMES, timeShort, whenShort, TIME_SYMBOLS, limitName, refreshAfter, inlineText, segmentShape, BRAND_COLORS, ICONS,
     SIZE_CONTENT, paceText, sanitizeHistory, sparkLines, trendWindows, clockText, widgetSize, PADDING, drawnJunction,
     projectionOf, barSegmentsAt, barPieces, freshnessOf, resetShort, rowMark, SCALES, WARN_MARK, BAR_COLORS, PROVIDER_ORDER, NOT_AVAILABLE, trendDrawOrder, lineHeight, subHeight, rowHeightOf, FRESH_COLORS, fitRows, groupHeight, thinPoints, paceOf, visibleRows, sanitizeBoundaries, layoutGroups, rowRank, trendSeries, timerWidth, remainingText, trendY, TREND_HOURS, weekRange, dayStarts, trendX, WEEKDAYS,
