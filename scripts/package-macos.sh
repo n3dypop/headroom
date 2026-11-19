@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Builds the macOS release package of the Headroom agent (universal: Apple silicon + Intel):
-#   dist/headroom-<version>-macos-universal.tar.gz and dist/headroom-<version>-macos-universal.tar.gz.sha256
+# Builds the macOS release package of the Headroom agent (Apple silicon only; Intel Macs are not supported):
+#   dist/headroom-<version>-macos-arm64.tar.gz and dist/headroom-<version>-macos-arm64.tar.gz.sha256
 # Run on a Mac with Xcode Command Line Tools and Rust (rustup) installed:
-#   rustup target add aarch64-apple-darwin x86_64-apple-darwin
+#   rustup target add aarch64-apple-darwin
 #   scripts/package-macos.sh
 # The binaries get an ad-hoc signature only (not notarized), so install them with curl, not a browser.
 set -euo pipefail
@@ -12,23 +12,25 @@ manifest="$root/agent/Cargo.toml"
 version="$(sed -n 's/^version = "\(.*\)"/\1/p' "$manifest" | head -n 1)"
 [ -n "$version" ] || { echo "version not found in $manifest" >&2; exit 1; }
 
-# Fixed output directory, so the package never picks up binaries from another build
-target_dir="$root/agent/target"
-for t in aarch64-apple-darwin x86_64-apple-darwin; do
-  cargo build --release --locked --manifest-path "$manifest" --target "$t" --target-dir "$target_dir"
-done
+target="aarch64-apple-darwin"
+if command -v rustup >/dev/null 2>&1 && ! rustup target list --installed | grep -qx "$target"; then
+  echo "Rust target $target is not installed. Run: rustup target add $target" >&2
+  exit 1
+fi
 
-name="headroom-$version-macos-universal"
+# Fixed target and output directory, so the package never picks up binaries from another build
+target_dir="$root/agent/target"
+cargo build --release --locked --manifest-path "$manifest" --target "$target" --target-dir "$target_dir"
+
+name="headroom-$version-macos-arm64"
 dist="$root/dist"
 stage="$dist/$name"
 rm -rf "$stage"
 mkdir -p "$stage/docs"
 
 for bin in headroom headroomw; do
-  lipo -create -output "$stage/$bin" \
-    "$target_dir/aarch64-apple-darwin/release/$bin" \
-    "$target_dir/x86_64-apple-darwin/release/$bin"
-  lipo "$stage/$bin" -verify_arch arm64 x86_64
+  cp "$target_dir/$target/release/$bin" "$stage/$bin"
+  lipo "$stage/$bin" -verify_arch arm64
   codesign --force --sign - "$stage/$bin"
 done
 

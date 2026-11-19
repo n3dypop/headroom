@@ -3,7 +3,7 @@
 Headroom has three parts. Set them up in this order:
 
 1. **Server**: a Cloudflare Worker with a D1 database. You do this once.
-2. **Agent**: runs on each PC that uses Claude Code or Codex (Windows or macOS).
+2. **Agent**: runs on each PC that uses Claude Code or Codex (Windows x64, or macOS on Apple silicon).
 3. **Widget**: Scriptable on the iPhone.
 
 Each device gets its own token:
@@ -156,7 +156,7 @@ The agent starts Codex's App Server with the agent's own environment. A custom `
 
 **From a release package** (no build tools needed):
 
-Packages are published on the [Releases page](https://github.com/n3dypop/headroom/releases). Each package has a `.sha256` file next to it; the Releases page also shows each file's SHA-256 digest. Set `V` to the version you install (for example `0.1.0`).
+Packages are published on the [Releases page](https://github.com/n3dypop/headroom/releases). Each package has a `.sha256` file next to it; the Releases page also shows each file's SHA-256 digest. Set `V` to the version you install (for example `0.1.1`).
 
 Always download and extract into a new, empty folder. An older package you keep for rollback must not be overwritten, even one with the same version.
 
@@ -184,14 +184,14 @@ Always download and extract into a new, empty folder. An older package you keep 
   set -euo pipefail
   V=<version>
   EXPECTED=<sha256 of the tar.gz>
-  F="headroom-$V-macos-universal.tar.gz"
+  F="headroom-$V-macos-arm64.tar.gz"
   D="headroom-$(date +%Y%m%d%H%M%S)"
   mkdir "$D"
   cd "$D"
   curl -fsSLO "https://github.com/n3dypop/headroom/releases/download/v$V/$F"
   echo "$EXPECTED  $F" | shasum -a 256 -c -
   tar -xzf "$F"
-  cd "headroom-$V-macos-universal"
+  cd "headroom-$V-macos-arm64"
   ```
 
   If a version has no macOS package yet, build it on a Mac from the source of the same tag with `scripts/package-macos.sh`, or use **From source** below.

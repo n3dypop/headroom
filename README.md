@@ -49,7 +49,7 @@ See **[docs/install.md](docs/install.md)**. In short:
 |---|---|---|
 | Claude Code CLI (standalone install) with a Claude subscription (Pro, Max or higher) | Claude values | Checked with 2.1.325 |
 | Codex CLI (standalone install), signed in with ChatGPT | Codex values | Needs `app-server` and `account/rateLimits/read`. Developed against 0.169.0 |
-| Windows 10/11 or macOS | Agent | macOS packaging is provided; macOS support is still being verified |
+| Windows 10/11 (x64) or macOS on Apple silicon | Agent | Intel Macs are not supported. macOS support is still being verified |
 | Cloudflare account (Workers Free plan), Node.js 24+ | Deploying the Worker | `wrangler` is used through `npx` |
 | iPhone with [Scriptable](https://apps.apple.com/app/id1405459188) | Widget | |
 | Rust (stable), Node.js 24+ | Building from source / development only | |
