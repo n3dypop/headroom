@@ -112,6 +112,7 @@ fn spawn_detached(program: &Path) -> Result<(), String> {
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
     let base = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW;
+    stop_inheriting_std_handles();
     let run = |flags: u32| {
         Command::new(program)
             .arg("agent")
@@ -126,6 +127,36 @@ fn spawn_detached(program: &Path) -> Result<(), String> {
         .or_else(|_| run(base))
         .map(drop)
         .map_err(|_| "Cannot start the background agent".into())
+}
+
+/// Keeps the caller's standard handles (e.g. the pipe of a script that runs `headroom install`) out of the agent.
+/// Windows gives a child every inheritable handle of its parent when handle inheritance is on, which Rust's `Command`
+/// enables by default. The caller would then wait for its pipe to close for as long as the agent runs.
+/// Only this process's handles change; the caller's own handles keep their flags. (A launcher that passes another
+/// inheritable copy of its pipe, besides the standard handles, is not covered; Headroom itself does not)
+#[cfg(windows)]
+fn stop_inheriting_std_handles() {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetStdHandle(std_handle: u32) -> isize;
+        fn SetHandleInformation(handle: isize, mask: u32, flags: u32) -> i32;
+    }
+    const STD_INPUT_HANDLE: u32 = -10i32 as u32;
+    const STD_OUTPUT_HANDLE: u32 = -11i32 as u32;
+    const STD_ERROR_HANDLE: u32 = -12i32 as u32;
+    const HANDLE_FLAG_INHERIT: u32 = 0x0000_0001;
+    const INVALID_HANDLE_VALUE: isize = -1;
+    for std_handle in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+        // SAFETY: GetStdHandle takes one of the STD_*_HANDLE constants and returns a handle, null or INVALID_HANDLE_VALUE.
+        // SetHandleInformation is only called with a handle owned by this process and changes only its inherit flag;
+        // a failure (e.g. a console pseudo-handle) leaves the handle as it was
+        unsafe {
+            let handle = GetStdHandle(std_handle);
+            if handle != 0 && handle != INVALID_HANDLE_VALUE {
+                SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0);
+            }
+        }
+    }
 }
 
 #[cfg(not(windows))]
