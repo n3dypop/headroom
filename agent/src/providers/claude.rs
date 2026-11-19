@@ -1517,11 +1517,8 @@ mod tests {
         TimeZone::get("Asia/Tokyo").unwrap()
     }
 
-    fn home(name: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("headroom-claude-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
-        d
+    fn home(name: &str) -> crate::test_util::TempHome {
+        crate::test_util::TempHome::new(&format!("headroom-claude-{name}"))
     }
 
     fn usage_text(session: u32) -> String {
@@ -1628,7 +1625,7 @@ mod tests {
     fn provider(
         name: &str,
         usage: Vec<Result<String, UsageError>>,
-    ) -> (ClaudeProvider, Fake, PathBuf) {
+    ) -> (ClaudeProvider, Fake, crate::test_util::TempHome) {
         let h = home(name);
         let fake = Fake::new(usage);
         (provider_with(&h, &fake, Logger::stderr()), fake, h)
@@ -2624,9 +2621,12 @@ mod tests {
         fb.0.lock().unwrap().usage_delay = Duration::from_millis(300);
         let mut a = provider_with(&h, &fa, Logger::stderr());
         let mut b = provider_with(&h, &fb, Logger::stderr());
-        let ta = std::thread::spawn(move || a.collect(NOW, false));
-        let tb = std::thread::spawn(move || b.collect(NOW, false));
-        let (sa, sb) = (ta.join().unwrap(), tb.join().unwrap());
+        // Scoped: both threads finish before the scope returns (also when one panics), so the home outlives them
+        let (sa, sb) = std::thread::scope(|s| {
+            let ta = s.spawn(move || a.collect(NOW, false));
+            let tb = s.spawn(move || b.collect(NOW, false));
+            (ta.join().unwrap(), tb.join().unwrap())
+        });
         assert_eq!(
             fa.calls() + fb.calls(),
             1,

@@ -85,6 +85,19 @@ pub fn user_home() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
+/// `install` and `start` refuse a relative Headroom folder (from HEADROOM_HOME, or a home folder that could not be
+/// found): the agent runs in that folder (Windows) or "/" (launchd), and at login in another folder again, so a
+/// relative path would point somewhere else there
+pub fn check_home(home: &std::path::Path) -> Result<(), String> {
+    if home.is_absolute() {
+        return Ok(());
+    }
+    Err(format!(
+        "The Headroom folder must be an absolute path (it is {}). Set HEADROOM_HOME to an absolute path",
+        home.display()
+    ))
+}
+
 /// Headroom state directory. Override with HEADROOM_HOME; default ~/.headroom
 pub fn headroom_home() -> PathBuf {
     std::env::var_os("HEADROOM_HOME")
@@ -164,6 +177,14 @@ pub fn collector_id(cfg: &Config) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_relative_headroom_folder_is_refused() {
+        use std::path::Path;
+        assert!(check_home(&std::env::temp_dir().join("headroom-home")).is_ok());
+        assert!(check_home(Path::new("state")).is_err());
+        assert!(check_home(Path::new("./.headroom")).is_err());
+    }
 
     #[test]
     fn partial_config_keeps_defaults() {

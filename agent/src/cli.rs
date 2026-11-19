@@ -38,7 +38,8 @@ pub fn run(args: Vec<String>) -> i32 {
         Some("collect") => collect(rest, &home),
         Some("status") => status(&home),
         Some("credentials") => credentials(rest),
-        Some("install") => match config::load(&home) {
+        // The folder is checked before config.toml is read, so a relative folder is reported first
+        Some("install") => match config::check_home(&home).and_then(|()| config::load(&home)) {
             Ok(cfg) => report(crate::install::install(&home, &cfg)),
             Err(e) => {
                 eprintln!("{e}");
@@ -60,11 +61,13 @@ pub fn run(args: Vec<String>) -> i32 {
                 1
             }
         },
-        Some("start") => {
-            report(crate::install::start(&home).map(|()| {
-                vec!["Started the background agent (autostart was not registered)".into()]
-            }))
-        }
+        Some("start") => report(crate::install::start(&home).map(|started| {
+            vec![if started {
+                "Started the background agent (the autostart registration is unchanged)".into()
+            } else {
+                "The background agent is already running".into()
+            }]
+        })),
         Some("version") | Some("--version") | Some("-V") => {
             println!("headroom {}", env!("CARGO_PKG_VERSION"));
             0

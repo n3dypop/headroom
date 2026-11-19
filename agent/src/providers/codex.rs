@@ -758,6 +758,7 @@ fn blocked(windows: &[UsageWindow], reached: bool, usage_allowed: Option<bool>) 
 mod tests {
     use super::*;
     use crate::schema::WindowKind;
+    use crate::test_util::TempHome;
 
     const NOW: i64 = 1_795_000_000_000;
 
@@ -773,12 +774,11 @@ mod tests {
         }
     }
 
-    fn temp_home(label: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "headroom-codex-{}-{label}-{}",
-            std::process::id(),
-            now_ms()
-        ))
+    fn temp_home(label: &str) -> (TempHome, PathBuf) {
+        let root = TempHome::new(&format!("headroom-codex-{label}"));
+        // Let each test start with a missing home, as on first use.
+        let home = root.join("home");
+        (root, home)
     }
 
     #[test]
@@ -809,7 +809,7 @@ mod tests {
 
     #[test]
     fn restart_publishes_the_cached_limit_without_polling_early() {
-        let home = temp_home("blocked-restart");
+        let (_root, home) = temp_home("blocked-restart");
         fs::create_dir_all(&home).unwrap();
         let mut last_ok = observation();
         last_ok.snapshot.blocked = Some(true);
@@ -838,7 +838,6 @@ mod tests {
             (Identity::default(), Ok(observation()))
         });
         assert_eq!(snap.blocked, Some(false));
-        let _ = fs::remove_dir_all(home);
     }
 
     #[test]
@@ -1033,7 +1032,7 @@ mod tests {
 
     #[test]
     fn retries_back_off_and_keep_cached_observation_until_recovery() {
-        let home = temp_home("backoff");
+        let (_root, home) = temp_home("backoff");
         let mut provider = CodexProvider::new(&home, CodexConfig::default(), Logger::stderr());
         assert_eq!(
             provider
@@ -1078,7 +1077,7 @@ mod tests {
 
     #[test]
     fn manual_collection_cannot_bypass_the_active_poll_lock() {
-        let home = temp_home("lock");
+        let (_root, home) = temp_home("lock");
         let mut first = CodexProvider::new(&home, CodexConfig::default(), Logger::stderr());
         let mut second = CodexProvider::new(&home, CodexConfig::default(), Logger::stderr());
         first.collect_with(NOW, true, |_, _, _| {
@@ -1097,7 +1096,7 @@ mod tests {
 
     #[test]
     fn account_switch_survives_restart_and_requires_a_successful_acceptance() {
-        let home = temp_home("account");
+        let (_root, home) = temp_home("account");
         let mut provider = CodexProvider::new(&home, CodexConfig::default(), Logger::stderr());
         let identity =
             |user| account_identity(&json!({"account":{"type":"chatgpt"},"userId":user})).unwrap();
@@ -1178,12 +1177,11 @@ mod tests {
         });
         assert_eq!(logout.error_code, Some(ErrorCode::LoginRequired));
         assert_eq!(logout.history_since, boundary);
-        let _ = fs::remove_dir_all(home);
     }
 
     #[test]
     fn unreadable_state_withholds_cached_windows_until_explicit_recovery() {
-        let home = temp_home("unreadable-state");
+        let (_root, home) = temp_home("unreadable-state");
         let state_path = home.join(STATE_FILE);
         let mut provider = CodexProvider::new(&home, CodexConfig::default(), Logger::stderr());
         provider.collect_with(NOW, true, |_, _, _| {
@@ -1230,12 +1228,11 @@ mod tests {
         assert_eq!(recovered.error_code, None);
         assert_eq!(recovered.windows.len(), 1);
         assert!(!load_state(&state_path).unwrap().account_changed);
-        let _ = fs::remove_dir_all(home);
     }
 
     #[test]
     fn incomplete_state_cannot_reset_the_approved_identity() {
-        let home = temp_home("incomplete-state");
+        let (_root, home) = temp_home("incomplete-state");
         fs::create_dir_all(&home).unwrap();
         let path = home.join(STATE_FILE);
         for incomplete in ["[]", "{}", r#"{"last_attempt_ms":123}"#] {
@@ -1248,12 +1245,11 @@ mod tests {
             assert!(stopped.windows.is_empty());
             assert_eq!(fs::read_to_string(&path).unwrap(), incomplete);
         }
-        let _ = fs::remove_dir_all(home);
     }
 
     #[test]
     fn logout_clears_windows_but_preserves_the_approved_identity() {
-        let home = temp_home("logout");
+        let (_root, home) = temp_home("logout");
         let mut provider = CodexProvider::new(&home, CodexConfig::default(), Logger::stderr());
         let identity =
             |user| account_identity(&json!({"account":{"type":"chatgpt"},"userId":user})).unwrap();
@@ -1279,7 +1275,7 @@ mod tests {
 
     #[test]
     fn a_workspace_change_drops_the_new_observation_before_it_can_be_returned() {
-        let home = temp_home("workspace");
+        let (_root, home) = temp_home("workspace");
         let mut provider = CodexProvider::new(&home, CodexConfig::default(), Logger::stderr());
         let identity = |workspace| Identity {
             user_hash: Some("same-user-hash".into()),

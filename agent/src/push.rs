@@ -651,11 +651,8 @@ mod tests {
         assert_eq!(c, creds());
     }
 
-    fn home(label: &str) -> PathBuf {
-        let h = std::env::temp_dir().join(format!("headroom-push-{label}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&h);
-        std::fs::create_dir_all(&h).unwrap();
-        h
+    fn home(label: &str) -> crate::test_util::TempHome {
+        crate::test_util::TempHome::new(&format!("headroom-push-{label}"))
     }
 
     fn pusher(h: &Path, t: &FakeTransport, c: Result<Credentials, String>) -> Pusher {

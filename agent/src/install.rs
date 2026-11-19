@@ -34,38 +34,71 @@ pub fn bin_dir(home: &Path) -> PathBuf {
     home.join("bin")
 }
 
-/// Whether the agent is running (running if agent.lock cannot be acquired)
+/// Whether the agent is running (running if agent.lock cannot be acquired). For display; `start` uses `agent_lock_state`
 pub fn agent_running(home: &Path) -> bool {
-    let Ok(f) = OpenOptions::new()
+    agent_lock_state(home).unwrap_or(false)
+}
+
+/// Ok(true) only when another process holds agent.lock. A missing home (before the first `install`) means not running.
+/// A lock file that cannot be opened or locked for another reason is an error, so `start` does not launch an agent
+/// that would exit at once on the same lock, and `stop` does not report a stop it cannot confirm
+fn agent_lock_state(home: &Path) -> Result<bool, String> {
+    if matches!(home.try_exists(), Ok(false)) {
+        return Ok(false);
+    }
+    let lock = open_lock(home)?;
+    lock_is_held(&lock, home)
+}
+
+fn open_lock(home: &Path) -> Result<File, String> {
+    let path = home.join(LOCK_FILE);
+    OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
-        .open(home.join(LOCK_FILE))
-    else {
-        return false;
-    };
-    let running = f.try_lock().is_err();
-    drop(f);
-    running
+        .open(&path)
+        .map_err(|e| format!("Cannot open {}: {e}", path.display()))
 }
 
-/// Asks the agent to stop and waits until it does. Ok(false) if it was not running
+/// Ok(true) if another process holds the lock. Taking it (Ok(false)) holds it until `lock` is dropped
+fn lock_is_held(lock: &File, home: &Path) -> Result<bool, String> {
+    match lock.try_lock() {
+        Ok(()) => Ok(false),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(true),
+        Err(std::fs::TryLockError::Error(e)) => Err(format!(
+            "Cannot lock {}: {e}",
+            home.join(LOCK_FILE).display()
+        )),
+    }
+}
+
+/// Asks the agent to stop and waits until it does. Ok(false) if it was not running.
+/// The wait watches the same lock file handle it first found held, so renaming the folder meanwhile cannot look like a stop.
+/// (The stop request itself is still written and removed by path, so renaming the folder during the wait is not supported)
 pub fn stop(home: &Path, wait: Duration) -> Result<bool, String> {
-    if !agent_running(home) {
+    if matches!(home.try_exists(), Ok(false)) {
+        return Ok(false);
+    }
+    let lock = open_lock(home)?;
+    if !lock_is_held(&lock, home)? {
         let _ = std::fs::remove_file(home.join(STOP_FILE));
         return Ok(false);
     }
     File::create(home.join(STOP_FILE)).map_err(|_| "Cannot write the stop request".to_string())?;
+    let result = wait_for_release(&lock, home, wait);
+    // Whatever the outcome, remove the request so an agent started later is not stopped by it
+    let _ = std::fs::remove_file(home.join(STOP_FILE));
+    result
+}
+
+fn wait_for_release(lock: &File, home: &Path, wait: Duration) -> Result<bool, String> {
     let start = Instant::now();
     while start.elapsed() < wait {
         std::thread::sleep(Duration::from_millis(300));
-        if !agent_running(home) {
-            let _ = std::fs::remove_file(home.join(STOP_FILE));
+        if !lock_is_held(lock, home)? {
             return Ok(true);
         }
     }
-    // Remove the request so an agent started later is not stopped by it
-    let _ = std::fs::remove_file(home.join(STOP_FILE));
     Err("The agent did not stop (stuck in a fetch). Wait a while and try again".into())
 }
 
@@ -80,10 +113,12 @@ pub fn take_stop_request(home: &Path) -> bool {
     }
 }
 
-/// Starts the agent in the background (runs until logout; does not register autostart)
-pub fn start(home: &Path) -> Result<(), String> {
-    if agent_running(home) {
-        return Ok(());
+/// Starts the agent in the background (runs until logout; does not change the autostart registration).
+/// Ok(false) if it was already running
+pub fn start(home: &Path) -> Result<bool, String> {
+    crate::config::check_home(home)?;
+    if agent_lock_state(home)? {
+        return Ok(false);
     }
     let program = installed_agent(home);
     if !program.is_file() {
@@ -92,7 +127,7 @@ pub fn start(home: &Path) -> Result<(), String> {
             program.display()
         ));
     }
-    spawn_detached(&program)
+    spawn_detached(&program, home).map(|()| true)
 }
 
 /// Executable used for the background agent (windowless headroomw on Windows)
@@ -104,8 +139,10 @@ pub fn installed_agent(home: &Path) -> PathBuf {
     }))
 }
 
+/// Runs the agent with HEADROOM_HOME as its working folder. Windows keeps a process's working folder in use, so
+/// otherwise the folder `install` or `start` was run from (e.g. an extracted package) could not be deleted while the agent runs
 #[cfg(windows)]
-fn spawn_detached(program: &Path) -> Result<(), String> {
+fn spawn_detached(program: &Path, home: &Path) -> Result<(), String> {
     use std::os::windows::process::CommandExt;
     const DETACHED_PROCESS: u32 = 0x0000_0008;
     const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
@@ -116,6 +153,7 @@ fn spawn_detached(program: &Path) -> Result<(), String> {
     let run = |flags: u32| {
         Command::new(program)
             .arg("agent")
+            .current_dir(home)
             .creation_flags(flags)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -160,8 +198,8 @@ fn stop_inheriting_std_handles() {
 }
 
 #[cfg(not(windows))]
-fn spawn_detached(_program: &Path) -> Result<(), String> {
-    // On Mac, let launchd start it (load the registered LaunchAgent)
+fn spawn_detached(_program: &Path, _home: &Path) -> Result<(), String> {
+    // On Mac, let launchd start it (load the registered LaunchAgent; launchd runs it in "/", so no folder is kept in use)
     launchctl_load(&launch_agent_path())
 }
 
@@ -207,16 +245,22 @@ fn same_file(a: &Path, b: &Path) -> bool {
 }
 
 pub fn install(home: &Path, cfg: &Config) -> Result<Vec<String>, String> {
+    crate::config::check_home(home)?;
     stop(home, STOP_WAIT)?;
     copy_binaries(home)?;
     register(home, cfg)?;
-    start(home)?;
+    let started = start(home)?;
     let cli = bin_dir(home).join(exe("headroom"));
     let mut lines = vec![
         format!("Executables: {}", bin_dir(home).display()),
         format!("Autostart: {}", registration_label()),
         format!(
-            "Started the background agent (check with {}\"{}\" status)",
+            "{} (check with {}\"{}\" status)",
+            if started {
+                "Started the background agent"
+            } else {
+                "The background agent is already running"
+            },
             // PowerShell needs the call operator to run a quoted path
             if cfg!(windows) { "& " } else { "" },
             cli.display()
@@ -483,6 +527,20 @@ mod tests {
         let _ = std::fs::remove_dir_all(&h);
         std::fs::create_dir_all(&h).unwrap();
         h
+    }
+
+    #[test]
+    fn a_missing_home_is_not_running_and_start_points_to_install() {
+        let h =
+            std::env::temp_dir().join(format!("headroom-install-missing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&h);
+        assert_eq!(agent_lock_state(&h), Ok(false));
+        assert_eq!(stop(&h, Duration::from_secs(1)), Ok(false));
+        let err = start(&h).unwrap_err();
+        assert!(err.contains("run headroom install first"), "{err}");
+        assert!(!h.exists(), "nothing is created before install");
+        let relative = start(Path::new("relative-home")).unwrap_err();
+        assert!(relative.contains("must be an absolute path"), "{relative}");
     }
 
     #[test]

@@ -10,4 +10,6 @@ pub mod schedule;
 pub mod schema;
 pub mod statusline;
 pub mod store;
+#[cfg(test)]
+pub(crate) mod test_util;
 pub mod time;
