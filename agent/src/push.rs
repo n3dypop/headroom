@@ -1087,15 +1087,26 @@ mod tests {
         let origin = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = origin.local_addr().unwrap().port();
         let server = std::thread::spawn(move || {
+            use std::io::Read;
             let (stream, _) = origin.accept().unwrap();
             let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut body_len = 0;
             loop {
                 let mut line = String::new();
                 reader.read_line(&mut line).unwrap();
+                if let Some((name, value)) = line.split_once(':')
+                    && name.eq_ignore_ascii_case("content-length")
+                {
+                    body_len = value.trim().parse().unwrap();
+                }
                 if line == "\r\n" || line.is_empty() {
                     break;
                 }
             }
+            // Read the body before replying: closing a socket with unread data resets the connection on Windows,
+            // and the client could then fail before it reads the reply
+            let mut body = vec![0; body_len];
+            reader.read_exact(&mut body).unwrap();
             let mut stream = stream;
             let reply = format!(
                 "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{target_port}/steal\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
