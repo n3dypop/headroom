@@ -156,20 +156,28 @@ The agent starts Codex's App Server with the agent's own environment. A custom `
 
 **From a release package** (no build tools needed):
 
+Packages are published on the [Releases page](https://github.com/n3dypop/headroom/releases). Each package has a `.sha256` file next to it; the Releases page also shows each file's SHA-256 digest. Set `V` to the version you install (for example `0.1.0`).
+
 Always download and extract into a new, empty folder. An older package you keep for rollback must not be overwritten, even one with the same version.
 
-- **Windows:** extract the zip into a new folder, then run the next steps from inside the folder it contains:
+- **Windows:** download the zip into a new folder, check its SHA-256, extract it, then run the next steps from inside the folder it contains:
 
   ```powershell
   $ErrorActionPreference = 'Stop'
+  $V = '<version>'
+  $EXPECTED = '<sha256 of the zip>'
+  $F = "headroom-$V-windows-x64.zip"
   $d = New-Item -ItemType Directory "headroom-$(Get-Date -Format yyyyMMddHHmmss)"
-  Expand-Archive headroom-<version>-windows-x64.zip -DestinationPath $d
-  Set-Location (Join-Path $d 'headroom-<version>-windows-x64')
+  Set-Location $d
+  Invoke-WebRequest "https://github.com/n3dypop/headroom/releases/download/v$V/$F" -OutFile $F
+  if ((Get-FileHash $F -Algorithm SHA256).Hash -ne $EXPECTED) { throw 'SHA-256 mismatch' }
+  Expand-Archive $F -DestinationPath .
+  Set-Location "headroom-$V-windows-x64"
   ```
 
 - **macOS:**
   - Download with `curl`, not a browser. A browser download marks the file as quarantined, and the binaries are not notarized.
-  - Check the archive against a SHA-256 value you obtained separately from the download (for example, one you recorded when you built the package).
+  - Check the archive against its SHA-256 value from the Releases page.
   - Run the next steps from inside the folder the archive contains.
 
   ```bash
@@ -180,11 +188,13 @@ Always download and extract into a new, empty folder. An older package you keep 
   D="headroom-$(date +%Y%m%d%H%M%S)"
   mkdir "$D"
   cd "$D"
-  curl -fsSLO "<release location>/$F"
+  curl -fsSLO "https://github.com/n3dypop/headroom/releases/download/v$V/$F"
   echo "$EXPECTED  $F" | shasum -a 256 -c -
   tar -xzf "$F"
   cd "headroom-$V-macos-universal"
   ```
+
+  If a version has no macOS package yet, build it on a Mac from the source of the same tag with `scripts/package-macos.sh`, or use **From source** below.
 
 **From source** (Rust stable). The binaries are then in `agent/target/release/`; run the next steps from there.
 
