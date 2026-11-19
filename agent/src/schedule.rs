@@ -12,10 +12,68 @@
 
 use std::collections::BTreeMap;
 
+use serde::{Deserialize, Serialize};
+
 use crate::config::ScheduleConfig;
 use crate::schema::{ProviderSnapshot, ProviderStatus};
 use crate::store::Logger;
-use crate::time::MINUTE_MS;
+use crate::time::{MINUTE_MS, iso_from_ms};
+
+/// File in HEADROOM_HOME where the running agent records when it next checks each provider, for `headroom status` only (never sent)
+pub const SCHEDULE_FILE: &str = "schedule.json";
+/// File in HEADROOM_HOME holding the running agent's session ID (new on every start). `status` uses the schedule only if it
+/// carries the same ID, so a schedule left by an earlier agent process is never shown as the current one's
+pub const SESSION_FILE: &str = "agent.session";
+/// Held with an exclusive lock by the agent that wrote SESSION_FILE, for its lifetime. `status` only probes it with a
+/// shared lock (so concurrent `status` runs never block each other): if the probe succeeds, that agent is gone
+pub const SESSION_LOCK_FILE: &str = "agent.session.lock";
+
+/// Contents of SCHEDULE_FILE
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Schedule {
+    pub session: String,
+    pub providers: BTreeMap<String, NextRun>,
+}
+
+/// When the running agent next decides whether to fetch a provider. Not a promise to fetch: at that time the agent may
+/// still defer (another PC holds the turn) or stretch the interval
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NextRun {
+    /// This PC's clock (ms). None when no fetch is scheduled (stopped, disabled or waiting for a manual resume)
+    pub at_ms: Option<i64>,
+    /// Why the fetch waits past the provider's own schedule
+    pub waiting: Option<Waiting>,
+    /// Disabled in the config the running agent started with (set by the agent, not by the coordinator)
+    #[serde(default)]
+    pub disabled: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Waiting {
+    /// Another PC holds the fetch turn
+    Turn,
+    /// Values have not changed, so the interval is stretched
+    Idle,
+}
+
+impl NextRun {
+    /// Text for `headroom status`
+    pub fn describe(&self) -> String {
+        if self.disabled {
+            return "none (disabled)".into();
+        }
+        let Some(at) = self.at_ms else {
+            return "none (not scheduled)".into();
+        };
+        let note = match self.waiting {
+            Some(Waiting::Turn) => " (another PC holds the fetch turn; checks again then)",
+            Some(Waiting::Idle) => " (no recent changes; interval stretched)",
+            None => "",
+        };
+        format!("{}{note}", iso_from_ms(at))
+    }
+}
 
 /// Start stretching the interval when values have not changed for this many minutes
 const IDLE_AFTER_MIN: i64 = 30;
@@ -58,6 +116,8 @@ struct Slot {
     granted_until: i64,
     /// Whether deferring (for logging transitions)
     deferring: bool,
+    /// Why `hold_until` was set (shown by `headroom status`)
+    hold_reason: Option<Waiting>,
 }
 
 pub struct Coordinator {
@@ -78,6 +138,32 @@ impl Coordinator {
     /// Time until which fetching is held off (no hold once it has passed)
     pub fn hold_until(&self, id: &str) -> i64 {
         self.slots.get(id).map_or(0, |s| s.hold_until)
+    }
+
+    /// When the agent next decides whether to fetch the provider, for `headroom status`. Read-only: it never changes the schedule.
+    /// `fetch_due_ms` is the provider's own schedule (i64::MAX = none); providers already include a hold passed to them,
+    /// so a hold that equals it is still reported with its reason. A stretch or a deferral is only known once
+    /// `before_fetch` applies it at the reported time
+    pub fn next_run(&self, id: &str, fetch_due_ms: i64, now: i64) -> NextRun {
+        if fetch_due_ms == i64::MAX {
+            return NextRun {
+                at_ms: None,
+                waiting: None,
+                disabled: false,
+            };
+        }
+        match self.slots.get(id) {
+            Some(slot) if slot.hold_until > now && slot.hold_until >= fetch_due_ms => NextRun {
+                at_ms: Some(slot.hold_until),
+                waiting: slot.hold_reason,
+                disabled: false,
+            },
+            _ => NextRun {
+                at_ms: Some(fetch_due_ms),
+                waiting: None,
+                disabled: false,
+            },
+        }
     }
 
     /// For a provider whose fetch is due, decides whether it may fetch now. If holding off, sets `hold_until` and returns false
@@ -105,6 +191,7 @@ impl Coordinator {
             && now < slot.last_fetch + idle_ms
         {
             slot.hold_until = slot.last_fetch + idle_ms;
+            slot.hold_reason = Some(Waiting::Idle);
             return false;
         }
         // Right after startup, fetch without asking
@@ -134,6 +221,7 @@ impl Coordinator {
                 // Never hold off past the safety-net time
                 slot.hold_until =
                     (now + wait_ms.max(0) + RETRY_AFTER_MS).min(slot.last_fetch + own_ms);
+                slot.hold_reason = Some(Waiting::Turn);
                 false
             }
             // Destination unreachable or answer unreadable: fetch on this PC
@@ -304,6 +392,80 @@ mod tests {
         c.after_fetch("claude", &s, T0 + 5 * MINUTE_MS, 5, Some(&mut w), T0);
         assert!(c.before_fetch("claude", 5, Some(&s), Some(&mut w), T0 + 5 * MINUTE_MS));
         assert_eq!(w.calls, [("claude".to_string(), 7)]);
+    }
+
+    #[test]
+    fn next_run_reports_the_hold_and_its_reason() {
+        let mut c = coord(0);
+        let s = snap(10.0, ProviderStatus::Ok);
+        // Own schedule only
+        let own = c.next_run("codex", T0 + MINUTE_MS, T0);
+        assert_eq!(own.at_ms, Some(T0 + MINUTE_MS));
+        assert_eq!(own.waiting, None);
+        // Another PC holds the turn: the next check is the end of the hold, not the past due time
+        let mut w = FakeWorker {
+            reply: Some((false, 4 * MINUTE_MS)),
+            ..Default::default()
+        };
+        assert!(c.before_fetch("codex", 5, Some(&s), Some(&mut w), T0));
+        c.after_fetch("codex", &s, T0 + 5 * MINUTE_MS, 5, Some(&mut w), T0);
+        let now = T0 + 5 * MINUTE_MS;
+        assert!(!c.before_fetch("codex", 5, Some(&s), Some(&mut w), now));
+        let hold = c.hold_until("codex");
+        assert!(hold > now);
+        let held = c.next_run("codex", now, now);
+        assert_eq!(held.at_ms, Some(hold));
+        assert_eq!(held.waiting, Some(Waiting::Turn));
+        assert!(
+            held.describe()
+                .ends_with("(another PC holds the fetch turn; checks again then)")
+        );
+        // Providers already include the hold in their own due time: the reason is still shown
+        let included = c.next_run("codex", hold, now);
+        assert_eq!(included.at_ms, Some(hold));
+        assert_eq!(included.waiting, Some(Waiting::Turn));
+        // Nothing scheduled, and disabled
+        let none = c.next_run("codex", i64::MAX, now);
+        assert_eq!(none.at_ms, None);
+        assert_eq!(none.describe(), "none (not scheduled)");
+        let disabled = NextRun {
+            disabled: true,
+            ..none
+        };
+        assert_eq!(disabled.describe(), "none (disabled)");
+    }
+
+    #[test]
+    fn a_stretch_is_reported_once_applied_even_after_deferring() {
+        let mut c = coord(10);
+        let s = snap(10.0, ProviderStatus::Ok);
+        c.observe("codex", &s, T0);
+        c.record_fetch("codex", T0 + 30 * MINUTE_MS);
+        let last = T0 + 30 * MINUTE_MS;
+        // Before the next decision, the next check is the provider's own due time (the stretch is not known yet)
+        let before = c.next_run("codex", last + 5 * MINUTE_MS, last);
+        assert_eq!(before.at_ms, Some(last + 5 * MINUTE_MS));
+        assert_eq!(before.waiting, None);
+        // At that time the stretch is applied and reported with its reason
+        assert!(!c.before_fetch("codex", 5, Some(&s), None, last + 5 * MINUTE_MS));
+        let stretched = c.next_run("codex", last + 5 * MINUTE_MS, last + 5 * MINUTE_MS);
+        assert_eq!(stretched.at_ms, Some(last + 10 * MINUTE_MS));
+        assert_eq!(stretched.waiting, Some(Waiting::Idle));
+        // Then another PC holds the turn
+        let mut w = FakeWorker {
+            reply: Some((false, 2 * MINUTE_MS)),
+            ..Default::default()
+        };
+        assert!(!c.before_fetch("codex", 5, Some(&s), Some(&mut w), last + 10 * MINUTE_MS));
+        let deferred = c.next_run("codex", last + 10 * MINUTE_MS, last + 10 * MINUTE_MS);
+        assert_eq!(deferred.waiting, Some(Waiting::Turn));
+        // A later fetch on this PC, then a stretch: the reason changes to Idle even though the deferring flag stays set
+        c.record_fetch("codex", last + 20 * MINUTE_MS);
+        let next = last + 25 * MINUTE_MS;
+        assert!(!c.before_fetch("codex", 5, Some(&s), Some(&mut w), next));
+        let run = c.next_run("codex", next, next);
+        assert_eq!(run.at_ms, Some(last + 30 * MINUTE_MS));
+        assert_eq!(run.waiting, Some(Waiting::Idle));
     }
 
     #[test]

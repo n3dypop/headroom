@@ -118,6 +118,15 @@ irm https://claude.ai/install.ps1 | iex
 curl -fsSL https://claude.ai/install.sh | bash
 ```
 
+**macOS with Homebrew:** use the `claude-code@latest` cask instead. Its `/opt/homebrew/bin/claude` path stays the same across updates. The `claude-code` cask follows the stable channel, which can be older than 2.1.325; with an older CLI, the agent does not run `/usage`. Update it with `brew upgrade --cask claude-code@latest` (`claude update` does not update a Homebrew install).
+
+```bash
+# New install
+brew install --cask claude-code@latest
+# Switching from the stable cask (the two casks conflict, so remove the stable one first)
+brew uninstall --cask claude-code && brew install --cask claude-code@latest
+```
+
 Open a new terminal, then sign in with your Claude subscription (Pro, Max or higher) and check:
 
 ```bash
@@ -125,6 +134,8 @@ claude --version        # 2.1.325 or later
 claude auth login
 claude auth status
 ```
+
+If `which -a claude` lists more than one `claude`, the agent uses the first one on its `PATH`. Remove the older copy, or set `claude_bin` (2.4) to the one you want.
 
 **Accounts where the agent does not run `/usage`:** API-key logins, organization (Team / Enterprise) plans, and machines with managed settings. In these cases the agent cannot confirm that `/usage` is free, so it skips it. If you set up the statusLine (2.6), it still uses the values Claude Code reports there.
 
@@ -156,7 +167,7 @@ The agent starts Codex's App Server with the agent's own environment. A custom `
 
 **From a release package** (no build tools needed):
 
-Packages are published on the [Releases page](https://github.com/n3dypop/headroom/releases). Each package has a `.sha256` file next to it; the Releases page also shows each file's SHA-256 digest. Set `V` to the version you install (for example `0.1.1`).
+Packages are published on the [Releases page](https://github.com/n3dypop/headroom/releases). Each package has a `.sha256` file next to it; the Releases page also shows each file's SHA-256 digest. Set `V` to the version you install (for example `0.1.2`).
 
 Always download and extract into a new, empty folder. An older package you keep for rollback must not be overwritten, even one with the same version.
 
@@ -236,7 +247,7 @@ The agent reads its settings when it starts, so write them before you install it
 
    [schedule]
    idle_interval_min = 10            # stretch the interval up to this when nothing changed for 30 minutes
-   own_fetch_min = 60                # fetch at least this often even when another PC is fetching
+   own_fetch_min = 60                # longest wait for another PC's turn before fetching on this PC
    ```
 
    When several PCs are on, they take turns fetching through the server, so the same values are not fetched twice.
@@ -314,6 +325,7 @@ On macOS, the path is `/Users/<you>/.headroom/bin/headroom`. These examples assu
 | `state-*.json` | Per-provider state |
 | `snapshot.json` | This PC's latest values |
 | `outbox.json` | Values not sent yet and the send state (no credentials) |
+| `schedule.json`, `agent.session`, `agent.session.lock` | When the running agent next checks each provider, for `headroom status` |
 | `logs/agent.log` | Agent log, rotated at 1 MB × 3 (no tokens, IDs or emails) |
 | `bin/` | The installed binaries |
 
@@ -372,6 +384,10 @@ iOS decides how often widgets refresh, usually every 15–60 minutes. Countdowns
   - After a safety stop, the agent does not run `/usage` again on its own.
   - Before retrying: read the reason in `headroom status`, and check `claude --version` (a newer CLI may have changed `/usage`).
   - Retry once with `headroom collect --provider claude --force`, and check that `headroom status` shows a normal result.
+- **Claude `last error unsupported_cli`:** the `claude` the agent found is older than 2.1.325, or its version could not be read, so the agent does not run `/usage`. Update the CLI (see 2.1; with Homebrew, use `claude-code@latest`), then run `headroom stop` and `headroom start`.
+- **`Push: ... last result Cannot connect to the destination`:** the agent could not reach the URL in `config.toml`. Check that `curl -i <url>/v2/view` returns 401. Fix the URL if needed, then restart the agent.
+- **`Push: ... last result The destination rejected the credentials (401, 403)`:** the server refused this PC's token. Check that this PC's write token is in `TOKENS`, that `credentials set` stored this PC's token, and that `collector_id` matches the name you created the token for.
+- **`next check ... (another PC holds the fetch turn; checks again then)`:** another PC is fetching the same values, so this PC waits and decides again at that time. Its own values in `snapshot.json` can look old; the widget shows the values the server merges from all PCs. `own_fetch_min` caps how long this PC waits: after that, it fetches without asking for the turn (unless its own retry backoff or a safety stop holds it).
 - **Widget shows `Check your credentials`:** the read token is wrong or was revoked.
 - **Widget shows `Can't reach the server`:** check the URL, or `ALLOWED_HOST` on the server.
 - **Values look old:** `headroom status` shows when the agent last sent. The widget marks old values (for example `31m ago`) and estimated resets (`est.`).

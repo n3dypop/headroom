@@ -6,6 +6,7 @@ use crate::agent;
 use crate::config::{self, collector_id, headroom_home};
 use crate::providers::codex::CodexProvider;
 use crate::push::{Credentials, OsCredentialStore, Pusher};
+use crate::schedule::{NextRun, SCHEDULE_FILE, SESSION_FILE, SESSION_LOCK_FILE, Schedule};
 use crate::schema::build_snapshot;
 use crate::store::{Logger, read_json};
 use crate::time::now_ms;
@@ -236,15 +237,61 @@ fn report(r: Result<Vec<String>, String>) -> i32 {
     }
 }
 
+/// One provider line of `headroom status` (same layout for every provider)
+fn provider_status_line(id: &str, failures: u64, last_error: &str, next_check: &str) -> String {
+    format!(
+        "{id}: {failures} consecutive failures / last error {last_error} / next check {next_check}"
+    )
+}
+
+/// When the running agent next checks the provider (schedule.json written by the current agent process).
+/// `unscheduled_reason` explains a check with no time when the provider knows why (e.g. waiting for a manual resume)
+fn planned_check(
+    plan: Option<&BTreeMap<String, NextRun>>,
+    id: &str,
+    running: bool,
+    unscheduled_reason: Option<&str>,
+) -> String {
+    if !running {
+        return "none (agent stopped)".into();
+    }
+    match plan.and_then(|p| p.get(id)) {
+        None => "unknown (no schedule from the running agent)".into(),
+        Some(run) if run.at_ms.is_none() && !run.disabled => match unscheduled_reason {
+            Some(reason) => format!("none ({reason})"),
+            None => run.describe(),
+        },
+        Some(run) => run.describe(),
+    }
+}
+
+/// The running agent's schedule, only if its writer is still running and it carries that writer's session ID.
+/// The agent holds an exclusive lock on SESSION_LOCK_FILE while it runs. This only probes it with a shared lock, so
+/// concurrent `status` runs never block each other: if the probe succeeds, the writer is gone (e.g. it crashed and an
+/// older agent version now runs), and the files it left are not used
+fn current_schedule(home: &std::path::Path) -> Option<BTreeMap<String, NextRun>> {
+    let probe = std::fs::File::open(home.join(SESSION_LOCK_FILE)).ok()?;
+    match probe.try_lock_shared() {
+        Err(std::fs::TryLockError::WouldBlock) => {}
+        Ok(()) | Err(std::fs::TryLockError::Error(_)) => return None,
+    }
+    drop(probe);
+    let session = std::fs::read_to_string(home.join(SESSION_FILE)).ok()?;
+    let schedule: Schedule = read_json(&home.join(SCHEDULE_FILE))?;
+    (!session.is_empty() && schedule.session == session).then_some(schedule.providers)
+}
+
 fn status(home: &std::path::Path) -> i32 {
+    let running = crate::install::agent_running(home);
+    let plan = if running {
+        current_schedule(home)
+    } else {
+        None
+    };
     println!("HEADROOM_HOME: {}", home.display());
     println!(
         "Agent: {} / Autostart: {}",
-        if crate::install::agent_running(home) {
-            "running"
-        } else {
-            "stopped"
-        },
+        if running { "running" } else { "stopped" },
         if crate::install::registered() {
             "registered"
         } else {
@@ -260,15 +307,23 @@ fn status(home: &std::path::Path) -> i32 {
     }
     if let Some(v) = read_json::<serde_json::Value>(&home.join("state-claude.json")) {
         println!(
-            "claude: {} consecutive failures / last error {}",
-            v["failures"],
-            v["last_error"].as_str().unwrap_or("none")
+            "{}",
+            provider_status_line(
+                "claude",
+                v["failures"].as_u64().unwrap_or(0),
+                v["last_error"].as_str().unwrap_or("none"),
+                &planned_check(plan.as_ref(), "claude", running, None),
+            )
         );
     }
-    if let Ok(cfg) = config::load(home)
-        && let Some(line) = CodexProvider::status_line(home, &cfg.codex, now_ms())
-    {
-        println!("{line}");
+    // Whether Codex is enabled comes from the running agent's schedule, not from config.toml (which may have changed
+    // since the agent started, or be mid-edit), so only the state-based reason is taken from the provider
+    if let Some(s) = CodexProvider::status_parts(home, &config::CodexConfig::default()) {
+        let next = planned_check(plan.as_ref(), "codex", running, s.not_scheduled);
+        println!(
+            "{}",
+            provider_status_line("codex", s.failures.into(), s.last_error, &next)
+        );
     }
     match Pusher::status_line(home) {
         Some(line) => println!("{line}"),
@@ -285,6 +340,94 @@ mod tests {
 
     fn args(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn status_uses_only_the_current_sessions_schedule() {
+        let home =
+            std::env::temp_dir().join(format!("headroom-status-schedule-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let providers = BTreeMap::from([(
+            "codex".to_string(),
+            NextRun {
+                at_ms: Some(1_800_000_000_000),
+                waiting: None,
+                disabled: false,
+            },
+        )]);
+        let schedule = |session: &str| Schedule {
+            session: session.into(),
+            providers: providers.clone(),
+        };
+        // A crashed agent left both files of session "old"
+        crate::store::write_json_atomic(&home.join(SCHEDULE_FILE), &schedule("old")).unwrap();
+        std::fs::write(home.join(SESSION_FILE), "old").unwrap();
+        assert_eq!(current_schedule(&home), None, "nobody holds the lock");
+        // A new agent is publishing session "new": ID written, lock not taken yet
+        std::fs::write(home.join(SESSION_FILE), "new").unwrap();
+        assert_eq!(current_schedule(&home), None);
+        // Lock taken: the leftover schedule carries another ID
+        let held = crate::agent::hold_session_lock(&home).unwrap();
+        assert_eq!(current_schedule(&home), None);
+        // Written by the running one
+        crate::store::write_json_atomic(&home.join(SCHEDULE_FILE), &schedule("new")).unwrap();
+        assert_eq!(current_schedule(&home), Some(providers.clone()));
+        // Its writer is gone (crashed) and both files remain, e.g. while an older agent version runs: not used
+        drop(held);
+        assert_eq!(current_schedule(&home), None);
+        // Another `status` probing at the same moment (shared lock) is not mistaken for the agent
+        let other_status = std::fs::File::open(home.join(SESSION_LOCK_FILE)).unwrap();
+        other_status.try_lock_shared().unwrap();
+        assert_eq!(current_schedule(&home), None);
+        drop(other_status);
+        // No session lock file (e.g. an older agent version): not used
+        std::fs::remove_file(home.join(SESSION_LOCK_FILE)).unwrap();
+        assert_eq!(current_schedule(&home), None);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn next_check_text() {
+        let run = |at_ms, disabled| NextRun {
+            at_ms,
+            waiting: None,
+            disabled,
+        };
+        let plan = BTreeMap::from([
+            ("claude".to_string(), run(None, false)),
+            ("codex".to_string(), run(None, true)),
+        ]);
+        assert_eq!(
+            planned_check(Some(&plan), "claude", false, None),
+            "none (agent stopped)"
+        );
+        assert_eq!(
+            planned_check(None, "claude", true, None),
+            "unknown (no schedule from the running agent)"
+        );
+        assert_eq!(
+            planned_check(
+                Some(&plan),
+                "claude",
+                true,
+                Some("waiting for manual resume")
+            ),
+            "none (waiting for manual resume)"
+        );
+        assert_eq!(
+            planned_check(Some(&plan), "claude", true, None),
+            "none (not scheduled)"
+        );
+        assert_eq!(
+            planned_check(
+                Some(&plan),
+                "codex",
+                true,
+                Some("waiting for manual resume")
+            ),
+            "none (disabled)"
+        );
     }
 
     #[test]

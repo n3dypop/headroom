@@ -47,7 +47,7 @@ See **[docs/install.md](docs/install.md)**. In short:
 
 | Dependency | Needed for | Notes |
 |---|---|---|
-| Claude Code CLI (standalone install) with a Claude subscription (Pro, Max or higher) | Claude values | Checked with 2.1.325 |
+| Claude Code CLI (standalone install, or Homebrew `claude-code@latest` on macOS) with a Claude subscription (Pro, Max or higher) | Claude values | 2.1.325 or later |
 | Codex CLI (standalone install), signed in with ChatGPT | Codex values | Needs `app-server` and `account/rateLimits/read`. Developed against 0.169.0 |
 | Windows 10/11 (x64) or macOS on Apple silicon | Agent | Intel Macs are not supported. macOS support is still being verified |
 | Cloudflare account (Workers Free plan), Node.js 24+ | Deploying the Worker | `wrangler` is used through `npx` |

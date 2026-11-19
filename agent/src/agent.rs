@@ -4,7 +4,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::config::{self, Config, collector_id};
 use crate::install::{STOP_FILE, take_stop_request};
@@ -12,7 +12,9 @@ use crate::providers::claude::ClaudeProvider;
 use crate::providers::codex::CodexProvider;
 use crate::providers::{Event, Provider};
 use crate::push::Pusher;
-use crate::schedule::{Coordinator, TurnAsker};
+use crate::schedule::{
+    Coordinator, NextRun, SCHEDULE_FILE, SESSION_FILE, SESSION_LOCK_FILE, Schedule, TurnAsker,
+};
 use crate::schema::{ProviderSnapshot, build_snapshot};
 use crate::statusline::CAPTURE_FILE;
 use crate::store::{Logger, write_json_atomic};
@@ -62,6 +64,12 @@ pub fn run(home: &Path) -> i32 {
         log.log("Another agent is running; exiting");
         return 0;
     }
+    // A new session ID on every start: `status` shows the schedule only if it carries the ID in SESSION_FILE and this
+    // process still holds its lock, so a schedule left by an earlier (or crashed) agent process is never shown as current.
+    // The session file is published together with the schedule below, with the same retry
+    let _ = std::fs::remove_file(home.join(SCHEDULE_FILE));
+    let session = new_session_id();
+    let mut session_file: Option<std::fs::File> = None;
 
     let cfg = match config::load(home) {
         Ok(c) => c,
@@ -86,6 +94,12 @@ pub fn run(home: &Path) -> i32 {
     // Fetch turn-taking and interval stretching (schedule.rs). honors = providers that can keep doing passive work while holding off
     let mut coord = Coordinator::new(cfg.schedule.clone(), log.clone());
     let mut honors: BTreeMap<&'static str, bool> = BTreeMap::new();
+    // Next check per provider last written for `headroom status` (written only when it changes)
+    let mut planned: Option<BTreeMap<String, NextRun>> = None;
+    // After a failed write, wait before writing again (events such as statusLine updates can wake the loop often).
+    // Measured with the monotonic clock, so clock corrections do not shorten or stretch the wait
+    let mut plan_retry_at: Option<Instant> = None;
+    let mut last_plan_error_log: Option<Instant> = None;
     log.log(&format!("agent started (collector={collector})"));
     let _ = take_stop_request(home); // a stop request left over from before startup does not stop us
 
@@ -93,6 +107,9 @@ pub fn run(home: &Path) -> i32 {
         // Stop requests are only honored between fetches (never in the middle of /usage)
         if take_stop_request(home) {
             log.log("Stop requested; exiting");
+            drop(session_file.take()); // releases the session lock
+            let _ = std::fs::remove_file(home.join(SCHEDULE_FILE));
+            let _ = std::fs::remove_file(home.join(SESSION_FILE));
             return 0;
         }
         let mut changed = false;
@@ -139,6 +156,46 @@ pub fn run(home: &Path) -> i32 {
         }
 
         let now = now_ms();
+        let plan: BTreeMap<String, NextRun> = providers
+            .iter()
+            .map(|p| {
+                let id = p.id();
+                let mut run = coord.next_run(id, p.fetch_due_ms(now), now);
+                run.disabled = !provider_enabled(&cfg, id);
+                (id.to_string(), run)
+            })
+            .collect();
+        let retry_ok = plan_retry_at.is_none_or(|t| Instant::now() >= t);
+        if planned.as_ref() != Some(&plan) && retry_ok {
+            let file = Schedule {
+                session: session.clone(),
+                providers: plan.clone(),
+            };
+            let written = match session_file {
+                Some(_) => Ok(()),
+                None => publish_session(home, &session).map(|f| session_file = Some(f)),
+            }
+            .and_then(|()| write_json_atomic(&home.join(SCHEDULE_FILE), &file));
+            match written {
+                Ok(()) => {
+                    planned = Some(plan);
+                    plan_retry_at = None;
+                }
+                Err(e) => {
+                    // Retried after a minute (not on every wake-up); logged at most every 10 minutes
+                    let t = Instant::now();
+                    plan_retry_at = Some(t + Duration::from_secs(60));
+                    if last_plan_error_log
+                        .is_none_or(|l| t.duration_since(l) >= Duration::from_secs(600))
+                    {
+                        log.log(&format!(
+                            "Failed to write the schedule for headroom status: {e}"
+                        ));
+                        last_plan_error_log = Some(t);
+                    }
+                }
+            }
+        }
         let next = providers
             .iter()
             .map(|p| {
@@ -168,6 +225,45 @@ pub fn run(home: &Path) -> i32 {
                 std::thread::sleep(Duration::from_millis(wait as u64))
             }
         }
+    }
+}
+
+/// Writes SESSION_FILE, then takes an exclusive lock on SESSION_LOCK_FILE (the order matters: while the lock is held,
+/// SESSION_FILE already has this session's ID, so files left by a crashed agent never match). agent.lock already makes
+/// this process the only writer. The lock lasts as long as the returned handle (the agent's lifetime), so `status` can
+/// tell that the session's writer is still running
+pub(crate) fn publish_session(home: &Path, session: &str) -> std::io::Result<std::fs::File> {
+    std::fs::write(home.join(SESSION_FILE), session)?;
+    hold_session_lock(home)
+}
+
+pub(crate) fn hold_session_lock(home: &Path) -> std::io::Result<std::fs::File> {
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(home.join(SESSION_LOCK_FILE))?;
+    lock.try_lock().map_err(std::io::Error::other)?;
+    Ok(lock)
+}
+
+/// A session ID that differs on every agent start (process ID, start time and a stack address; not secret)
+fn new_session_id() -> String {
+    let marker = 0u8;
+    crate::store::fnv1a_hex(&[
+        &std::process::id().to_string(),
+        &now_ms().to_string(),
+        &format!("{:p}", &marker),
+        &format!("{:?}", Instant::now()),
+    ])
+}
+
+/// Whether the provider is enabled in the config this agent started with
+fn provider_enabled(cfg: &Config, id: &str) -> bool {
+    match id {
+        "claude" => cfg.claude.enabled,
+        "codex" => cfg.codex.enabled,
+        _ => true,
     }
 }
 

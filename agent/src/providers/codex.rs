@@ -259,6 +259,14 @@ fn changed(previous: &Option<String>, current: &Option<String>) -> bool {
     matches!((previous, current), (Some(a), Some(b)) if a != b)
 }
 
+/// Codex status for the CLI. The running agent supplies the next run through schedule.json.
+pub(crate) struct CodexStatus {
+    pub failures: u32,
+    pub last_error: &'static str,
+    /// Why no fetch is scheduled, when the reason is absent from the agent schedule.
+    pub not_scheduled: Option<&'static str>,
+}
+
 pub struct CodexProvider {
     home: PathBuf,
     cfg: CodexConfig,
@@ -454,31 +462,28 @@ impl CodexProvider {
         self.state.snapshot(now, None)
     }
 
-    pub(crate) fn status_line(home: &Path, cfg: &CodexConfig, now: i64) -> Option<String> {
+    pub(crate) fn status_parts(home: &Path, cfg: &CodexConfig) -> Option<CodexStatus> {
         let path = home.join(STATE_FILE);
         if matches!(path.try_exists(), Ok(false)) {
             return None;
         }
         let state = load_state(&path).unwrap_or_else(|_| State::recovery_required());
-        let error = state
+        let last_error = state
             .stop_reason()
             .or(state.last_error)
             .map_or("none", FetchError::message);
-        let due = if state.account_changed {
-            "waiting for manual resume".into()
-        } else if cfg.enabled {
-            let interval = cfg
-                .interval_min
-                .saturating_mul(MINUTE_MS)
-                .max(MIN_INTERVAL_MS);
-            iso_from_ms(state.due_ms(now, interval))
+        let not_scheduled = if state.account_changed {
+            Some("waiting for manual resume")
+        } else if !cfg.enabled {
+            Some("disabled")
         } else {
-            "disabled".into()
+            None
         };
-        Some(format!(
-            "codex: consecutive failures {} / last error {} / next run {}",
-            state.failures, error, due
-        ))
+        Some(CodexStatus {
+            failures: state.failures,
+            last_error,
+            not_scheduled,
+        })
     }
 }
 
@@ -1194,11 +1199,9 @@ mod tests {
         assert_eq!(stopped.error_code, Some(ErrorCode::AccountChanged));
         assert!(stopped.windows.is_empty());
         assert_eq!(fs::read_to_string(&state_path).unwrap(), old_state);
-        assert!(
-            CodexProvider::status_line(&home, &CodexConfig::default(), NOW)
-                .unwrap()
-                .contains("--accept-account")
-        );
+        let status = CodexProvider::status_parts(&home, &CodexConfig::default()).unwrap();
+        assert!(status.last_error.contains("--accept-account"));
+        assert_eq!(status.not_scheduled, Some("waiting for manual resume"));
 
         provider.accept_account();
         let failed = provider.collect_with(NOW + 2, false, |_, _, _| {
