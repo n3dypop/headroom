@@ -23,7 +23,8 @@ Headroom shows how much of your **Claude Code** and **Codex** usage limits is le
    merges all PCs, keeps short history, computes pace / forecast / events (Cron, every 5 min)
         │  GET with a per-device read token
         ▼
- iPhone: Scriptable widget (home screen: small / medium / large, lock screen: 3 styles)
+ iPhone: Scriptable widget (home screen: small / medium / large, lock screen: 3 styles),
+         a details page on tap, and optional notifications
 ```
 
 | Component | Path | Language |

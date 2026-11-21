@@ -22,6 +22,10 @@ pub struct Capture {
     #[serde(default)]
     pub captured_at_ms: i64,
     pub rate_limits: Value,
+    /// Clock epoch read before the input was (clock.rs): used only while that epoch is current and trusted. None when it couldn't be
+    /// read (never used)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub epoch: Option<u64>,
 }
 
 pub fn run(args: &[String], home: &Path) -> i32 {
@@ -30,13 +34,15 @@ pub fn run(args: &[String], home: &Path) -> i32 {
         .find(|w| w[0] == "--then")
         .map(|w| w[1].clone());
 
+    // The clock epoch first: a value read under it and saved late (after a refusal and its lifting) carries the epoch it came in
+    let epoch = crate::clock::usable_epoch(home);
     let mut input = Vec::new();
     let _ = std::io::stdin().read_to_end(&mut input);
     let parsed: Option<Value> = serde_json::from_slice(&input).ok();
 
     // rate_limits is absent until the session's first API response. When absent, keep the previous capture.
     if let Some(rl) = parsed.as_ref().and_then(|v| v.get("rate_limits")) {
-        let _ = save_capture(home, rl, now_ms());
+        let _ = save_capture_in(home, rl, now_ms(), epoch);
     }
 
     let out = match then_cmd {
@@ -71,14 +77,26 @@ pub fn capture_fields(rate_limits: &Value) -> Option<Value> {
     (!kept.is_empty()).then_some(Value::Object(kept))
 }
 
-/// Stores only `capture_fields`. Don't write if nothing is left or the value is unchanged (keeps captured_at as "when this value appeared").
+/// Stores only `capture_fields`, under the clock epoch usable now
 pub fn save_capture(home: &Path, rate_limits: &Value, now: i64) -> std::io::Result<bool> {
+    save_capture_in(home, rate_limits, now, crate::clock::usable_epoch(home))
+}
+
+/// Stores only `capture_fields`, with the clock epoch read before the input. Don't write if nothing is left or the value and its epoch are
+/// unchanged (keeps captured_at as "when this value appeared"; the same value in a new epoch is a new one)
+pub fn save_capture_in(
+    home: &Path,
+    rate_limits: &Value,
+    now: i64,
+    epoch: Option<u64>,
+) -> std::io::Result<bool> {
     let Some(rate_limits) = capture_fields(rate_limits) else {
         return Ok(false);
     };
     let path = home.join(CAPTURE_FILE);
     if let Some(prev) = read_json::<Capture>(&path)
         && prev.rate_limits == rate_limits
+        && prev.epoch == epoch
     {
         return Ok(false);
     }
@@ -86,14 +104,45 @@ pub fn save_capture(home: &Path, rate_limits: &Value, now: i64) -> std::io::Resu
         captured_at: iso_from_ms(now),
         captured_at_ms: now,
         rate_limits,
+        epoch,
     };
     write_json_atomic(&path, &cap)?;
     Ok(true)
 }
 
-/// Read the capture and return (observed time ms, windows).
+/// Read the capture and return (observed time ms, windows), if it was taken in the clock epoch usable now
 pub fn read_capture(home: &Path) -> Option<(i64, Vec<UsageWindow>)> {
-    let cap: Capture = read_json(&home.join(CAPTURE_FILE))?;
+    read_capture_in(home, crate::clock::usable_epoch(home))
+}
+
+/// Read the capture, if it was taken in `epoch` (None: none is used)
+pub fn read_capture_in(home: &Path, epoch: Option<u64>) -> Option<(i64, Vec<UsageWindow>)> {
+    let epoch = epoch?;
+    let bytes = std::fs::read(home.join(CAPTURE_FILE)).ok()?;
+    let cap: Capture = serde_json::from_slice(&bytes).ok()?;
+    if cap.epoch != Some(epoch) {
+        return None;
+    }
+    capture_from(&bytes)
+}
+
+/// The observed time of the saved value and the clock epoch it was taken in (None without one). Err when the file exists but can't be
+/// read (an I/O error: a later read may still find the value)
+pub fn capture_at(home: &Path) -> std::io::Result<Option<(i64, Option<u64>)>> {
+    match std::fs::read(home.join(CAPTURE_FILE)) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+        Ok(bytes) => {
+            let epoch = serde_json::from_slice::<Capture>(&bytes)
+                .ok()
+                .and_then(|c| c.epoch);
+            Ok(capture_from(&bytes).map(|(at, _)| (at, epoch)))
+        }
+    }
+}
+
+fn capture_from(bytes: &[u8]) -> Option<(i64, Vec<UsageWindow>)> {
+    let cap: Capture = serde_json::from_slice(bytes).ok()?;
     let at = if cap.captured_at_ms > 0 {
         cap.captured_at_ms
     } else {
@@ -183,7 +232,32 @@ mod tests {
     fn temp_home(name: &str) -> std::path::PathBuf {
         let d = std::env::temp_dir().join(format!("headroom-test-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
+        crate::test_util::trust_clock(&d);
         d
+    }
+
+    /// The agent records a refusal of the clock and then lifts it (two new epochs)
+    fn refuse_and_lift(home: &std::path::Path) {
+        for trusted in [false, true] {
+            let _lock = crate::clock::hold_clock_lock(home).unwrap();
+            let state = crate::clock::ensure_locked(home, || Ok(false)).unwrap();
+            crate::clock::advance_locked(home, &state, trusted).unwrap();
+        }
+    }
+
+    #[test]
+    fn g3_e_a_value_read_before_a_refusal_and_its_lifting_but_saved_after_is_never_used() {
+        let home = temp_home("capture-epoch");
+        let rl = json!({"five_hour": {"used_percentage": 5, "resets_at": 1}});
+        // the epoch is read before the input; the save comes after the agent refused and lifted the clock
+        let read_under = crate::clock::usable_epoch(&home);
+        refuse_and_lift(&home);
+        assert!(save_capture_in(&home, &rl, 1_000, read_under).unwrap());
+        assert!(read_capture(&home).is_none(), "of the epoch before");
+        // the control: the same value read under the new epoch is a new one, and used
+        assert!(save_capture(&home, &rl, 2_000).unwrap());
+        assert_eq!(read_capture(&home).unwrap().0, 2_000);
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]

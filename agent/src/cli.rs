@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use crate::agent;
 use crate::config::{self, collector_id, headroom_home};
 use crate::providers::codex::CodexProvider;
-use crate::push::{Credentials, OsCredentialStore, Pusher};
+use crate::push::{Credentials, EpochRead, OsCredentialStore, Pusher, clock_epoch, usable_epoch};
 use crate::schedule::{NextRun, SCHEDULE_FILE, SESSION_FILE, SESSION_LOCK_FILE, Schedule};
 use crate::schema::build_snapshot;
 use crate::store::{Logger, read_json};
@@ -20,6 +20,8 @@ Usage:
                                           Fetch once and print the result
                                           (--force ignores the interval; neither uses any quota)
   headroom status                         Show the last result and the current state
+  headroom discard-queue                  Discard the observations waiting to be sent and the values the providers cached
+                                          (agent stopped; for a planned stop)
   headroom credentials set | clear        Save / delete the destination credentials in the OS credential store
                                           (set reads one line from stdin: the Worker token)
   headroom install | uninstall            Register autostart and start / stop and unregister
@@ -37,6 +39,7 @@ pub fn run(args: Vec<String>) -> i32 {
         Some("statusline") => crate::statusline::run(rest, &home),
         Some("collect") => collect(rest, &home),
         Some("status") => status(&home),
+        Some("discard-queue") => discard_queue(&home),
         Some("credentials") => credentials(rest),
         // The folder is checked before config.toml is read, so a relative folder is reported first
         Some("install") => match config::check_home(&home).and_then(|()| config::load(&home)) {
@@ -150,22 +153,80 @@ fn collect(args: &[String], home: &std::path::Path) -> i32 {
         accept_account,
     } = parsed;
     let log = Logger::stderr();
-    let mut results = BTreeMap::new();
-    for mut p in agent::make_providers(home, &cfg, &log) {
-        if only.is_some_and(|o| o != p.id()) {
-            continue;
+    let pushing = !cfg.push.url.trim().is_empty();
+    let (results, epoch) = match run_collect(
+        home,
+        pushing,
+        || agent::make_providers(home, &cfg, &log),
+        only,
+        force,
+        accept_account,
+    ) {
+        Collected::Done(results, epoch) => (results, epoch),
+        Collected::Unlocked(e) => {
+            eprintln!(
+                "{e}
+The account switch was not accepted"
+            );
+            return 1;
         }
-        // Resume a provider that stopped on an account switch, using the new account (only the one named)
-        if accept_account {
-            p.accept_account();
+        Collected::Refused(state) => {
+            // Nothing was run (no fetch, no sign-in check, no account acceptance): anything done now would be stamped by that clock
+            eprintln!(
+                "{}",
+                match state {
+                    EpochRead::Read {
+                        in_flight: Some(_), ..
+                    } =>
+                        "Not fetched: the result of a send is pending (the destination may have refused this PC's clock). The background agent saves it, or takes it as refused when it starts; collect again after that",
+                    EpochRead::Read { .. } =>
+                        "Not fetched: the destination refuses this PC's clock. Set the clock automatically (sync it), then collect again",
+                    _ =>
+                        "Not fetched: the clock state (clock-epoch.json) can't be read. Start the background agent (it makes it again), then collect again",
+                }
+            );
+            if accept_account {
+                eprintln!(
+                    "The account switch was not accepted (accept it after the clock is fixed)"
+                );
+                return 1;
+            }
+            // Shown under this decision (refused): nothing of a value comes out, also if the clock reads as trusted a moment later
+            let providers = agent::read_snapshot_at(home, None)
+                .map(|s| s.providers)
+                .unwrap_or_default();
+            let shown = crate::push::trusted_local_at(home, &providers, now_ms(), pushing, false);
+            let snapshot = build_snapshot(shown, now_ms(), &collector_id(&cfg));
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&snapshot).unwrap_or_default()
+            );
+            return 0;
         }
-        let snap = p.collect(now_ms(), force);
-        results.insert(p.id().to_string(), snap);
-    }
+        Collected::Stopped => {
+            eprintln!(
+                "Stopped: the destination refused this PC's clock meanwhile. Set the clock automatically (sync it), then collect again"
+            );
+            return 1;
+        }
+    };
     let collector = collector_id(&cfg);
     let now = now_ms();
+    // One decision for saving and printing: only while the epoch the values were taken in is still usable (a refusal saved after the
+    // fetches holds them back from both), and as the push state lets them out
+    let usable = usable_epoch(home) == Some(epoch);
+    let results = if usable {
+        crate::push::trusted_local_at(home, &results, now, pushing, true)
+    } else {
+        eprintln!("Held back: the destination refused this PC's clock meanwhile");
+        results
+            .into_iter()
+            .map(|(id, p)| (id, crate::push::held(p)))
+            .collect()
+    };
     if only.is_none()
-        && let Err(e) = agent::write_snapshot(home, &results, now, &collector)
+        && usable
+        && let Err(e) = agent::write_snapshot(home, &results, now, &collector, Some(epoch))
     {
         eprintln!("Failed to write snapshot.json: {e}");
     }
@@ -175,6 +236,112 @@ fn collect(args: &[String], home: &std::path::Path) -> i32 {
         serde_json::to_string_pretty(&snapshot).unwrap_or_default()
     );
     0
+}
+
+/// What a manual collect did
+#[derive(Debug)]
+enum Collected {
+    /// What was fetched, and the clock epoch it was taken in
+    Done(BTreeMap<String, crate::schema::ProviderSnapshot>, u64),
+    /// Not run: the clock isn't trusted now (refused, a send's result pending, or a state that can't be read)
+    Refused(EpochRead),
+    /// Stopped: a refusal was saved meanwhile (what was fetched across it is not used). Never after an acceptance (see run_collect)
+    Stopped,
+    /// An acceptance couldn't take the clock lock (nothing was run)
+    Unlocked(String),
+}
+
+/// Runs a manual collect unless this PC's clock is refused. An acceptance holds the clock lock from the first check to the end: a refusal
+/// can't be saved in between (the agent saving one waits for it), so an acceptance is made only on a clock not refused, and one made is
+/// reported as made
+fn run_collect(
+    home: &std::path::Path,
+    pushing: bool,
+    make: impl FnOnce() -> Vec<Box<dyn crate::providers::Provider>>,
+    only: Option<&str>,
+    force: bool,
+    accept_account: bool,
+) -> Collected {
+    // The clock state: made here when there is none (a PC whose agent never ran), and trusted without pushing (nothing refuses it)
+    let made = if pushing {
+        match clock_epoch(home) {
+            EpochRead::Missing => crate::push::ensure_clock(home).map(|_| ()),
+            _ => Ok(()),
+        }
+    } else {
+        match clock_epoch(home) {
+            EpochRead::Read {
+                trusted: true,
+                in_flight: None,
+                ..
+            } => Ok(()),
+            // Lifted only while no background agent runs: one started with the earlier settings may still be pushing (and be refused).
+            // Holding its lock, this is the agent's to resolve, a send it left pending included
+            _ => crate::install::hold_agent_lock(home)
+                .and_then(|_lock| crate::push::trust_without_push_as_agent(home).map(|_| ())),
+        }
+    };
+    if let Err(e) = made {
+        return Collected::Unlocked(e);
+    }
+    let _lock = if accept_account {
+        match crate::push::hold_clock_lock(home) {
+            Ok(lock) => Some(lock),
+            Err(e) => return Collected::Unlocked(e),
+        }
+    } else {
+        None
+    };
+    let Some(epoch) = usable_epoch(home) else {
+        return Collected::Refused(clock_epoch(home));
+    };
+    // Each provider is started and its result taken only in that epoch (a refusal and its lifting both within the fetch show as
+    // another epoch)
+    match collect_providers(make(), only, force, accept_account, &|| {
+        usable_epoch(home) != Some(epoch)
+    }) {
+        Some(results) => Collected::Done(results, epoch),
+        None => Collected::Stopped,
+    }
+}
+
+/// Fetches with each provider (the one named, or all). The refusal of this PC's clock is checked before each provider's fetch or account
+/// acceptance, and again after it: a refusal saved meanwhile (by the background agent) stops it, and what was fetched across it is
+/// not used (None)
+pub(crate) fn collect_providers(
+    providers: Vec<Box<dyn crate::providers::Provider>>,
+    only: Option<&str>,
+    force: bool,
+    accept_account: bool,
+    refused: &dyn Fn() -> bool,
+) -> Option<BTreeMap<String, crate::schema::ProviderSnapshot>> {
+    let mut results = BTreeMap::new();
+    for mut p in providers {
+        if only.is_some_and(|o| o != p.id()) {
+            continue;
+        }
+        if refused() {
+            return None;
+        }
+        // Resume a provider that stopped on an account switch, using the new account (only the one named)
+        if accept_account {
+            p.accept_account();
+        }
+        let snap = p.collect(now_ms(), force);
+        // What the acceptance did, as the provider saved it
+        if accept_account {
+            match p.account_accepted() {
+                Some(true) => eprintln!("{}: accepted the account switch", p.id()),
+                Some(false) => eprintln!("{}: the account switch was not accepted", p.id()),
+                None => {}
+            }
+        }
+        if refused() {
+            return None;
+        }
+        results.insert(p.id().to_string(), snap);
+    }
+    Some(results)
 }
 
 /// Shown when `credentials set` is typed directly at a terminal (refused, because the input would show on screen)
@@ -284,6 +451,52 @@ fn current_schedule(home: &std::path::Path) -> Option<BTreeMap<String, NextRun>>
     (!session.is_empty() && schedule.session == session).then_some(schedule.providers)
 }
 
+/// For a planned stop before a migration. Holds agent.lock throughout (the agent can't start and send the old queue meanwhile), has the
+/// providers forget the values they cached (one could be queued again on the next start), then discards the queue
+fn discard_queue(home: &std::path::Path) -> i32 {
+    let _lock = match crate::install::hold_agent_lock(home) {
+        Ok(lock) => lock,
+        Err(e) => {
+            eprintln!("{e}");
+            return 1;
+        }
+    };
+    let cfg = match config::load(home) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("{e}");
+            return 2;
+        }
+    };
+    // The clock epoch moves on first (with the queue emptied and read back): nothing taken before is sent or used, whatever follows
+    let result = match Pusher::discard_queue(home) {
+        Ok(Some(n)) => {
+            println!("Discarded {n} unsent observations");
+            0
+        }
+        Ok(None) => {
+            println!("No push state: nothing to discard");
+            0
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            return 1;
+        }
+    };
+    // Then the providers tidy what they cached (only tidying: a value left behind is of the epoch before and never used)
+    let log = Logger::stderr();
+    let mut tidied = true;
+    for mut p in agent::make_providers(home, &cfg, &log) {
+        tidied &= p.forget_cached();
+    }
+    if !tidied {
+        eprintln!(
+            "A provider's cached values couldn't be tidied away now (they aren't used); the agent tidies them later"
+        );
+    }
+    result
+}
+
 fn status(home: &std::path::Path) -> i32 {
     let running = crate::install::agent_running(home);
     let plan = if running {
@@ -301,11 +514,47 @@ fn status(home: &std::path::Path) -> i32 {
             "not registered"
         }
     );
-    match read_json::<serde_json::Value>(&home.join("snapshot.json")) {
-        Some(v) => println!(
-            "snapshot.json:\n{}",
-            serde_json::to_string_pretty(&v).unwrap_or_default()
-        ),
+    // Shown as the push state lets it out now (a file written before the latest marks, or by an older version, may hold values a
+    // refused clock stamped)
+    let pushing = config::load(home).is_ok_and(|c| !c.push.url.trim().is_empty());
+    // The clock state: values are shown only while it is trusted (and only those taken in its epoch)
+    // One read of the clock for the line and the values below
+    let clock = clock_epoch(home);
+    let usable = match clock {
+        EpochRead::Read {
+            epoch,
+            trusted: true,
+            in_flight: None,
+        } => Some(epoch),
+        _ => None,
+    };
+    println!(
+        "Clock: {}",
+        match clock {
+            EpochRead::Read {
+                in_flight: Some(_), ..
+            } => "a send's result is pending (values held back until it is saved)",
+            EpochRead::Read { trusted: true, .. } => "trusted",
+            EpochRead::Read { .. } =>
+                "refused by the destination (values held back until a send goes through)",
+            EpochRead::Missing => "not set up yet (the background agent sets it up)",
+            EpochRead::Unreadable => "clock-epoch.json can't be read (values held back)",
+        }
+    );
+    match agent::read_snapshot_at(home, usable) {
+        Some(mut s) => {
+            s.providers = crate::push::trusted_local_at(
+                home,
+                &s.providers,
+                now_ms(),
+                pushing,
+                usable.is_some(),
+            );
+            println!(
+                "snapshot.json:\n{}",
+                serde_json::to_string_pretty(&s).unwrap_or_default()
+            )
+        }
         None => println!("snapshot.json: not yet"),
     }
     if let Some(v) = read_json::<serde_json::Value>(&home.join("state-claude.json")) {
@@ -340,6 +589,267 @@ fn status(home: &std::path::Path) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    /// A provider that counts its fetches and acceptances, and can run a step while fetching (the agent saving a refusal)
+    struct Counting {
+        id: &'static str,
+        fetches: Rc<Cell<u32>>,
+        accepted: Rc<Cell<u32>>,
+        during: Option<Box<dyn Fn()>>,
+    }
+
+    impl crate::providers::Provider for Counting {
+        fn id(&self) -> &'static str {
+            self.id
+        }
+        fn next_due_ms(&self, now: i64) -> i64 {
+            now
+        }
+        fn collect(&mut self, _now: i64, _force: bool) -> crate::schema::ProviderSnapshot {
+            self.fetches.set(self.fetches.get() + 1);
+            if let Some(f) = &self.during {
+                f();
+            }
+            crate::schema::ProviderSnapshot::empty(crate::schema::ProviderStatus::Ok, "", None)
+        }
+        fn accept_account(&mut self) {
+            self.accepted.set(self.accepted.get() + 1);
+        }
+    }
+
+    type Counted = (
+        Box<dyn crate::providers::Provider>,
+        Rc<Cell<u32>>,
+        Rc<Cell<u32>>,
+    );
+
+    fn counting(id: &'static str, during: Option<Box<dyn Fn()>>) -> Counted {
+        let (f, a) = (Rc::new(Cell::new(0)), Rc::new(Cell::new(0)));
+        (
+            Box::new(Counting {
+                id,
+                fetches: f.clone(),
+                accepted: a.clone(),
+                during,
+            }),
+            f,
+            a,
+        )
+    }
+
+    #[test]
+    fn g3_i_what_is_shown_follows_the_clock_read_once_for_the_decision() {
+        let home = crate::test_util::TempHome::new("headroom-cli-shown-once");
+        crate::test_util::trust_clock(&home);
+        let epoch = usable_epoch(&home).unwrap();
+        let values = BTreeMap::from([(
+            "claude".to_string(),
+            crate::schema::ProviderSnapshot::empty(crate::schema::ProviderStatus::Ok, "", None),
+        )]);
+        agent::write_snapshot(&home, &values, 0, "pc", Some(epoch)).unwrap();
+        // decided as refused: nothing comes out, though the clock now reads as trusted
+        assert!(
+            agent::read_snapshot_at(&home, None)
+                .unwrap()
+                .providers
+                .is_empty()
+        );
+        assert_eq!(
+            agent::read_snapshot_at(&home, Some(epoch))
+                .unwrap()
+                .providers
+                .len(),
+            1
+        );
+        assert_eq!(
+            agent::read_snapshot_at(&home, Some(epoch + 1))
+                .unwrap()
+                .providers
+                .len(),
+            0
+        );
+    }
+
+    #[test]
+    fn g3_a_a_refusal_saved_while_fetching_stops_the_next_provider_and_drops_the_value() {
+        let refused = Rc::new(Cell::new(false));
+        let r = refused.clone();
+        let (claude, claude_fetches, _) = counting("claude", Some(Box::new(move || r.set(true))));
+        let (codex, codex_fetches, _) = counting("codex", None);
+        let check = {
+            let r = refused.clone();
+            move || r.get()
+        };
+        assert!(
+            collect_providers(vec![claude, codex], None, false, false, &check).is_none(),
+            "the value fetched across it is not used"
+        );
+        assert_eq!((claude_fetches.get(), codex_fetches.get()), (1, 0));
+    }
+
+    #[test]
+    fn g3_a_a_refusal_saved_just_before_accepting_stops_the_acceptance_and_the_fetch() {
+        let (codex, fetches, accepted) = counting("codex", None);
+        assert!(collect_providers(vec![codex], Some("codex"), false, true, &|| true).is_none());
+        assert_eq!(
+            (accepted.get(), fetches.get()),
+            (0, 0),
+            "the switch stays pending"
+        );
+    }
+
+    #[test]
+    fn g3_c_on_a_fixed_clock_a_named_provider_is_accepted_and_fetched() {
+        let (codex, fetches, accepted) = counting("codex", None);
+        let (claude, claude_fetches, _) = counting("claude", None);
+        let got =
+            collect_providers(vec![claude, codex], Some("codex"), false, true, &|| false).unwrap();
+        assert_eq!(
+            (accepted.get(), fetches.get(), claude_fetches.get()),
+            (1, 1, 0)
+        );
+        assert!(got.contains_key("codex"));
+    }
+
+    fn temp_home(label: &str) -> std::path::PathBuf {
+        let home =
+            std::env::temp_dir().join(format!("headroom-cli-{label}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        home
+    }
+
+    #[test]
+    fn g3_a_an_acceptance_holds_the_clock_lock_from_its_check_to_its_end() {
+        let home = temp_home("accept-lock");
+        // what the agent saving a refusal would find while the provider accepts and fetches
+        let busy = Rc::new(Cell::new(None));
+        let (b, h) = (busy.clone(), home.clone());
+        let probe = move || {
+            let lock = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(h.join(crate::push::CLOCK_LOCK_FILE))
+                .unwrap();
+            b.set(Some(matches!(
+                lock.try_lock(),
+                Err(std::fs::TryLockError::WouldBlock)
+            )));
+        };
+        let (codex, fetches, accepted) = counting("codex", Some(Box::new(probe.clone())));
+        let got = run_collect(&home, true, || vec![codex], Some("codex"), false, true);
+        assert!(matches!(got, Collected::Done(..)));
+        assert_eq!(
+            (accepted.get(), fetches.get(), busy.get()),
+            (1, 1, Some(true)),
+            "a refusal can't be saved between the check and the acceptance"
+        );
+        // control: a plain collect doesn't hold it (the agent isn't kept waiting by a fetch; what was fetched across a refusal is dropped)
+        let (codex, _, _) = counting("codex", Some(Box::new(probe)));
+        assert!(matches!(
+            run_collect(&home, true, || vec![codex], None, false, false),
+            Collected::Done(..)
+        ));
+        assert_eq!(busy.get(), Some(false));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn g3_d_without_pushing_a_refusal_is_lifted_only_while_no_background_agent_runs() {
+        let home = temp_home("lift-local");
+        crate::test_util::trust_clock(&home);
+        {
+            let _lock = crate::push::hold_clock_lock(&home).unwrap();
+            let state = crate::clock::ensure_locked(&home, || Ok(false)).unwrap();
+            crate::clock::advance_locked(&home, &state, false).unwrap();
+        }
+        // an agent started with the earlier settings (which pushed) still runs: not lifted, nothing fetched or accepted
+        let agent = crate::install::hold_agent_lock(&home).unwrap();
+        let (codex, fetches, accepted) = counting("codex", None);
+        assert!(matches!(
+            run_collect(&home, false, || vec![codex], None, false, true),
+            Collected::Unlocked(_)
+        ));
+        assert_eq!((fetches.get(), accepted.get()), (0, 0));
+        assert_eq!(usable_epoch(&home), None, "still refused");
+        // the agent is gone: lifted under a new epoch, and the collect runs
+        drop(agent);
+        let (codex, fetches, _) = counting("codex", None);
+        assert!(matches!(
+            run_collect(&home, false, || vec![codex], None, false, false),
+            Collected::Done(..)
+        ));
+        assert_eq!(fetches.get(), 1);
+        assert!(usable_epoch(&home).is_some());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn g3_f_a_refusal_and_its_lifting_both_within_a_fetch_drop_its_value_and_stop_the_rest() {
+        let home = temp_home("across");
+        crate::test_util::trust_clock(&home);
+        let h = home.clone();
+        // while Claude fetches, the agent saves a refusal and then lifts it (two new epochs)
+        let both = move || {
+            for trusted in [false, true] {
+                let _lock = crate::push::hold_clock_lock(&h).unwrap();
+                let state = crate::clock::ensure_locked(&h, || Ok(false)).unwrap();
+                crate::clock::advance_locked(&h, &state, trusted).unwrap();
+            }
+        };
+        let (claude, claude_fetches, _) = counting("claude", Some(Box::new(both)));
+        let (codex, codex_fetches, _) = counting("codex", None);
+        let got = run_collect(&home, true, || vec![claude, codex], None, false, false);
+        assert!(matches!(got, Collected::Stopped), "{got:?}");
+        assert_eq!((claude_fetches.get(), codex_fetches.get()), (1, 0));
+        // the control: the epoch stays, both are used
+        let (claude, _, _) = counting("claude", None);
+        let (codex, _, _) = counting("codex", None);
+        let got = run_collect(&home, true, || vec![claude, codex], None, false, false);
+        assert!(matches!(got, Collected::Done(ref r, _) if r.len() == 2));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn g3_a_an_earlier_push_state_that_cant_be_read_runs_nothing() {
+        let home = temp_home("unreadable");
+        std::fs::write(home.join(crate::push::OUTBOX_FILE), "{broken").unwrap();
+        let (codex, fetches, accepted) = counting("codex", None);
+        let got = run_collect(&home, true, || vec![codex], Some("codex"), false, true);
+        assert!(
+            matches!(got, Collected::Unlocked(_)),
+            "no clock state made on a guess"
+        );
+        assert_eq!((accepted.get(), fetches.get()), (0, 0));
+        // a refused clock runs nothing either
+        let refused = temp_home("refused");
+        crate::test_util::trust_clock(&refused);
+        {
+            let _lock = crate::push::hold_clock_lock(&refused).unwrap();
+            let state = crate::clock::ensure_locked(&refused, || Ok(false)).unwrap();
+            crate::clock::advance_locked(&refused, &state, false).unwrap();
+        }
+        let (codex, fetches, _) = counting("codex", None);
+        let got = run_collect(&refused, true, || vec![codex], None, false, false);
+        assert!(matches!(
+            got,
+            Collected::Refused(EpochRead::Read { trusted: false, .. })
+        ));
+        assert_eq!(fetches.get(), 0);
+        let _ = std::fs::remove_dir_all(&refused);
+        // control: without pushing there is no refusal to read
+        let (codex, fetches, _) = counting("codex", None);
+        assert!(matches!(
+            run_collect(&home, false, || vec![codex], None, false, false),
+            Collected::Done(..)
+        ));
+        assert_eq!(fetches.get(), 1);
+        let _ = std::fs::remove_dir_all(&home);
+    }
 
     fn args(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()

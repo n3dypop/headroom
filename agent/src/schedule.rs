@@ -119,6 +119,8 @@ struct Slot {
     deferring: bool,
     /// Why `hold_until` was set (shown by `headroom status`)
     hold_reason: Option<Waiting>,
+    /// When `hold_until` was set (a clock that went back before it set the hold by its old time)
+    hold_set_at: i64,
 }
 
 pub struct Coordinator {
@@ -167,6 +169,26 @@ impl Coordinator {
         }
     }
 
+    /// Notices a clock that went back past this PC's last fetch or past the time a hold was set: the hold and the lease were set by the
+    /// old clock (they could hold off for as long as it went back), so they are dropped and counted again from now. Called on every
+    /// round before the provider's schedule is checked (a provider holding off by the same hold would never reach `before_fetch`).
+    /// true if it dropped a hold
+    pub fn notice_clock(&mut self, id: &str, now: i64) -> bool {
+        let Some(slot) = self.slots.get_mut(id) else {
+            return false;
+        };
+        if slot.last_fetch <= now && slot.hold_set_at <= now {
+            return false;
+        }
+        slot.last_fetch = slot.last_fetch.min(now);
+        slot.last_change = slot.last_change.min(now);
+        slot.hold_until = 0;
+        slot.hold_reason = None;
+        slot.hold_set_at = 0;
+        slot.granted_until = slot.granted_until.min(now);
+        true
+    }
+
     /// For a provider whose fetch is due, decides whether it may fetch now. If holding off, sets `hold_until` and returns false
     pub fn before_fetch(
         &mut self,
@@ -178,6 +200,7 @@ impl Coordinator {
     ) -> bool {
         let idle_ms = self.cfg.idle_interval_min.max(0) * MINUTE_MS;
         let own_ms = self.cfg.own_fetch_min.max(1) * MINUTE_MS;
+        self.notice_clock(id, now);
         let slot = self.slots.entry(id.to_string()).or_default();
         // If this PC has not fetched for a long time, fetch without asking even while holding off (safety net; checked before the lease)
         if slot.last_fetch > 0 && now - slot.last_fetch >= own_ms {
@@ -192,6 +215,7 @@ impl Coordinator {
             && now < slot.last_fetch + idle_ms
         {
             slot.hold_until = slot.last_fetch + idle_ms;
+            slot.hold_set_at = now;
             slot.hold_reason = Some(Waiting::Idle);
             return false;
         }
@@ -226,6 +250,7 @@ impl Coordinator {
                     .min(recheck)
                     .min(slot.last_fetch + own_ms);
                 slot.hold_reason = Some(Waiting::Turn);
+                slot.hold_set_at = now;
                 false
             }
             // Destination unreachable or answer unreadable: fetch on this PC
@@ -799,5 +824,42 @@ mod tests {
             "asks from the second fetch on"
         );
         assert_eq!(w.calls.len(), 1);
+    }
+
+    #[test]
+    fn a_hold_set_before_the_clock_went_back_does_not_hold_off() {
+        // fetched at 15:00 and told to wait for the turn until 15:05; then the clock is set back to 12:00
+        let mut c = Coordinator::new(ScheduleConfig::default(), Logger::stderr());
+        let fifteen = 15 * 60 * MINUTE_MS;
+        c.record_fetch("claude", fifteen);
+        {
+            let slot = c.slots.get_mut("claude").unwrap();
+            slot.hold_until = fifteen + 5 * MINUTE_MS;
+            slot.hold_reason = Some(Waiting::Turn);
+            slot.hold_set_at = fifteen;
+        }
+        let noon = 12 * 60 * MINUTE_MS;
+        assert!(
+            c.before_fetch("claude", 5, None, None, noon),
+            "not held off until 15:05"
+        );
+        assert_eq!(c.hold_until("claude"), 0);
+    }
+
+    #[test]
+    fn a_hold_set_after_the_last_fetch_is_dropped_when_the_clock_goes_back_before_it() {
+        // fetched at 12:00; at 12:19 another PC's turn holds this one off until 12:26; then the clock is set back to 12:01
+        let mut c = Coordinator::new(ScheduleConfig::default(), Logger::stderr());
+        let noon = 12 * 60 * MINUTE_MS;
+        c.record_fetch("claude", noon);
+        {
+            let slot = c.slots.get_mut("claude").unwrap();
+            slot.hold_until = noon + 26 * MINUTE_MS;
+            slot.hold_reason = Some(Waiting::Turn);
+            slot.hold_set_at = noon + 19 * MINUTE_MS;
+        }
+        assert!(c.notice_clock("claude", noon + MINUTE_MS));
+        assert_eq!(c.hold_until("claude"), 0);
+        assert!(!c.notice_clock("claude", noon + 2 * MINUTE_MS), "once");
     }
 }

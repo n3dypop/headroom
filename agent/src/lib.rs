@@ -2,6 +2,7 @@
 
 pub mod agent;
 pub mod cli;
+pub mod clock;
 pub mod config;
 pub mod install;
 pub mod providers;

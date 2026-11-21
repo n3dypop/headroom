@@ -353,7 +353,7 @@ On macOS, the path is `/Users/<you>/.headroom/bin/headroom`. These examples assu
 
    They are saved together in the iPhone Keychain, never in the script.
 5. Add a Scriptable widget to the home screen or lock screen and choose the `Headroom` script.
-6. Optionally set the widget's **Parameter**:
+6. Optionally set the widget's **Parameter**. In the app menu, **Widget** > **Make a parameter** builds one and copies it, and **Parameter guide** lists them all:
 
    | Parameter | Shows |
    |---|---|
@@ -363,10 +363,30 @@ On macOS, the path is `/Users/<you>/.headroom/bin/headroom`. These examples assu
    | `5h`, `weekly`, `claude 5h`, `codex weekly` | Lock screen: that limit |
    | `claude 5h, codex 5h`, `both weekly` | Lock screen: two limits side by side |
    | `demo:<name>` | Sample data to preview every state (`normal`, `runout`, `no5h`, `stale`, `reset`, `offline`, `error`, `nochart`) |
+   | `…, notify` (or just `notify`) | Also send notifications from this widget (see below). Add it to one widget only |
 
-To change or remove the settings, run the script in the app and choose **Edit settings** or **Remove settings**.
+**App menu.** Run the script in the app to open it. Each item comes back to the menu:
+
+| Item | What it does |
+|---|---|
+| **Details** | The details page (the same as tapping the widget) |
+| **Widget** | **Preview current values** or **Preview sample data** in any home screen or lock screen size; **Make a parameter** (answer three questions, then copy the Parameter or preview it); **Parameter guide** (every Parameter and what it shows) |
+| **Notifications** | **Send sample notifications**, and turn **Limit alerts** and **Time reminders** on or off |
+| **Settings** | **Server and token**, **Reset saved data**, **Remove all settings** (the last two ask first) |
 
 iOS decides how often widgets refresh, usually every 15–60 minutes. Countdowns to the reset keep running between refreshes.
+
+**Details:** tap the widget to open a details page in Scriptable: every limit with its reset time, pace, forecast and confidence, the weekly chart, and recent events. On a medium or large widget, each provider's column opens that provider. You can also choose **Details** in the app menu.
+
+**Notifications** (optional):
+
+1. Run the script in the app, choose **Notifications**, then **Send sample notifications** and allow notifications. The samples show each kind for Claude, Codex or both.
+2. Add `notify` to the Parameter of **one** widget (for example `notify` or `claude, notify`). Each time that widget refreshes, it:
+   - schedules **time reminders** on the iPhone: when a provider at its limit resets, and 15 minutes before a limit is forecast to run out. These ring on time even if the widget isn't refreshed;
+   - tells new **limit alerts** from the server (limit reached, reset after a limit, weekly 80%, collection stopped, sign-in required). These arrive on the next refresh, so they can be 15–60 minutes late.
+3. Each kind can be turned off under **Notifications**. **Settings** > **Reset saved data** forgets saved values, scheduled reminders and where the alerts left off.
+
+If the widget can't schedule notifications on your iPhone, use a Shortcuts automation instead: add **Run Script**, choose `Headroom`, and pass `notify` as the parameter. It runs without opening a screen and outputs a short summary.
 
 ## 4. Updating and removing
 
@@ -379,13 +399,18 @@ iOS decides how often widgets refresh, usually every 15–60 minutes. Countdowns
   1. Apply new migrations with `npx wrangler d1 migrations apply headroom --remote -c wrangler.prod.toml`.
   2. Deploy with `npx wrangler deploy -c wrangler.prod.toml`.
 
-  Normally you apply migrations before deploying. **Exception:** a migration that only drops a table is applied **after** deploying the Worker that no longer uses it. Its header comment says so.
-- **Widget:** update the server first, then paste the new script over the old one (a newer widget may ask the server for data an older server doesn't serve). Settings are kept.
+  Apply migrations before deploying. **Exception:** a migration that only drops a table is applied **after** deploying that Worker; its header comment says so.
+- **Planned stop** (when a release or a migration's header asks for it, so nothing an older Worker accepted is sent again):
+  1. On every PC: stop the agent with the installed version (`headroom stop`). Then, with the `headroom` of the **new, extracted package** (not installed yet; the old version has no such command), run `headroom discard-queue` and check that `headroom status` shows `Push: 0 unsent observations`. A PC that is asleep is handled the same way before it sends again.
+  2. Apply the migrations, then deploy the Worker, as above. The new Worker refuses uploads from older agents (426), so one sent before the stop and arriving late isn't saved.
+  3. Wait a minute (requests the earlier Worker was still handling finish), then run the one-time cleanup: `npx wrangler d1 execute headroom --remote -c wrangler.prod.toml --file upgrade/after-deploy.sql` (in `packages/worker`). It removes rows the new Worker no longer accepts; speeds and the weekly series are computed again by the next Cron (up to 5 minutes, and an hour for the weekly series), and the widget shows no values until then.
+  4. On every PC: run `install` from the new package (it starts the agent).
+- **Widget:** update the server first, then close the Scriptable app (swipe it away) and paste the new script over the old one, while no notifying shortcut is running (a newer widget may ask the server for data an older server doesn't serve; an older copy left running could write settings the newer one doesn't expect). Settings are kept.
 
 ## 5. Troubleshooting
 
 - **First check:** `headroom status` shows the last error per provider and the send result.
-- **Send result says the PC's clock is ahead of or behind the destination's:** the Worker refuses uploads from a PC whose clock is more than 2 minutes off, because it uses the PC's times as they are. Turn on automatic time sync (Windows: Settings > Time & language > Set time automatically; macOS: System Settings > General > Date & Time). Observations the agent had queued when it was refused are dropped (they were stamped by the wrong clock), and it takes no fetch turn until a send goes through, so another PC fetches meanwhile.
+- **Send result says the PC's clock is ahead of or behind the destination's:** the Worker refuses uploads from a PC whose clock is more than 2 minutes off, because it uses the PC's times as they are. Turn on automatic time sync (Windows: Settings > Time & language > Set time automatically; macOS: System Settings > General > Date & Time). Observations the agent had queued when it was refused are dropped (they were stamped by the wrong clock). While refused, the agent doesn't fetch at all and takes no fetch turn, so another PC fetches meanwhile; it checks the clock with a send that carries no values, and once that goes through it fetches again. Every value the agent takes in carries the clock's generation (`clock-epoch.json`), so nothing taken before the refusal is used or sent after it. A send whose answer is lost (a timeout after the request went out) counts as a possible refusal and is followed by such a check; a request that never reached the destination doesn't. Until the clock is trusted again, `headroom status` shows no values (its `Clock:` line says why), and `headroom collect` doesn't fetch or accept an account switch. If the clock state can't be read, it counts as refused the same way. Values stamped by the wrong clock are never sent, also after the clock is fixed.
 - **Codex `account_changed`:** the CLI's account changed, so fetching stopped to avoid mixing histories. Check that it is the right account, then run `headroom collect --provider codex --accept-account`.
 - **Claude account change:** same as Codex, with `--provider claude`.
 - **Claude safety stop:** fetching stopped because the agent could not confirm that `/usage` used no quota.
@@ -399,4 +424,5 @@ iOS decides how often widgets refresh, usually every 15–60 minutes. Countdowns
 - **`next check ... (another PC holds the fetch turn; checks again then)`:** another PC is fetching the same values, so this PC waits and decides again at that time. Its own values in `snapshot.json` can look old; the widget shows the values the server merges from all PCs. `own_fetch_min` caps how long this PC waits: after that, it fetches without asking for the turn (unless its own retry backoff or a safety stop holds it).
 - **Widget shows `Check your credentials`:** the read token is wrong or was revoked.
 - **Widget shows `Can't reach the server`:** check the URL, or `ALLOWED_HOST` on the server.
-- **Values look old:** `headroom status` shows when the agent last sent. The widget marks old values (for example `31m ago`) and estimated resets (`est.`).
+- **No notifications:** check that notifications are allowed for Scriptable, that exactly one widget has `notify`, and the last check time under **Notifications** in the app menu. After the server's database is recreated, choose **Settings** > **Reset saved data**.
+- **Values look old:** `headroom status` shows when the agent last sent. The widget marks old values (for example `31m ago`) and limits whose reset time passed since the last value (`↻`).

@@ -60,6 +60,19 @@ fn open_lock(home: &Path) -> Result<File, String> {
         .map_err(|e| format!("Cannot open {}: {e}", path.display()))
 }
 
+/// Takes agent.lock and holds it while the returned file lives (the agent can't start meanwhile). Err if the agent is running or the
+/// lock can't be checked (not taken for "stopped")
+pub fn hold_agent_lock(home: &Path) -> Result<File, String> {
+    let lock = open_lock(home)?;
+    match lock_is_held(&lock, home)? {
+        false => Ok(lock),
+        true => Err(
+            "The background agent is running. Stop it first (headroom stop), then run this again"
+                .into(),
+        ),
+    }
+}
+
 /// Ok(true) if another process holds the lock. Taking it (Ok(false)) holds it until `lock` is dropped
 fn lock_is_held(lock: &File, home: &Path) -> Result<bool, String> {
     match lock.try_lock() {
@@ -520,6 +533,24 @@ pub fn registered() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_queue_discard_holds_the_agent_lock_and_refuses_while_it_is_held() {
+        let home = std::env::temp_dir().join(format!("headroom-hold-lock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        // the agent holds it: refused
+        let agent = open_lock(&home).unwrap();
+        agent.try_lock().unwrap();
+        assert!(hold_agent_lock(&home).is_err());
+        drop(agent);
+        // taken: an agent starting now can't take it until it is let go
+        let held = hold_agent_lock(&home).unwrap();
+        assert_eq!(agent_lock_state(&home), Ok(true));
+        drop(held);
+        assert_eq!(agent_lock_state(&home), Ok(false));
+        let _ = std::fs::remove_dir_all(&home);
+    }
 
     fn home(label: &str) -> PathBuf {
         let h =

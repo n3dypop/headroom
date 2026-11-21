@@ -16,7 +16,7 @@ import {
   type Snapshot,
   type UsageObservation,
 } from "../../core/src/index.ts";
-import { settleLimits, withoutUnstored, type CleanUpload } from "./sanitize.ts";
+import { heldToClock, settleLimits, withinClock, withoutUnstored, type CleanUpload } from "./sanitize.ts";
 
 export interface D1Statement {
   bind(...values: unknown[]): D1Statement;
@@ -35,6 +35,12 @@ const DAY_MS = 24 * 60 * 60_000;
 export const OBSERVATION_RETENTION_MS = 8 * DAY_MS;
 /** Retention of per-PC latest values */
 export const SNAPSHOT_RETENTION_MS = 30 * DAY_MS;
+/**
+ * Marks this Worker's writes to the rows the upgrade cleanup holds (collector_snapshots, observations, observation_hourly, public_state).
+ * After the cleanup, triggers refuse a write without it: a request an earlier Worker was still handling can't put back what the cleanup removed
+ */
+export const WRITER = 2;
+
 /** Max observations read per provider for derived values (newest first; bounds D1 reads) */
 export const HISTORY_ROW_LIMIT = 5_000;
 /** Max observations deleted per Cron run (per provider and kind; deletes count as writes: 3 rows per item, the row and 2 indexes) */
@@ -209,12 +215,16 @@ export async function saveUpload(
       db
         .prepare(
           `INSERT OR IGNORE INTO observations
-             (provider, window_id, collector, observed_at, first_received_at, resets_at, used_percent)
-           SELECT column1, column2, column3, column4, column5, column6, column7 FROM (VALUES ${placeholders}) AS v
+             (provider, window_id, collector, observed_at, first_received_at, resets_at, used_percent, writer)
+           SELECT column1, column2, column3, column4, column5, column6, column7, ${WRITER} FROM (VALUES ${placeholders}) AS v
            -- Received before the boundary, or stamped before the boundary plus the guard (may be from before the switch)
            WHERE NOT EXISTS (
              SELECT 1 FROM history_boundaries b
              WHERE b.provider = v.column1 AND (v.column5 < b.since OR v.column4 < ${guardedSql("b.since")})
+           )
+           -- At or before the marker an earlier Worker kept for that PC (observations it removed at a boundary; a resend doesn't bring them back)
+           AND NOT EXISTS (
+             SELECT 1 FROM boundary_watermarks w WHERE w.provider = v.column1 AND w.collector = v.column3 AND v.column4 <= w.until
            )`,
         )
         .bind(
@@ -250,9 +260,9 @@ export async function saveUpload(
       db
         .prepare(
           `INSERT INTO observation_hourly
-             (provider, window_id, hour, used_percent, resets_at, observed_at, effective_at, first_received_at, collector, priority)
+             (provider, window_id, hour, used_percent, resets_at, observed_at, effective_at, first_received_at, collector, priority, writer)
            SELECT provider, window_id, hour, used_percent, resets_at, observed_at, effective_at, first_received_at, collector,
-             priority
+             priority, ${WRITER}
            FROM (
              SELECT *, row_number() OVER (
                  PARTITION BY provider, window_id, hour
@@ -274,7 +284,7 @@ export async function saveUpload(
            ON CONFLICT (provider, window_id, hour) DO UPDATE SET
              used_percent = excluded.used_percent, resets_at = excluded.resets_at, observed_at = excluded.observed_at,
              effective_at = excluded.effective_at, first_received_at = excluded.first_received_at,
-             collector = excluded.collector, priority = excluded.priority
+             collector = excluded.collector, priority = excluded.priority, writer = excluded.writer
            WHERE excluded.effective_at > observation_hourly.effective_at
               OR (excluded.effective_at = observation_hourly.effective_at AND (
                 excluded.priority < observation_hourly.priority
@@ -316,21 +326,23 @@ export async function saveUpload(
     db
       .prepare(
         // Don't rebuild a latest value from an old resend after it has expired
-        `INSERT INTO collector_snapshots (collector, seq, snapshot, received_at) SELECT ?, ?, ?, ? WHERE ${notStale}
+        `INSERT INTO collector_snapshots (collector, seq, snapshot, received_at, writer) SELECT ?, ?, ?, ?, ${WRITER} WHERE ${notStale}
          ON CONFLICT (collector) DO UPDATE SET
-           seq = excluded.seq, snapshot = excluded.snapshot, received_at = excluded.received_at
+           seq = excluded.seq, snapshot = excluded.snapshot, received_at = excluded.received_at, writer = excluded.writer
          WHERE excluded.seq > collector_snapshots.seq`,
       )
       .bind(collector, upload.seq, body, received, collector, upload.seq),
     // Record the accepted seq in the registration table (after replacing the latest value; earlier statements in this batch judge by the previous seq)
     db.prepare("UPDATE collector_names SET seq = ? WHERE name = ? AND seq < ?").bind(upload.seq, collector, upload.seq),
+    // The database is used from the first save on (writes only that once)
+    db.prepare("UPDATE data_generation SET used = 1 WHERE id = 1 AND used = 0"),
   );
   // Put the current boundaries into the latest-value row in the same transaction as the boundary save (write only on change)
   statements.push(
     db.prepare(
       // Also keep the global counter at the time of the put (already advanced by earlier statements in this batch)
       `UPDATE public_state SET current_boundaries = (${CURRENT_BOUNDARIES_SQL}),
-         current_version = (SELECT version FROM data_versions WHERE provider = '${ALL_VERSION}')
+         current_version = (SELECT version FROM data_versions WHERE provider = '${ALL_VERSION}'), writer = ${WRITER}
        WHERE id = 1 AND current_boundaries IS NOT (${CURRENT_BOUNDARIES_SQL})`,
     ),
   );
@@ -386,17 +398,47 @@ export async function mayWrite(db: D1Like, collector: string): Promise<boolean> 
  */
 export async function loadSnapshots(db: D1Like): Promise<{ snapshots: Snapshot[]; received: Map<string, string> }> {
   const boundaries = await loadBoundaries(db);
-  const { results } = await db
+  const marks = await loadWatermarks(db);
+  const { results: all } = await db
     .prepare("SELECT collector, snapshot, received_at FROM collector_snapshots")
     .all<{ collector: string; snapshot: string; received_at: string }>();
+  // A row an earlier Worker kept from a PC whose clock today's Worker refuses: left out entirely (its values, state and liveness)
+  const rows = all.map((r) => ({ ...r, parsed: JSON.parse(r.snapshot) as Snapshot })).filter((r) => withinClock(r.parsed, r.received_at));
   return {
-    // Held to today's rules (rows saved by an earlier Worker), then boundaries applied
-    snapshots: results.map((r) =>
-      settleLimits(applyBoundaries(withoutUnstored(JSON.parse(r.snapshot) as Snapshot), r.received_at, boundaries))
+    // Held to today's rules (rows saved by an earlier Worker: unstored windows, values after the send time, its markers), then boundaries applied
+    snapshots: rows.map((r) =>
+      settleLimits(applyBoundaries(belowMarks(heldToClock(withoutUnstored(r.parsed), r.received_at), r.collector, marks), r.received_at, boundaries))
     ),
     // Each PC's last received time (liveness marker)
-    received: new Map(results.map((r) => [r.collector, r.received_at])),
+    received: new Map(rows.map((r) => [r.collector, r.received_at])),
   };
+}
+
+/** The markers an earlier Worker kept per provider and PC (`provider/collector` -> time; values at or before it are not used) */
+async function loadWatermarks(db: D1Like): Promise<Map<string, string>> {
+  const { results } = await db
+    .prepare("SELECT provider, collector, until FROM boundary_watermarks")
+    .all<{ provider: string; collector: string; until: string }>();
+  return new Map(results.map((r) => [pcKey(r.provider, r.collector), r.until]));
+}
+
+/** Windows at or before an earlier Worker's marker for that PC are left out (with the limit flag of a provider that loses them) */
+export function belowMarks(snapshot: Snapshot, collector: string, marks: Map<string, string>): Snapshot {
+  if (marks.size === 0) return snapshot;
+  const providers: Snapshot["providers"] = {};
+  for (const [id, p] of Object.entries(snapshot.providers) as [string, Snapshot["providers"][keyof Snapshot["providers"]]][]) {
+    const until = marks.get(pcKey(id, collector));
+    if (!p || until === undefined) {
+      if (p) providers[id as "claude" | "codex"] = p;
+      continue;
+    }
+    const windows = p.windows.filter((w) => w.fetched_at !== null && w.fetched_at > until);
+    const fetchedOk = p.fetched_at !== null && p.fetched_at > until;
+    providers[id as "claude" | "codex"] = windows.length === p.windows.length && fetchedOk ? p : {
+      ...p, windows, fetched_at: windows.map((w) => w.fetched_at as string).sort()[0] ?? (fetchedOk ? p.fetched_at : null), blocked: null,
+    };
+  }
+  return { ...snapshot, providers };
 }
 
 export function applyBoundaries(snapshot: Snapshot, receivedAt: string, boundaries: Boundaries): Snapshot {
@@ -410,11 +452,14 @@ export function applyBoundaries(snapshot: Snapshot, receivedAt: string, boundari
       providers[id] = p;
       continue;
     }
-    // The PC that set the boundary: from its own acceptance time (its clock). Others: received after the boundary (a row kept by an
-    // earlier Worker may have been received before it) and stamped after the boundary plus the guard
+    // Every PC: received after the boundary (a row kept by an earlier Worker may have been received before it) and stamped after the
+    // boundary plus the guard. The PC that set the boundary may also show values from its own acceptance time (its clock) on, so its new
+    // account shows right after the acceptance; an acceptance time recorded while its clock ran ahead (later than the boundary, which is
+    // never after the received time) doesn't hide its values fetched after the clock was fixed
     const source = boundaries.setters.get(id) === collector ? boundaries.sources.get(pcKey(id, collector)) : undefined;
-    const from = source ?? guarded(since);
-    const after = (t: string | null) => t !== null && t >= from && (source !== undefined || receivedAt >= since);
+    const guard = guarded(since);
+    const after = (t: string | null) =>
+      t !== null && ((t >= guard && receivedAt >= since) || (source !== undefined && t >= source));
     const windows = p.windows.filter((w) => after(w.fetched_at));
     const providerAfter = after(p.fetched_at);
     if (windows.length === p.windows.length && providerAfter) {
@@ -484,6 +529,38 @@ export async function loadObservations(
 /** Counter of the merged latest value. public_state compares with this; derived values compare with per-provider counters */
 export const ALL_VERSION = "all";
 
+/**
+ * Advance the counter of the merged latest value from the value read before (a public value put without an upload). false if it moved
+ * meanwhile (an upload saved and puts its own value, which stands)
+ */
+export async function bumpAllVersion(db: D1Like, expected: number): Promise<boolean> {
+  const result = expected === 0
+    ? await db
+      .prepare(`INSERT INTO data_versions (provider, version) VALUES ('${ALL_VERSION}', 1)
+        ON CONFLICT (provider) DO UPDATE SET version = 1 WHERE data_versions.version = 0`)
+      .run()
+    : await db
+      .prepare(`UPDATE data_versions SET version = version + 1 WHERE provider = '${ALL_VERSION}' AND version = ?`)
+      .bind(expected)
+      .run();
+  return changes(result) > 0;
+}
+
+/**
+ * The data generation (moved on by the one-time cleanup after an upgrade). Derived values carry the generation they were computed in; one
+ * of another generation is not shown and is computed again (it may come from rows the cleanup removed)
+ */
+export async function readGeneration(db: D1Like): Promise<number> {
+  const row = await db.prepare("SELECT generation FROM data_generation WHERE id = 1").first<{ generation: number }>();
+  return Number(row?.generation ?? 0);
+}
+
+/** Whether this database was ever used (a PC saved something, also before an earlier Worker removed it): then no value is a withdrawal, not "no value yet" */
+export async function databaseUsed(db: D1Like): Promise<boolean> {
+  const row = await db.prepare("SELECT used FROM data_generation WHERE id = 1").first<{ used: number }>();
+  return Number(row?.used ?? 0) === 1;
+}
+
 export async function readDataVersion(db: D1Like, provider: ProviderId | typeof ALL_VERSION): Promise<number> {
   const row = await db
     .prepare("SELECT version FROM data_versions WHERE provider = ?")
@@ -518,11 +595,11 @@ export const stampOf = (stamps: BoundaryStamps | null | undefined, provider: Pro
 /** Per-provider saved derived-value counter and boundary stamp (decides whether Cron recomputes) */
 export async function loadDerivedVersions(
   db: D1Like,
-): Promise<Map<string, { version: number; boundary: string; basis: string | null }>> {
+): Promise<Map<string, { version: number; boundary: string; basis: string | null; generation: number }>> {
   const { results } = await db
-    .prepare("SELECT provider, version, boundary, basis FROM derived_metrics")
-    .all<{ provider: string; version: number; boundary: string | null; basis: string | null }>();
-  return new Map(results.map((r) => [r.provider, { version: Number(r.version), boundary: r.boundary ?? "", basis: r.basis }]));
+    .prepare("SELECT provider, version, boundary, basis, generation FROM derived_metrics")
+    .all<{ provider: string; version: number; boundary: string | null; basis: string | null; generation: number }>();
+  return new Map(results.map((r) => [r.provider, { version: Number(r.version), boundary: r.boundary ?? "", basis: r.basis, generation: Number(r.generation) }]));
 }
 
 /**
@@ -539,11 +616,11 @@ export async function savePublicState(
   const result = await db
     .prepare(
       // Take the current boundaries from the table at write time (if another upload moved them after reading, don't put old boundaries as "current")
-      `INSERT INTO public_state (id, version, body, boundaries, current_boundaries)
-       SELECT 1, ?, ?, ?, (${CURRENT_BOUNDARIES_SQL})
+      `INSERT INTO public_state (id, version, body, boundaries, current_boundaries, writer)
+       SELECT 1, ?, ?, ?, (${CURRENT_BOUNDARIES_SQL}), ${WRITER}
        WHERE coalesce((SELECT version FROM data_versions WHERE provider = '${ALL_VERSION}'), 0) = ?
        ON CONFLICT (id) DO UPDATE SET version = excluded.version, body = excluded.body, boundaries = excluded.boundaries,
-         current_boundaries = excluded.current_boundaries`,
+         current_boundaries = excluded.current_boundaries, writer = excluded.writer`,
     )
     .bind(version, JSON.stringify(snapshot), JSON.stringify(boundaries), version)
     .run();
@@ -617,9 +694,46 @@ export async function loadPublicState(db: D1Like): Promise<Snapshot | null> {
  * Saved derived values. Given `boundaries` (the boundaries at read time), derived values of providers computed under a different boundary are removed
  * (don't show the previous account's forecast)
  */
+/**
+ * The public row and the derived values of the current generation, read in one statement (one consistent read: a body read before the
+ * upgrade cleanup is never paired with derived values computed after it). null without a public row
+ */
+export async function loadPublicView(db: D1Like): Promise<{ row: PublicRow; derived: { provider: string; body: string; boundary: string | null }[] } | null> {
+  const r = await db
+    .prepare(
+      `SELECT p.version, p.body, p.boundaries, p.current_boundaries, p.current_version,
+         (SELECT json_group_array(json_object('provider', d.provider, 'body', d.body, 'boundary', d.boundary)) FROM derived_metrics d
+           WHERE d.generation = (SELECT generation FROM data_generation WHERE id = 1)) AS derived
+       FROM public_state p WHERE p.id = 1`,
+    )
+    .first<{ version: number; body: string; boundaries: string | null; current_boundaries: string | null; current_version: number | null; derived: string | null }>();
+  if (!r) return null;
+  return {
+    row: {
+      version: Number(r.version),
+      dataVersion: dataVersionOf(Number(r.version), Number(r.current_version ?? 0)),
+      snapshot: JSON.parse(r.body) as Snapshot,
+      boundaries: parseStamps(r.boundaries),
+      current: parseStamps(r.current_boundaries),
+    },
+    derived: JSON.parse(r.derived ?? "[]"),
+  };
+}
+
+/** Derived values of the rows given, only those computed under the boundaries given (as loadDerived) */
+export function metricsOf(rows: { provider: string; body: string; boundary: string | null }[], boundaries?: BoundaryStamps): MetricsCache {
+  const out: MetricsCache = {};
+  for (const r of rows) {
+    if (r.provider !== "claude" && r.provider !== "codex") continue;
+    if (boundaries && (r.boundary ?? "") !== stampOf(boundaries, r.provider)) continue;
+    out[r.provider] = JSON.parse(r.body);
+  }
+  return out;
+}
+
 export async function loadDerived(db: D1Like, boundaries?: BoundaryStamps): Promise<MetricsCache> {
   const { results } = await db
-    .prepare("SELECT provider, body, boundary FROM derived_metrics")
+    .prepare(`SELECT provider, body, boundary FROM derived_metrics WHERE generation = (SELECT generation FROM data_generation WHERE id = 1)`)
     .all<{ provider: string; body: string; boundary: string | null }>();
   const out: MetricsCache = {};
   for (const r of results) {
@@ -844,20 +958,26 @@ export async function saveDerived(
   basis: string | null = null,
   /** Counter of the latest-value row used for computation */
   publicVersion = 0,
+  /** Data generation read before reading anything this computation used */
+  generation = 0,
 ): Promise<void> {
   // An old computation never overwrites a newer one
   // Only a computation with neither counter below the saved ones replaces it. A computation whose two counters disagree in age (newer observations
   // but older latest value, etc.) doesn't replace. Both counters only increase, so the next Cron computing with the current counters always replaces
   await db
     .prepare(
-      `INSERT INTO derived_metrics (provider, computed_at, version, body, boundary, basis, public_version)
-       VALUES (?, ?, ?, ?, ?, ?, ?)
+      // Put only while the generation read before computing is current (a computation that read rows the cleanup removed never saves,
+      // also as a first row). Within a generation, the counters decide; a row of an older generation is replaced whatever its counters
+      `INSERT INTO derived_metrics (provider, computed_at, version, body, boundary, basis, public_version, generation)
+       SELECT ?, ?, ?, ?, ?, ?, ?, ? WHERE (SELECT generation FROM data_generation WHERE id = 1) = ?
        ON CONFLICT (provider) DO UPDATE SET computed_at = excluded.computed_at, version = excluded.version,
-         body = excluded.body, boundary = excluded.boundary, basis = excluded.basis, public_version = excluded.public_version
-       WHERE excluded.version >= derived_metrics.version
-         AND coalesce(excluded.public_version, 0) >= coalesce(derived_metrics.public_version, 0)`,
+         body = excluded.body, boundary = excluded.boundary, basis = excluded.basis, public_version = excluded.public_version,
+         generation = excluded.generation
+       WHERE derived_metrics.generation < excluded.generation
+         OR (derived_metrics.generation = excluded.generation AND excluded.version >= derived_metrics.version
+           AND coalesce(excluded.public_version, 0) >= coalesce(derived_metrics.public_version, 0))`,
     )
-    .bind(provider, computedAt.toISOString(), version, JSON.stringify(metrics), boundary, basis, publicVersion)
+    .bind(provider, computedAt.toISOString(), version, JSON.stringify(metrics), boundary, basis, publicVersion, generation, generation)
     .run();
 }
 
@@ -867,7 +987,7 @@ export async function loadWeekly(
   provider: ProviderId,
 ): Promise<{ series: SeriesPoint[]; boundary: string; builtHour: string } | null> {
   const row = await db
-    .prepare("SELECT body, boundary, built_hour FROM derived_weekly WHERE provider = ?")
+    .prepare(`SELECT body, boundary, built_hour FROM derived_weekly WHERE provider = ? AND generation = (SELECT generation FROM data_generation WHERE id = 1)`)
     .bind(provider)
     .first<{ body: string; boundary: string; built_hour: string }>();
   return row ? { series: JSON.parse(row.body) as SeriesPoint[], boundary: row.boundary, builtHour: row.built_hour } : null;
@@ -900,18 +1020,30 @@ export async function loadHourly(
 /** Max aggregate rows read per call (7 days = 168 hours plus margin) */
 export const HOURLY_READ_LIMIT = 200;
 
-export async function saveWeekly(db: D1Like, provider: ProviderId, series: SeriesPoint[], boundary: string, builtHour: string, at: Date): Promise<void> {
+export async function saveWeekly(
+  db: D1Like,
+  provider: ProviderId,
+  series: SeriesPoint[],
+  boundary: string,
+  builtHour: string,
+  at: Date,
+  /** Data generation read before reading the representatives */
+  generation = 0,
+): Promise<void> {
   // Don't put if the boundary moved during computation (differs from the current stamp) or it's an old late-finishing computation (time before the saved one)
   const current = `coalesce(json_extract((SELECT coalesce(current_boundaries, boundaries) FROM public_state WHERE id = 1), '$.' || ?), '')`;
   await db
     .prepare(
-      `INSERT INTO derived_weekly (provider, body, boundary, built_hour, computed_at)
-       SELECT ?, ?, ?, ?, ? WHERE ? = ${current}
+      // And only while the generation read before reading the representatives is current (also as a first row); a series of an older
+      // generation is replaced whatever its time
+      `INSERT INTO derived_weekly (provider, body, boundary, built_hour, computed_at, generation)
+       SELECT ?, ?, ?, ?, ?, ? WHERE ? = ${current} AND (SELECT generation FROM data_generation WHERE id = 1) = ?
        ON CONFLICT (provider) DO UPDATE SET body = excluded.body, boundary = excluded.boundary,
-         built_hour = excluded.built_hour, computed_at = excluded.computed_at
-       WHERE excluded.computed_at >= derived_weekly.computed_at`,
+         built_hour = excluded.built_hour, computed_at = excluded.computed_at, generation = excluded.generation
+       WHERE derived_weekly.generation < excluded.generation
+         OR (derived_weekly.generation = excluded.generation AND excluded.computed_at >= derived_weekly.computed_at)`,
     )
-    .bind(provider, JSON.stringify(series), boundary, builtHour, at.toISOString(), boundary, provider)
+    .bind(provider, JSON.stringify(series), boundary, builtHour, at.toISOString(), generation, boundary, provider, generation)
     .run();
 }
 

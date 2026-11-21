@@ -32,6 +32,17 @@ pub trait Provider {
     fn hold_fetch_until(&mut self, _until_ms: i64) -> bool {
         false
     }
+    /// Forget the values cached so far (the destination refused this PC's clock: they were stamped by it, and one hidden behind a newer
+    /// value of the same window could come back later). false if that couldn't be saved (tried again). Default: nothing cached beyond
+    /// what the latest values show
+    fn forget_cached(&mut self) -> bool {
+        true
+    }
+    /// Whether a round can take passive values (statusLine etc.) besides fetching. Such a round is held from fetching on its own
+    /// (the agent checks the fetch turn first). Default false
+    fn takes_passive_values(&self) -> bool {
+        false
+    }
     /// Time of the last query attempt. Used to notice fetches the provider made on its own, outside the scheduler
     /// (e.g. a fetch following the version check right after startup). Default None (only scheduled fetches count)
     fn last_fetch_attempt_ms(&self) -> Option<i64> {
@@ -39,4 +50,9 @@ pub trait Provider {
     }
     /// Accept an account switch and resume fetching (manual `--accept-account`). Default: no-op
     fn accept_account(&mut self) {}
+    /// After a collect with an acceptance: Some(true) if the switch was accepted and saved, Some(false) if not, None if this provider
+    /// doesn't say
+    fn account_accepted(&self) -> Option<bool> {
+        None
+    }
 }

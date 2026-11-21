@@ -3,13 +3,22 @@ import { readFileSync, readdirSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { test } from "node:test";
 import { nextSendSeq, type Snapshot } from "../../core/src/index.ts";
-import { MAX_COLLECTORS, parseTokens, sha256Hex } from "../src/auth.ts";
-import { handle, refreshDerived, repairPublicState, runCron, type Env } from "../src/index.ts";
+import { AGENT_PROTOCOL, MAX_COLLECTORS, parseTokens, sha256Hex } from "../src/auth.ts";
+import { handle as handleRequest, refreshDerived, repairPublicState, runCron, type Env } from "../src/index.ts";
 import { DAILY_BUDGET, MIN_BUDGET_PERCENT, RESERVE, budgetLimit, daysToReserve, endOfDays, reserve, settle } from "../src/budget.ts";
 import { MAX_WINDOWS, WITHHELD_ERROR } from "../src/sanitize.ts";
 import { sanitizeUpload } from "../src/sanitize.ts";
 import { EVENT_FEED_SQL, MAX_STORED_COLLECTORS, PRUNE_EVENTS, PRUNE_ROWS, dataVersionOf, loadObservations, loadPublicRow, prune, rebuildEventFeed, saveDerived, savePublicState, saveUpload, saveWeekly, loadWeekly, type D1Like } from "../src/store.ts";
 import { sqliteD1 } from "./d1-sqlite.ts";
+
+/** The Worker's handler, as reached by an agent of this protocol (a test that sets the header itself keeps its value) */
+const handle: typeof handleRequest = (request, env, now) => {
+  if (!request.headers.has("headroom-protocol")) request.headers.set("headroom-protocol", AGENT_PROTOCOL);
+  return handleRequest(request, env, now);
+};
+
+/** The one-time cleanup run after deploying this version (upgrade/after-deploy.sql) */
+const cleanup = () => readFileSync(new URL("../upgrade/after-deploy.sql", import.meta.url), "utf8");
 
 const READ = "read-token-for-iphone-0123456789";
 const MAC = "write-token-for-mac-0123456789ab";
@@ -507,20 +516,38 @@ test("an acceptance time ahead of the received time (recorded while the clock ra
 });
 
 test("a later acceptance that lands on the same boundary time becomes the setting PC", async () => {
-  const { call } = await setup();
-  // mac accepts a switch at 11:59:40 (received 12:00) and fetches 94% of that account
-  const first = snapAt("2026-11-16T12:00:00.000Z");
-  first.providers.claude!.history_since = "2026-11-16T11:59:40.000Z";
+  const { call, raw } = await setup();
+  // both acceptances, receipts and fetches at exactly 12:00 (the boundary time is the same, so only >= keeps the later one)
+  const at = "2026-11-16T12:00:00.000Z";
+  const first = snapAt(at);
+  first.providers.claude!.history_since = at;
   first.providers.claude!.windows[0]!.used_percent = 94;
-  await call("PUT", "/v2/snapshots/mac", MAC, upload(1, first), new Date("2026-11-16T12:00:00Z"));
-  // win-desktop accepts the next switch; its boundary is held to the same received time 12:00
-  const second = snapAt("2026-11-16T12:00:00.000Z");
-  second.providers.claude!.history_since = "2026-11-16T12:00:30.000Z";
+  assert.equal((await call("PUT", "/v2/snapshots/mac", MAC, upload(1, first), new Date(at))).status, 204);
+  const second = snapAt(at);
+  second.providers.claude!.history_since = at;
   second.providers.claude!.windows[0]!.used_percent = 7;
-  await call("PUT", "/v2/snapshots/win-desktop", WIN, upload(1, second), new Date("2026-11-16T12:00:00Z"));
+  assert.equal((await call("PUT", "/v2/snapshots/win-desktop", WIN, upload(1, second), new Date(at))).status, 204);
+  assert.deepEqual(raw.prepare("SELECT since, collector FROM history_boundaries WHERE provider = 'claude'").all().map((r) => ({ ...r })),
+    [{ since: at, collector: "win-desktop" }], "the later acceptance at the same time sets the boundary");
   const merged = (await (await call("GET", "/v2/snapshot", READ, undefined, new Date("2026-11-16T12:01:00Z"))).json()) as Snapshot;
   assert.equal(merged.providers.claude?.collector, "win-desktop");
+  assert.equal(merged.providers.claude?.windows.some((w) => w.used_percent === 7), true, "the setting PC's own 7% from its acceptance time");
   assert.equal(merged.providers.claude?.windows.some((w) => w.used_percent === 94), false);
+});
+
+test("a PC that accepted while its clock ran ahead shows its values fetched after the clock was fixed", async () => {
+  const { call } = await setup();
+  // The switch was accepted at 18:00 on a clock six hours ahead; the clock was fixed before sending (received 12:01)
+  const accepted = snapAt("2026-11-16T12:01:00.000Z");
+  accepted.providers.claude!.history_since = "2026-11-16T18:00:00.000Z";
+  assert.equal((await call("PUT", "/v2/snapshots/mac", MAC, upload(1, accepted), new Date("2026-11-16T12:01:00Z"))).status, 204);
+  // A new fetch at 12:10 of the new account
+  const later = snapAt("2026-11-16T12:10:00.000Z");
+  later.providers.claude!.history_since = "2026-11-16T18:00:00.000Z";
+  later.providers.claude!.windows[0]!.used_percent = 12;
+  assert.equal((await call("PUT", "/v2/snapshots/mac", MAC, upload(2, later), new Date("2026-11-16T12:10:00Z"))).status, 204);
+  const merged = (await (await call("GET", "/v2/snapshot", READ, undefined, new Date("2026-11-16T12:11:00Z"))).json()) as Snapshot;
+  assert.equal(merged.providers.claude?.windows.some((w) => w.used_percent === 12), true, "not hidden until 18:00");
 });
 
 test("a re-acceptance raised to the received time keeps the accepting PC's own new windows", async () => {
@@ -571,14 +598,21 @@ test("a latest value an earlier Worker kept from before a switch is not shown ag
   assert.equal(merged.providers.claude?.windows.some((w) => w.used_percent === 94), false);
 });
 
-test("when every PC's latest value is past retention, the merged value is no longer shown", async () => {
+test("when every PC's latest value is past retention, the merged value is withdrawn as an empty one under a newer version", async () => {
   const { call, env } = await setup();
   await call("PUT", "/v2/snapshots/mac", MAC, upload(1, fixture()));
-  assert.equal((await call("GET", "/v2/snapshot", READ)).status, 200);
+  const before = ((await (await call("GET", "/v2/view", READ)).json()) as { data_version: number }).data_version;
   const later = new Date(NOW.getTime() + 32 * 24 * 3_600_000);
   await runCron(env, later);
   await runCron(env, later);
-  assert.equal((await call("GET", "/v2/snapshot", READ, undefined, later)).status, 404);
+  const res = await call("GET", "/v2/view", READ, undefined, later);
+  assert.equal(res.status, 200);
+  const view = (await res.json()) as { claude: unknown; codex: unknown; data_version: number };
+  assert.deepEqual([view.claude, view.codex], [null, null]);
+  assert.ok(view.data_version > before, "newer than what an iPhone saved");
+  // withdrawn once: later Crons write nothing more
+  await runCron(env, later);
+  assert.equal(((await (await call("GET", "/v2/view", READ, undefined, later)).json()) as { data_version: number }).data_version, view.data_version);
 });
 
 test("a resent current value without observations doesn't bring back windows removed by the boundary", async () => {
@@ -1401,7 +1435,7 @@ function countQueries(db: D1Like): { db: D1Like; queries: () => number } {
 test("Cloudflare free plan: at most 50 D1 queries per invocation (heavy cases of upload, turn, GET, Cron)", async () => {
   const { raw, env } = await setup();
   // Give both providers history beyond the computation limit (5,000 items) and old observations to be deleted
-  const ins = raw.prepare("INSERT INTO observations VALUES (?,?,?,?,?,?,?)");
+  const ins = raw.prepare("INSERT INTO observations (provider, window_id, collector, observed_at, first_received_at, resets_at, used_percent) VALUES (?,?,?,?,?,?,?)");
   raw.exec("BEGIN");
   for (const p of ["claude", "codex"]) {
     for (let i = 0; i < 6000; i++) {
@@ -2110,13 +2144,13 @@ test("a computation whose provider counter and latest-value row counter disagree
   const { env, raw } = await setup();
   const metrics = (used: number) => ({ five_hour: { fetched_at: null, resets_at: null, used_percent: used, metrics: {} } }) as never;
   // Computed from the new latest value (counter 2): provider counter 1
-  await saveDerived(env.DB, "claude", metrics(90), 1, NOW, "", null, 2);
+  await saveDerived(env.DB, "claude", metrics(90), 1, NOW, "", null, 2, 1);
   // Computed from the old latest value (counter 1): provider counter 2 (newer observations but older latest value)
-  await saveDerived(env.DB, "claude", metrics(10), 2, NOW, "", null, 1);
+  await saveDerived(env.DB, "claude", metrics(10), 2, NOW, "", null, 1, 1);
   const body = JSON.parse((raw.prepare("SELECT body FROM derived_metrics WHERE provider = 'claude'").get() as { body: string }).body);
   assert.equal(body.five_hour.used_percent, 90);
   // A computation with neither counter smaller (the next Cron) replaces it
-  await saveDerived(env.DB, "claude", metrics(91), 2, NOW, "", null, 2);
+  await saveDerived(env.DB, "claude", metrics(91), 2, NOW, "", null, 2, 1);
   assert.equal(JSON.parse((raw.prepare("SELECT body FROM derived_metrics WHERE provider = 'claude'").get() as { body: string }).body).five_hour.used_percent, 91);
 });
 
@@ -2192,7 +2226,7 @@ test("old-format derived values (without rate_pace) are recomputed by the next C
     if (v && typeof v === "object") return Object.fromEntries(Object.entries(v).filter(([k]) => k !== "rate_pace").map(([k, x]) => [k, drop(x)]));
     return v;
   };
-  assert.match(row.basis, /^2:/, "format version in the basis");
+  assert.match(row.basis, /^3:/, "format version in the basis");
   raw.prepare("UPDATE derived_metrics SET body = ?, basis = ? WHERE provider = 'claude'").run(JSON.stringify(drop(JSON.parse(row.body))), row.basis.replace(/^\d+:/, ""));
   const view = async () => ((await (await call("GET", "/v2/view", READ)).json()) as { claude: { windows: Record<string, Record<string, unknown>> } }).claude.windows.five_hour!;
   assert.equal("rate_pace" in (await view()), false, "still the old format");
@@ -2288,10 +2322,10 @@ test("late-finishing old computations and computations after a boundary move don
   const { call, db } = await setup();
   await call("PUT", "/v2/snapshots/win-desktop", WIN, upload(1, fixture(), [weekObs(10, "2026-11-16T12:30:00.000Z")]));
   const point = (used: number) => [{ at: "2026-11-16T12:30:00.000Z", used_percent: used, resets_at: null, break: null }];
-  await saveWeekly(db, "claude", point(12), "", "2026-11-16T12", new Date("2026-11-16T12:00:00Z"));
-  await saveWeekly(db, "claude", point(11), "", "2026-11-16T11", new Date("2026-11-16T11:55:00Z"));
+  await saveWeekly(db, "claude", point(12), "", "2026-11-16T12", new Date("2026-11-16T12:00:00Z"), 1);
+  await saveWeekly(db, "claude", point(11), "", "2026-11-16T11", new Date("2026-11-16T11:55:00Z"), 1);
   assert.equal((await loadWeekly(db, "claude"))!.series[0]!.used_percent, 12, "an old computation doesn't replace");
-  await saveWeekly(db, "claude", point(99), "2026-11-16T12:00:00.000Z#9", "2026-11-16T13", new Date("2026-11-16T13:00:00Z"));
+  await saveWeekly(db, "claude", point(99), "2026-11-16T12:00:00.000Z#9", "2026-11-16T13", new Date("2026-11-16T13:00:00Z"), 1);
   assert.equal((await loadWeekly(db, "claude"))!.series[0]!.used_percent, 12, "a computation with a stamp differing from the current boundary is not put");
 });
 
@@ -2612,5 +2646,447 @@ test("a merged value left after an earlier Worker already deleted every PC's lat
   raw.exec("DELETE FROM collector_snapshots");
   assert.equal((await call("GET", "/v2/snapshot", READ)).status, 200);
   await runCron(env, NOW);
-  assert.equal((await call("GET", "/v2/snapshot", READ)).status, 404);
+  const snap = (await (await call("GET", "/v2/snapshot", READ)).json()) as Snapshot;
+  assert.deepEqual(snap.providers, {}, "withdrawn: no provider's value is left");
+});
+
+test("a PC row an earlier Worker kept from a clock off is not merged again; values stamped after its send time neither", async () => {
+  const { call, raw, db, env } = await setup();
+  const at = new Date("2026-11-16T12:00:00Z");
+  await call("PUT", "/v2/snapshots/mac", MAC, upload(1, snapAt("2026-11-16T11:59:00.000Z")), at);
+  const view = async () => (await (await call("GET", "/v2/view", READ, undefined, at)).json()) as { claude: { windows: Record<string, unknown> } | null };
+  assert.ok(Object.keys((await view()).claude?.windows ?? {}).length > 0);
+  // what an earlier Worker could have kept: a row sent 22 minutes ahead of its receipt
+  const ahead = snapAt("2026-11-16T12:21:00.000Z");
+  raw.prepare("UPDATE collector_snapshots SET snapshot = ? WHERE collector = 'mac'").run(JSON.stringify(ahead));
+  const versionOf = async () => ((await (await call("GET", "/v2/view", READ, undefined, at)).json()) as { data_version: number }).data_version;
+  const before = await versionOf();
+  await repairPublicState(db, env);
+  const gone = (await (await call("GET", "/v2/view", READ, undefined, at)).json()) as { claude: unknown; data_version: number };
+  assert.equal(gone.claude, null, "no PC row today's rules use: withdrawn, with no PC sending");
+  assert.ok(gone.data_version > before, "under a newer version (an iPhone replaces what it saved)");
+  // a row within the tolerance, with one window stamped after its send time
+  const row = snapAt("2026-11-16T12:00:00.000Z");
+  row.providers.claude!.windows[0]!.fetched_at = "2026-11-16T12:01:00.000Z";
+  raw.prepare("UPDATE collector_snapshots SET snapshot = ? WHERE collector = 'mac'").run(JSON.stringify(row));
+  await repairPublicState(db, env);
+  const shown = (await view()).claude?.windows ?? {};
+  assert.ok(!(row.providers.claude!.windows[0]!.id in shown), "the window stamped after the send time is left out");
+  assert.ok(row.providers.claude!.windows.slice(1).every((w) => w.id in shown), "its other windows are shown again");
+  assert.ok((await versionOf()) > before, "under a new data version");
+});
+
+test("an earlier Worker's markers keep its removed observations and values out (resends and saved rows)", async () => {
+  const { call, raw, db, env } = await setup();
+  const at = new Date("2026-11-16T12:30:00Z");
+  raw.prepare("INSERT INTO boundary_watermarks (provider, collector, until) VALUES ('claude', 'mac', '2026-11-16T12:10:00.000Z')").run();
+  await call("PUT", "/v2/snapshots/mac", MAC, upload(1, snapAt("2026-11-16T12:30:00.000Z"),
+    [obs("five_hour", 50, "2026-11-16T12:05:00.000Z"), obs("five_hour", 55, "2026-11-16T12:20:00.000Z")]), at);
+  const stored = raw.prepare("SELECT observed_at FROM observations WHERE collector = 'mac' ORDER BY observed_at").all().map((r: any) => r.observed_at);
+  assert.deepEqual(stored, ["2026-11-16T12:20:00.000Z"], "the resend at or before the marker isn't stored");
+  // a saved row with windows at or before the marker
+  raw.prepare("UPDATE collector_snapshots SET snapshot = ? WHERE collector = 'mac'").run(JSON.stringify(snapAt("2026-11-16T12:10:00.000Z")));
+  raw.prepare("UPDATE collector_snapshots SET received_at = '2026-11-16T12:10:00.000Z' WHERE collector = 'mac'").run();
+  await repairPublicState(db, env);
+  const view = (await (await call("GET", "/v2/view", READ, undefined, at)).json()) as { claude: { windows: Record<string, unknown> } | null };
+  assert.equal(Object.keys(view.claude?.windows ?? {}).length, 0);
+});
+
+test("the cleanup removes what an earlier Worker kept that today's rules don't accept, each rule on its own", () => {
+  const raw = new DatabaseSync(":memory:");
+  const dir = new URL("../migrations/", import.meta.url);
+  const names = readdirSync(dir).filter((n) => n.endsWith(".sql")).sort();
+  for (const n of names.filter((n) => n < "0014")) raw.exec(readFileSync(new URL(n, dir), "utf8"));
+  // a boundary at 11:50 (guard to 11:55) for claude, and a marker for codex on win-desktop until 12:20
+  raw.prepare("INSERT INTO history_boundaries (provider, since, collector) VALUES ('claude', '2026-11-16T11:50:00.000Z', 'mac')").run();
+  raw.prepare("INSERT INTO boundary_watermarks (provider, collector, until) VALUES ('codex', 'win-desktop', '2026-11-16T12:20:00.000Z')").run();
+  const add = raw.prepare(`INSERT INTO observations (provider, window_id, collector, observed_at, first_received_at, resets_at, used_percent)
+    VALUES (?, 'five_hour', ?, ?, ?, NULL, 10)`);
+  const rows: [string, string, string, string, boolean][] = [
+    // provider, PC, observed, first received, kept
+    ["codex", "mac", "2026-11-16T12:03:01.000Z", "2026-11-16T12:00:00.000Z", false], // more than 2 minutes after its receipt
+    ["codex", "mac", "2026-11-16T12:01:30.000Z", "2026-11-16T12:00:00.000Z", true], // within 2 minutes: a clock today's Worker accepts
+    ["codex", "win-desktop", "2026-11-16T12:10:00.000Z", "2026-11-16T12:10:05.000Z", false], // at or before the marker
+    ["codex", "win-desktop", "2026-11-16T12:25:00.000Z", "2026-11-16T12:25:05.000Z", true], // after the marker
+    ["codex", "mac", "2026-11-16T12:10:00.000Z", "2026-11-16T12:10:05.000Z", true], // the marker is another PC's
+    ["claude", "mac", "2026-11-16T11:52:00.000Z", "2026-11-16T11:58:00.000Z", false], // stamped within the guard after the boundary
+    ["claude", "mac", "2026-11-16T11:57:00.000Z", "2026-11-16T11:49:00.000Z", false], // received before the boundary
+    ["claude", "mac", "2026-11-16T11:56:00.000Z", "2026-11-16T11:56:05.000Z", true], // after the guard
+  ];
+  for (const [p, c, o, r] of rows) add.run(p, c, o, r);
+  const hourly = raw.prepare(`INSERT INTO observation_hourly (provider, window_id, hour, used_percent, resets_at, observed_at, effective_at, first_received_at, collector, priority)
+    VALUES (?, 'seven_day', ?, 10, NULL, ?, ?, ?, ?, 0)`);
+  const reps: [string, string, string, string, string, boolean][] = [
+    ["codex", "2026-11-16T09", "2026-11-16T09:03:01.000Z", "2026-11-16T09:00:00.000Z", "mac", false],
+    ["codex", "2026-11-16T10", "2026-11-16T10:01:30.000Z", "2026-11-16T10:00:00.000Z", "mac", true],
+    ["codex", "2026-11-16T11", "2026-11-16T11:10:00.000Z", "2026-11-16T11:10:05.000Z", "win-desktop", false],
+    ["claude", "2026-11-16T11", "2026-11-16T11:52:00.000Z", "2026-11-16T11:58:00.000Z", "mac", false],
+    ["claude", "2026-11-16T12", "2026-11-16T12:00:00.000Z", "2026-11-16T12:00:05.000Z", "mac", true],
+  ];
+  for (const [p, h, o, r, c] of reps) hourly.run(p, h, o, o < r ? o : r, r, c);
+  for (const n of names.filter((n) => n >= "0014")) raw.exec(readFileSync(new URL(n, dir), "utf8"));
+  raw.exec(cleanup());
+  const left = new Set(raw.prepare("SELECT provider || ' ' || collector || ' ' || observed_at AS k FROM observations").all().map((r: any) => r.k));
+  for (const [p, c, o, , kept] of rows) assert.equal(left.has(`${p} ${c} ${o}`), kept, `${p} ${c} ${o}`);
+  const leftHours = new Set(raw.prepare("SELECT provider || ' ' || hour AS k FROM observation_hourly").all().map((r: any) => r.k));
+  for (const [p, h, , , , kept] of reps) assert.equal(leftHours.has(`${p} ${h}`), kept, `${p} ${h}`);
+});
+
+test("the cleanup cuts a marker recorded by a clock ahead to now, and has the weekly series built again", () => {
+  const raw = new DatabaseSync(":memory:");
+  const dir = new URL("../migrations/", import.meta.url);
+  const names = readdirSync(dir).filter((n) => n.endsWith(".sql")).sort();
+  for (const n of names.filter((n) => n < "0014")) raw.exec(readFileSync(new URL(n, dir), "utf8"));
+  raw.prepare("INSERT INTO boundary_watermarks (provider, collector, until) VALUES ('claude', 'mac', '2999-01-01T00:00:00.000Z')").run();
+  raw.prepare("INSERT INTO boundary_watermarks (provider, collector, until) VALUES ('codex', 'mac', '2026-11-16T12:00:00.000Z')").run();
+  raw.prepare("INSERT INTO derived_weekly (provider, body, boundary, built_hour, computed_at) VALUES ('claude', '{}', '', '2026-11-16T12', '2026-11-16T12:00:00.000Z')").run();
+  for (const n of names.filter((n) => n >= "0014")) raw.exec(readFileSync(new URL(n, dir), "utf8"));
+  raw.exec(cleanup());
+  const until = (p: string) => (raw.prepare("SELECT until FROM boundary_watermarks WHERE provider = ?").get(p) as { until: string }).until;
+  assert.ok(until("claude") < "2999", "cut to now");
+  assert.equal(until("codex"), "2026-11-16T12:00:00.000Z", "a marker in the past stays");
+  const weekly = raw.prepare("SELECT generation FROM derived_weekly").all() as { generation: number }[];
+  const current = (raw.prepare("SELECT generation FROM data_generation").get() as { generation: number }).generation;
+  assert.ok(weekly.every((w) => w.generation < current), "of an older generation: not shown, built again");
+});
+
+test("a PC row only an earlier Worker kept from a clock off leaves nothing behind (no state, no liveness, no public value)", async () => {
+  const { call, raw, db, env } = await setup();
+  const at = new Date("2026-11-16T12:00:00Z");
+  const s = snapAt("2026-11-16T11:59:00.000Z");
+  s.providers.claude!.error_code = "login_required";
+  s.providers.claude!.error = "Sign in required";
+  await call("PUT", "/v2/snapshots/mac", MAC, upload(1, s), at);
+  const ahead = { ...s, generated_at: "2026-11-16T13:00:00.000Z" };
+  raw.prepare("UPDATE collector_snapshots SET snapshot = ? WHERE collector = 'mac'").run(JSON.stringify(ahead));
+  await repairPublicState(db, env);
+  const left = raw.prepare("SELECT body FROM public_state").get() as { body: string };
+  assert.deepEqual(JSON.parse(left.body).providers, {}, "no provider's value (and no error state) is left");
+});
+
+// ---- Guarantees G1 and G2: each counterexample with its control
+const migration0014 = cleanup;
+const rateOf = async (call: Awaited<ReturnType<typeof setup>>["call"], at = NOW) =>
+  (((await (await call("GET", "/v2/view", READ, undefined, at)).json()) as { claude: { windows: Record<string, { rate_60m: number | null }> } | null }).claude?.windows.five_hour?.rate_60m ?? null);
+
+test("G1-a: removed observations leave no speed behind (at once after the migration, after the next Cron, and against a late save)", async () => {
+  // every 5 minutes for the last hour, 1% at a time
+  const good = Array.from({ length: 12 }, (_, i) => obs("five_hour", i, new Date(Date.parse("2026-11-16T11:59:00.000Z") + i * 5 * 60_000).toISOString()));
+  // the control: the speed from the kept observations alone
+  const control = await setup();
+  await control.call("PUT", "/v2/snapshots/win-desktop", WIN, upload(1, fixture(), good));
+  await runCron(control.env, NOW);
+  const expected = await rateOf(control.call);
+  // an earlier Worker kept an observation stamped 5 minutes after its receipt, which changes the speed
+  const { call, env, raw, db } = await setup();
+  await call("PUT", "/v2/snapshots/win-desktop", WIN, upload(1, fixture(), good));
+  raw.prepare(`INSERT INTO observations (provider, window_id, collector, observed_at, first_received_at, resets_at, used_percent)
+    VALUES ('claude', 'five_hour', 'win-desktop', '2026-11-16T12:52:00.000Z', '2026-11-16T12:46:00.000Z', '2026-11-16T16:00:00.000Z', 60)`).run();
+  await runCron(env, NOW);
+  const polluted = await rateOf(call);
+  assert.notEqual(expected, null, "the kept observations give a speed");
+  assert.notEqual(polluted, expected, "the old observation changes the speed (the case is real)");
+  const stale = raw.prepare("SELECT version, body, boundary, basis, public_version FROM derived_metrics WHERE provider = 'claude'").get() as any;
+  raw.exec(migration0014());
+  assert.equal(await rateOf(call), null, "right after the migration: no speed until it is computed again");
+  // a Cron that read the observations before the migration saves after it
+  await saveDerived(db, "claude", JSON.parse(stale.body), stale.version, NOW, stale.boundary, stale.basis, stale.public_version, 1);
+  assert.equal(await rateOf(call), null, "a late save of the old computation doesn't come back");
+  await runCron(env, NOW);
+  assert.equal(await rateOf(call), expected, "the next Cron, with no upload: the speed of the kept observations");
+
+  // The first save of all comes only after the migration (no row before it): its counter, read before, is older
+  const first = await setup();
+  await first.call("PUT", "/v2/snapshots/win-desktop", WIN, upload(1, fixture(), good));
+  first.raw.prepare(`INSERT INTO observations (provider, window_id, collector, observed_at, first_received_at, resets_at, used_percent)
+    VALUES ('claude', 'five_hour', 'win-desktop', '2026-11-16T12:52:00.000Z', '2026-11-16T12:46:00.000Z', '2026-11-16T16:00:00.000Z', 60)`).run();
+  const readBefore = (first.raw.prepare("SELECT version FROM data_versions WHERE provider = 'claude'").get() as { version: number }).version;
+  first.raw.exec("DELETE FROM derived_metrics");
+  first.raw.exec(migration0014());
+  await saveDerived(first.db, "claude", JSON.parse(stale.body), readBefore, NOW, stale.boundary, stale.basis, stale.public_version, 1);
+  assert.equal(await rateOf(first.call), null, "a late first save of the old computation doesn't come back");
+  await runCron(first.env, NOW);
+  assert.equal(await rateOf(first.call), expected);
+});
+
+test("G1-c: after the migration, the same PC's new fetches on a fixed clock are taken into history and speed", async () => {
+  const { call, env, raw } = await setup();
+  // a marker recorded by a clock far ahead; the migration cuts it to now (the real clock)
+  raw.prepare("INSERT INTO boundary_watermarks (provider, collector, until) VALUES ('claude', 'win-desktop', '2999-01-01T00:00:00.000Z')").run();
+  raw.exec(migration0014());
+  const at = new Date(Date.now() + 60 * 60_000);
+  const iso = (min: number) => new Date(at.getTime() - min * 60_000).toISOString();
+  // the account switch the boundary records, 65 minutes before; its guard (5 minutes) is over before the first observation
+  raw.prepare("INSERT INTO history_boundaries (provider, since, collector) VALUES ('claude', ?, 'win-desktop')").run(iso(65));
+  const s = snapAt(iso(1));
+  // every 5 minutes for the last hour, 1% at a time, with resets ahead of then
+  const resets = new Date(at.getTime() + 3 * 3_600_000).toISOString();
+  for (const p of Object.values(s.providers)) for (const w of p?.windows ?? []) w.resets_at = resets;
+  // (all after the cut marker: the first one minutes after the migration ran)
+  const rows = Array.from({ length: 12 }, (_, i) => ({ ...obs("five_hour", i, iso(56 - i * 5)), resets_at: resets }));
+  await call("PUT", "/v2/snapshots/win-desktop", WIN, upload(1, s, rows), at);
+  const stored = raw.prepare("SELECT count(*) AS n FROM observations WHERE collector = 'win-desktop'").get() as { n: number };
+  assert.equal(stored.n, rows.length, "taken into history");
+  await runCron(env, at);
+  assert.notEqual(await rateOf(call, at), null, "and used for the speed");
+});
+
+test("G2-b: boundaries put again by Cron (no upload) go under a strictly newer data version", async () => {
+  const { call, env, raw, db } = await setup();
+  await call("PUT", "/v2/snapshots/win-desktop", WIN, upload(1, fixture()));
+  const versionOf = async () => ((await (await call("GET", "/v2/view", READ)).json()) as { data_version: number; boundaries: Record<string, string> });
+  const before = await versionOf();
+  // an acceptance saved whose put of the merged value failed (the values are the same, only the boundary moved)
+  raw.prepare("INSERT INTO history_boundaries (provider, since, collector) VALUES ('claude', '2026-11-16T12:00:00.000Z', 'win-desktop')").run();
+  raw.prepare("INSERT INTO boundary_epochs (provider, epoch) VALUES ('claude', 1)").run();
+  await repairPublicState(db, env);
+  const after = await versionOf();
+  assert.ok(after.data_version > before.data_version, `${after.data_version} > ${before.data_version}`);
+  assert.notEqual(after.boundaries.claude, before.boundaries.claude);
+});
+
+test("G2-d: after a withdrawal, a new upload's value comes under a newer version than the empty one", async () => {
+  const { call, env } = await setup();
+  await call("PUT", "/v2/snapshots/mac", MAC, upload(1, fixture()));
+  const later = new Date(NOW.getTime() + 32 * 24 * 3_600_000);
+  await runCron(env, later);
+  await runCron(env, later);
+  const empty = (await (await call("GET", "/v2/view", READ, undefined, later)).json()) as { claude: unknown; data_version: number };
+  assert.equal(empty.claude, null);
+  await call("PUT", "/v2/snapshots/mac", MAC, upload(2, snapAt(new Date(later.getTime() - 60_000).toISOString())), later);
+  const back = (await (await call("GET", "/v2/view", READ, undefined, later)).json()) as { claude: unknown; data_version: number };
+  assert.notEqual(back.claude, null);
+  assert.ok(back.data_version > empty.data_version);
+});
+
+// ---- Migration and withdrawal: each found order as a counterexample, with its control
+const proxied = (db: D1Like, onSql: (sql: string) => Promise<void> | void): D1Like => ({
+  prepare(sql) {
+    const st = db.prepare(sql);
+    const wrap = (s: typeof st): typeof st => ({
+      ...s,
+      bind: (...v: unknown[]) => wrap(s.bind(...v)),
+      all: async () => { const r = await s.all(); await onSql(sql); return r; },
+    }) as typeof st;
+    return wrap(st);
+  },
+  batch: (statements) => db.batch(statements),
+});
+
+test("a withdrawal that found no PC never replaces an upload that came meanwhile", async () => {
+  const { call, env, raw } = await setup();
+  await call("PUT", "/v2/snapshots/mac", MAC, upload(1, fixture()));
+  const later = new Date(NOW.getTime() + 32 * 24 * 3_600_000);
+  // the Cron reads the PC rows (none left), then an upload completes before it withdraws
+  raw.exec("DELETE FROM collector_snapshots");
+  let done = false;
+  const db = proxied(env.DB, async (sql) => {
+    if (done || !sql.startsWith("SELECT collector, snapshot, received_at FROM collector_snapshots")) return;
+    done = true;
+    await call("PUT", "/v2/snapshots/mac", MAC, upload(2, snapAt(new Date(later.getTime() - 60_000).toISOString())), later);
+  });
+  await repairPublicState(db, env);
+  const view = (await (await call("GET", "/v2/view", READ, undefined, later)).json()) as { claude: unknown };
+  assert.notEqual(view.claude, null, "the upload's value stays");
+});
+
+test("a merged value an earlier Worker already deleted (with every PC row) is withdrawn under a newer version", async () => {
+  const { call, env, raw, db } = await setup();
+  await call("PUT", "/v2/snapshots/mac", MAC, upload(1, fixture()));
+  const before = ((await (await call("GET", "/v2/view", READ)).json()) as { data_version: number }).data_version;
+  raw.exec("DELETE FROM collector_snapshots");
+  raw.exec("DELETE FROM public_state");
+  assert.equal((await call("GET", "/v2/view", READ)).status, 404);
+  await repairPublicState(db, env);
+  const res = await call("GET", "/v2/view", READ);
+  assert.equal(res.status, 200);
+  const view = (await res.json()) as { claude: unknown; data_version: number };
+  assert.equal(view.claude, null);
+  assert.ok(view.data_version > before);
+  // the control: a database that never had a value stays "no value yet"
+  const fresh = await setup();
+  await repairPublicState(fresh.db, fresh.env);
+  assert.equal((await fresh.call("GET", "/v2/view", READ)).status, 404);
+});
+
+test("the migration applies each marker as it was recorded to what was saved before it, then cuts it", async () => {
+  const { raw } = await setup();
+  const t = Date.now();
+  const iso = (ms: number) => new Date(t + ms).toISOString();
+  raw.prepare("INSERT INTO boundary_watermarks (provider, collector, until) VALUES ('claude', 'mac', ?)").run(iso(3_600_000));
+  raw.prepare(`INSERT INTO observations (provider, window_id, collector, observed_at, first_received_at, resets_at, used_percent)
+    VALUES ('claude', 'five_hour', 'mac', ?, ?, NULL, 92)`).run(iso(60_000), iso(-15_000));
+  raw.prepare("INSERT INTO collector_snapshots (collector, seq, snapshot, received_at) VALUES ('mac', 1, ?, ?)").run(JSON.stringify(snapAt(iso(0))), iso(0));
+  raw.exec(migration0014());
+  assert.equal((raw.prepare("SELECT count(*) AS n FROM observations WHERE collector = 'mac'").get() as { n: number }).n, 0, "by the marker as recorded");
+  assert.equal((raw.prepare("SELECT count(*) AS n FROM collector_snapshots WHERE collector = 'mac'").get() as { n: number }).n, 0, "its saved latest value too");
+  const until = (raw.prepare("SELECT until FROM boundary_watermarks").get() as { until: string }).until;
+  assert.ok(until < iso(3_600_000), "then cut to now");
+});
+
+test("a weekly series computed before the migration and saved after it doesn't come back", async () => {
+  const { raw, db } = await setup();
+  const before = new Date(Date.now() - 60_000);
+  const hour = before.toISOString().slice(0, 13);
+  await saveWeekly(db, "claude", [{ hour, used_percent: 92 } as any], "", hour, new Date(before.getTime() - 60_000), 1);
+  raw.exec(migration0014());
+  // the Cron that read the representatives before the cleanup (generation 1) saves now
+  await saveWeekly(db, "claude", [{ hour, used_percent: 92 } as any], "", hour, before, 1);
+  assert.equal(await loadWeekly(db, "claude"), null, "not shown: of the generation before the cleanup");
+});
+
+// ---- The upgrade: older agents refused, the data generation, the served version and a used database
+
+test("G1-h: an upload or a turn from an older agent is refused before D1 is touched; this version's agent writes", async () => {
+  const { env, raw } = await setup();
+  const before = (raw.prepare("SELECT count(*) AS n FROM collector_snapshots").get() as { n: number }).n;
+  const send = (path: string, method: string, body: unknown, protocol: string | null) => {
+    const request = new Request(`https://headroom.example${path}`, { method, headers: { authorization: `Bearer ${WIN}`, "content-type": "application/json" },
+      body: JSON.stringify(body) });
+    request.headers.set("headroom-protocol", protocol ?? "");
+    if (protocol === null) request.headers.delete("headroom-protocol");
+    return handleRequest(request, env, () => NOW);
+  };
+  for (const protocol of [null, "1"]) {
+    const put = await send("/v2/snapshots/win-desktop", "PUT", sentAt(upload(1, fixture()), NOW), protocol);
+    assert.equal(put.status, 426, String(protocol));
+    assert.deepEqual(await put.json(), { error: "agent_outdated" });
+    assert.equal((await send("/v2/turns/win-desktop", "POST", { claude: 5 }, protocol)).status, 426);
+  }
+  assert.equal((raw.prepare("SELECT count(*) AS n FROM collector_snapshots").get() as { n: number }).n, before, "nothing saved");
+  assert.equal((await send("/v2/snapshots/win-desktop", "PUT", sentAt(upload(1, fixture()), NOW), AGENT_PROTOCOL)).status, 204);
+});
+
+test("G1-d: a speed of an older generation is not shown and is replaced by the next Cron, also without a provider counter and with a higher one", async () => {
+  const good = Array.from({ length: 12 }, (_, i) => obs("five_hour", i, new Date(Date.parse("2026-11-16T11:59:00.000Z") + i * 5 * 60_000).toISOString()));
+  const { call, env, raw } = await setup();
+  await call("PUT", "/v2/snapshots/win-desktop", WIN, upload(1, fixture(), good));
+  await runCron(env, NOW);
+  const expected = await rateOf(call);
+  assert.notEqual(expected, null);
+  // an earlier Worker's row: counter 7, no provider counters at all, a speed the kept observations don't give
+  raw.exec("DELETE FROM data_versions WHERE provider IN ('claude', 'codex')");
+  raw.exec(`UPDATE derived_metrics SET version = 7, generation = 0, body = json_set(body, '$.five_hour.metrics.rate_60m', 76.6) WHERE provider = 'claude'`);
+  assert.equal(await rateOf(call), null, "of another generation: not shown");
+  await runCron(env, NOW);
+  assert.equal(await rateOf(call), expected, "computed again in this generation, whatever its counter");
+});
+
+test("G1-e: a first weekly series whose representatives were read before the cleanup is not saved after it", async () => {
+  const { raw, db } = await setup();
+  const hour = new Date(Date.now() - 60_000).toISOString().slice(0, 13);
+  const read = (raw.prepare("SELECT generation FROM data_generation").get() as { generation: number }).generation;
+  raw.exec(cleanup());
+  await saveWeekly(db, "claude", [{ hour, used_percent: 92 } as any], "", hour, new Date(), read);
+  assert.equal(raw.prepare("SELECT count(*) AS n FROM derived_weekly").get()!.n, 0, "no first row either");
+  // the control: a computation in the current generation saves
+  await saveWeekly(db, "claude", [{ hour, used_percent: 40 } as any], "", hour, new Date(), read + 1);
+  assert.equal((await loadWeekly(db, "claude"))!.series.length, 1);
+});
+
+test("G2-e: right after the cleanup the served version is above every one served before, with no value; the values left come back above it", async () => {
+  for (const boundaryOnly of [false, true]) {
+    const { call, env, raw } = await setup();
+    await call("PUT", "/v2/snapshots/win-desktop", WIN, upload(1, fixture()));
+    await call("PUT", "/v2/snapshots/mac", MAC, upload(1, fixture()));
+    if (boundaryOnly) raw.exec("UPDATE public_state SET current_version = version + 3 WHERE id = 1"); // an odd version was served
+    const view = async () => (await (await call("GET", "/v2/view", READ)).json()) as { data_version: number; claude: unknown; codex: unknown };
+    const before = await view();
+    // the cleanup removes the mac's saved value (a marker for it)
+    raw.exec("INSERT INTO boundary_watermarks (provider, collector, until) VALUES ('claude', 'mac', '2026-11-16T00:00:00.000Z')");
+    raw.exec(cleanup());
+    const after = await view();
+    assert.ok(after.data_version > before.data_version, `${boundaryOnly}: ${before.data_version} < ${after.data_version}`);
+    assert.deepEqual([after.claude, after.codex], [null, null], "no value of a PC whose rows were removed shows");
+    await runCron(env, NOW);
+    const again = await view();
+    // above C (the cleanup's counter): the empty one is 2C - 1, the first put again 2(C + 1) or more
+    assert.ok(again.data_version >= after.data_version + 3, `the values left come back under a newer version: ${after.data_version} -> ${again.data_version}`);
+    assert.notEqual(again.claude, null);
+  }
+});
+
+test("G2-f: a used database with nothing left answers with an empty view, also when no counter or public row is left; a new one with 404", async () => {
+  for (const left of ["names", "observations", "hourly", "derived"] as const) {
+    const { call, env, raw } = await setup();
+    raw.exec("DELETE FROM data_generation");
+    // an earlier Worker removed the latest values, the public row and the counters; only one kind of row is left
+    if (left === "names") raw.exec("INSERT INTO collector_names (name, slot, seq) VALUES ('mac', 0, 3)");
+    if (left === "observations") raw.exec(`INSERT INTO observations (provider, window_id, collector, observed_at, first_received_at, resets_at, used_percent)
+      VALUES ('claude', 'five_hour', 'mac', '2026-11-16T11:00:00.000Z', '2026-11-16T11:00:01.000Z', NULL, 10)`);
+    if (left === "hourly") raw.exec(`INSERT INTO observation_hourly (provider, window_id, hour, used_percent, resets_at, observed_at, effective_at, first_received_at, collector, priority)
+      VALUES ('claude', 'seven_day', '2026-11-16T11', 10, NULL, '2026-11-16T11:00:00.000Z', '2026-11-16T11:00:00.000Z', '2026-11-16T11:00:01.000Z', 'mac', 0)`);
+    if (left === "derived") raw.exec("INSERT INTO derived_metrics (provider, computed_at, version, body) VALUES ('claude', '2026-11-16T11:00:00.000Z', 0, '{}')");
+    // migration 0014 counts what is there before the cleanup removes anything
+    raw.exec(readFileSync(new URL("../migrations/0014_data_generation.sql", import.meta.url), "utf8").replace(/^ALTER TABLE.*$/gm, ""));
+    raw.exec(cleanup());
+    await runCron(env, NOW);
+    const res = await call("GET", "/v2/view", READ);
+    assert.equal(res.status, 200, left);
+    const body = (await res.json()) as { claude: unknown; codex: unknown };
+    assert.deepEqual([body.claude, body.codex], [null, null], left);
+  }
+  // the control: a new database never used
+  const fresh = await setup();
+  await runCron(fresh.env, NOW);
+  assert.equal((await fresh.call("GET", "/v2/view", READ)).status, 404);
+});
+
+test("G1-h: after the cleanup, a write a request of the earlier Worker was still making is refused; this Worker's writes go through", async () => {
+  const { call, raw } = await setup();
+  await call("PUT", "/v2/snapshots/win-desktop", WIN, upload(1, fixture()));
+  raw.exec(cleanup());
+  // the earlier Worker's statements (no writer mark): a late batch commits nothing
+  const late = [
+    `INSERT OR IGNORE INTO observations (provider, window_id, collector, observed_at, first_received_at, resets_at, used_percent)
+      VALUES ('claude', 'five_hour', 'mac', '2026-11-16T12:59:00.000Z', '2026-11-16T12:59:01.000Z', NULL, 60)`,
+    `INSERT INTO collector_snapshots (collector, seq, snapshot, received_at) VALUES ('mac', 9, '{}', '2026-11-16T12:59:01.000Z')
+      ON CONFLICT (collector) DO UPDATE SET seq = excluded.seq`,
+    `UPDATE collector_snapshots SET seq = seq + 1 WHERE collector = 'win-desktop'`,
+    `INSERT INTO observation_hourly (provider, window_id, hour, used_percent, resets_at, observed_at, effective_at, first_received_at, collector, priority)
+      VALUES ('claude', 'seven_day', '2026-11-16T12', 60, NULL, '2026-11-16T12:59:00.000Z', '2026-11-16T12:59:00.000Z', '2026-11-16T12:59:01.000Z', 'mac', 0)`,
+    `UPDATE public_state SET body = '{"providers":{"claude":{}}}' WHERE id = 1`,
+  ];
+  for (const sql of late) assert.throws(() => raw.exec(sql), /earlier Worker/, sql.slice(0, 40));
+  assert.equal(raw.prepare("SELECT count(*) AS n FROM collector_snapshots WHERE collector = 'mac'").get()!.n, 0);
+  // the control: this Worker's upload and Cron write as before
+  assert.equal((await call("PUT", "/v2/snapshots/win-desktop", WIN, upload(2, fixture(), [obs("five_hour", 1, "2026-11-16T12:58:00.000Z")]))).status, 204);
+  assert.equal((await call("GET", "/v2/view", READ)).status, 200);
+});
+
+test("the cleanup run a second time changes nothing and doesn't fail on its own guards", async () => {
+  const { call, raw } = await setup();
+  await call("PUT", "/v2/snapshots/win-desktop", WIN, upload(1, fixture()));
+  raw.exec(cleanup());
+  const snap = () => JSON.stringify([raw.prepare("SELECT generation FROM data_generation").get(), raw.prepare("SELECT version FROM data_versions WHERE provider = 'all'").get(),
+    raw.prepare("SELECT version, current_version, body FROM public_state").get()]);
+  const once = snap();
+  raw.exec(cleanup());
+  assert.equal(snap(), once);
+  // this Worker's writes still go through after it
+  assert.equal((await call("PUT", "/v2/snapshots/win-desktop", WIN, upload(2, fixture()))).status, 204);
+});
+
+test("G2-f: a used database whose public row is already gone answers with the empty view right after the cleanup", async () => {
+  const { call, raw } = await setup();
+  await call("PUT", "/v2/snapshots/win-desktop", WIN, upload(1, fixture()));
+  // an earlier Worker removed the public row and the PC's row
+  raw.exec("DELETE FROM public_state");
+  raw.exec("DELETE FROM collector_snapshots");
+  raw.exec(cleanup());
+  const res = await call("GET", "/v2/view", READ);
+  assert.equal(res.status, 200, "before any Cron");
+  const body = (await res.json()) as { claude: unknown; codex: unknown };
+  assert.deepEqual([body.claude, body.codex], [null, null]);
+});
+
+test("G1-h: after the cleanup, an earlier Worker's late DELETE of the withdrawn public row is refused", async () => {
+  const { call, raw } = await setup();
+  await call("PUT", "/v2/snapshots/win-desktop", WIN, upload(1, fixture()));
+  raw.exec(cleanup());
+  const before = await (await call("GET", "/v2/view", READ)).json() as { data_version: number };
+  assert.throws(() => raw.exec("DELETE FROM public_state WHERE id = 1 AND version = 1"), /earlier Worker/);
+  const res = await call("GET", "/v2/view", READ);
+  assert.equal(res.status, 200);
+  assert.equal(((await res.json()) as { data_version: number }).data_version, before.data_version, "the same withdrawal");
 });

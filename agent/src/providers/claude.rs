@@ -28,7 +28,7 @@ use crate::schema::{
     ErrorCode, ProviderSnapshot, ProviderStatus, UsageWindow, known_scope, known_window,
     make_window,
 };
-use crate::statusline::read_capture;
+use crate::statusline::{capture_at, read_capture_in};
 use crate::store::{Logger, backoff_ms, fnv1a_hex, read_json, write_json_atomic};
 use crate::time::{MINUTE_MS, iso_from_ms};
 
@@ -40,6 +40,8 @@ const AUTH_TIMEOUT: Duration = Duration::from_secs(15);
 const LOCK_WAIT: Duration = Duration::from_secs(90);
 const STATE_FILE: &str = "state-claude.json";
 const LOCK_FILE: &str = "state-claude.lock";
+/// How far a saved value's time may be ahead of the clock and still be used (the destination refuses a clock off by more than 2 minutes)
+const AHEAD_SLACK_MS: i64 = 2 * MINUTE_MS;
 const STATE_VERSION: u32 = 2;
 /// Safety guard: a nonexistent model name. `/usage` doesn't use a model, so it is unaffected
 pub const GUARD_MODEL: &str = "headroom-no-model-guard";
@@ -190,6 +192,10 @@ pub enum UsageError {
 pub struct Observation {
     pub fetched_ms: i64,
     pub windows: Vec<UsageWindow>,
+    /// Clock epoch read when the fetch started (clock.rs): used only while that epoch is current and trusted. None from earlier
+    /// versions (never used)
+    #[serde(default)]
+    pub epoch: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
@@ -234,12 +240,28 @@ pub struct ClaudeState {
     pub auth_verified: bool,
     /// Consecutive `claude auth status` failures (the recheck interval grows 1 -> 2 -> 4 ... minutes)
     pub auth_failures: u32,
+    /// Time of a statusLine value found stamped ahead of the clock (it has since gone back). That value is never used, also once the
+    /// time catches up with it (it would be taken for a fetch at that time); a newer statusLine value replaces it
+    pub capture_ahead_ms: Option<i64>,
 }
 
 /// Read the state file field by field. Even if observations can't be read (old format etc.), stop flags, intervals and backoff carry over.
 /// Only a missing file starts from the initial state. A file that can't be read or parsed, or a stop flag of the wrong type,
 /// keeps auto-fetch stopped (a corrupt file must not clear a safety stop)
 pub fn load_state(path: &Path) -> ClaudeState {
+    state_from(std::fs::read(path))
+}
+
+/// The state as load_state reads it, or None when the file exists but can't be read (an I/O error: a later read may still find the values
+/// in it). Contents that aren't a state are read as load_state reads them (never as values)
+fn read_state(path: &Path) -> Option<ClaudeState> {
+    match std::fs::read(path) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => None,
+        read => Some(state_from(read)),
+    }
+}
+
+fn state_from(read: std::io::Result<Vec<u8>>) -> ClaudeState {
     let initial = ClaudeState {
         state_version: STATE_VERSION,
         ..Default::default()
@@ -249,7 +271,7 @@ pub fn load_state(path: &Path) -> ClaudeState {
         last_error: Some(Diag::StateUnreadable),
         ..initial.clone()
     };
-    let v = match std::fs::read(path) {
+    let v = match read {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return initial,
         Err(_) => return unreadable,
         Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
@@ -294,6 +316,7 @@ pub fn load_state(path: &Path) -> ClaudeState {
         account_accepted_ms: i("account_accepted_ms"),
         managed_policy: v["managed_policy"].as_bool().unwrap_or(false),
         auth_verified: v["auth_verified"].as_bool().unwrap_or(false),
+        capture_ahead_ms: v["capture_ahead_ms"].as_i64(),
         auth_failures: v["auth_failures"]
             .as_u64()
             .map_or(0, |n| n.min(u32::MAX as u64) as u32),
@@ -414,6 +437,12 @@ pub struct ClaudeProvider {
     accept_account_pending: bool,
     /// Hold off `/usage` until this time (the resident agent's fetch scheduling; statusLine capture continues)
     fetch_hold_until_ms: i64,
+    /// The clock read once the state file is locked and read again (None in tests: the time passed to collect)
+    clock: Option<fn() -> i64>,
+    /// Clock epoch read when the current collect started (clock.rs). Values are taken in and used only under it; None: none usable
+    epoch: Option<u64>,
+    /// The account switch the last collect accepted: Some(true) once saved, Some(false) if accepting or saving failed
+    accepted: Option<bool>,
 }
 
 impl ClaudeProvider {
@@ -421,6 +450,7 @@ impl ClaudeProvider {
         let cli = Box::new(RealCli::new(claude_bin(&cfg)));
         let mut p = Self::with_cli(home, cfg, log, cli);
         p.claude_json = claude_json_path();
+        p.clock = Some(crate::time::now_ms);
         p
     }
 
@@ -438,7 +468,11 @@ impl ClaudeProvider {
             tz: TimeZone::system(),
             cli,
             accept_account_pending: false,
+            // The epoch now (each collect reads it again)
+            epoch: crate::clock::usable_epoch(home),
+            accepted: None,
             fetch_hold_until_ms: 0,
+            clock: None,
         }
     }
 
@@ -466,24 +500,34 @@ impl ClaudeProvider {
         {
             return i64::MAX;
         }
+        // An attempt saved while the clock ran ahead (it has since gone back): due now, so collect rewrites it to now once and the next
+        // run then waits the interval (and backoff) from that time instead of until the clock catches up
+        if self.state.last_attempt_ms > now {
+            return now;
+        }
         let interval = self.cfg.interval_min.max(1) * MINUTE_MS;
-        let last_ok = self.state.last_ok.as_ref().map_or(0, |o| o.fetched_ms);
-        let by_success = last_ok.saturating_add(interval);
-        let by_attempt = self
+        // A value fetched ahead of the clock doesn't set the schedule (the attempt that fetched it does)
+        let last_ok = self
             .state
-            .last_attempt_ms
-            .saturating_add(backoff_ms(interval, self.state.failures));
+            .last_ok
+            .as_ref()
+            .filter(|o| o.epoch.is_some() && o.epoch == crate::clock::usable_epoch(&self.home))
+            .map_or(0, |o| o.fetched_ms);
+        let last_ok = if last_ok > now { 0 } else { last_ok };
+        let last_attempt = self.state.last_attempt_ms;
+        let by_success = last_ok.saturating_add(interval);
+        let by_attempt = last_attempt.saturating_add(backoff_ms(interval, self.state.failures));
         let normal = by_success.max(by_attempt);
         // If the overall limit is maxed out, extend the interval until reset (statusLine values are passive and unaffected)
         let blocked_until = self
             .build(now)
-            .blocked_until_ms(self.state.last_attempt_ms)
+            .blocked_until_ms(last_attempt)
             .unwrap_or(i64::MIN);
         normal.max(blocked_until).max(self.fetch_hold_until_ms)
     }
 
     /// When to next check the version and auth. Independent of the `/usage` schedule; keeps checking while stopped or while the CLI is missing
-    pub fn cli_check_due_ms(&self) -> i64 {
+    pub fn cli_check_due_ms(&self, now: i64) -> i64 {
         if !self.cfg.enabled {
             return i64::MAX;
         }
@@ -497,6 +541,10 @@ impl ClaudeProvider {
         } else {
             backoff_ms(MINUTE_MS, self.state.auth_failures.saturating_sub(1)).min(AUTH_INTERVAL_MS)
         };
+        // A check saved while the clock ran ahead: due now, so collect rewrites it to now once (as for /usage)
+        if self.state.last_auth_ms > now {
+            return now;
+        }
         self.state.last_auth_ms.saturating_add(wait)
     }
 
@@ -557,7 +605,7 @@ impl ClaudeProvider {
 
     /// Check the CLI version and sign-in state every hour (both local, no quota use).
     fn refresh_cli(&mut self, now: i64, force: bool) {
-        let due = now >= self.cli_check_due_ms();
+        let due = now >= self.cli_check_due_ms(now);
         if !force && !due {
             return;
         }
@@ -701,6 +749,7 @@ impl ClaudeProvider {
                 self.state.last_ok = Some(Observation {
                     fetched_ms: now,
                     windows,
+                    epoch: self.epoch,
                 });
                 self.state.failures = 0;
                 self.state.last_error = None;
@@ -727,6 +776,8 @@ impl ClaudeProvider {
     /// Overlay newer statusLine windows on the `/usage` windows. Each window carries its actual fetch time,
     /// and the provider's fetched_at and status come from the **oldest window** (old windows never look fresh).
     fn build(&self, now: i64) -> ProviderSnapshot {
+        // The clock epoch usable now: values of another one are neither shown nor used for the schedule
+        let epoch = crate::clock::usable_epoch(&self.home);
         if self.state.account_changed {
             // While stopped by a switch, the switch stop wins over other version/auth diagnostics, and no values are shown
             return ProviderSnapshot::empty(
@@ -735,7 +786,14 @@ impl ClaudeProvider {
                 Some(ErrorCode::AccountChanged),
             );
         }
-        let usage = self.state.last_ok.as_ref();
+        // A value stamped ahead of the clock (fetched while it ran ahead; it has since gone back) is neither shown nor used for the
+        // schedule: it would hold the next fetch off, and a statusLine value ahead would replace a newer /usage value
+        let in_time = |at: i64| at <= now.saturating_add(AHEAD_SLACK_MS);
+        let usage = self
+            .state
+            .last_ok
+            .as_ref()
+            .filter(|u| u.epoch.is_some() && u.epoch == epoch && in_time(u.fetched_ms));
         // Only Claude's usage-limit windows (values saved by an older version may hold others, such as extra usage).
         // blocked is computed from these alone
         let mut windows: Vec<_> = usage
@@ -744,6 +802,9 @@ impl ClaudeProvider {
             .filter(|(w, _)| is_claude_window(&w.id))
             .collect();
         if let Some((at, ws)) = &self.capture
+            && self.epoch.is_some()
+            && self.epoch == epoch
+            && in_time(*at)
             && usage.is_none_or(|u| *at > u.fetched_ms)
         {
             for w in ws.iter().filter(|w| is_claude_window(&w.id)) {
@@ -831,7 +892,7 @@ impl Provider for ClaudeProvider {
         if self.capture_dirty {
             return now;
         }
-        self.usage_due_ms(now).min(self.cli_check_due_ms())
+        self.usage_due_ms(now).min(self.cli_check_due_ms(now))
     }
 
     fn collect(&mut self, now: i64, force: bool) -> ProviderSnapshot {
@@ -851,6 +912,26 @@ impl Provider for ClaudeProvider {
         };
         let state_path = self.home.join(STATE_FILE);
         self.state = load_state(&state_path);
+        // The clock epoch this collect works under: values of another one are neither used nor shown, and nothing is fetched
+        // without one (the clock isn't trusted now)
+        self.epoch = crate::clock::usable_epoch(&self.home);
+        // The time is read again now: while this run waited (for the lock or the fetch turn), another process (a manual collect) may
+        // have fetched and saved, and that is not ahead of the clock
+        let now = self.clock.map_or(now, |clock| clock());
+        // Times saved while the clock ran ahead (it has since gone back) are taken as now, once: the minimum interval and the backoff
+        // then count from this moment
+        self.state.last_attempt_ms = self.state.last_attempt_ms.min(now);
+        self.state.last_auth_ms = self.state.last_auth_ms.min(now);
+        // A /usage value stamped ahead of the clock is dropped (another process's save came before this read, so it isn't ahead): once
+        // the time caught up with it, it would pass for a value fetched then
+        if self
+            .state
+            .last_ok
+            .as_ref()
+            .is_some_and(|o| o.fetched_ms > now)
+        {
+            self.state.last_ok = None;
+        }
         if let Some(started) = self.state.usage_in_flight_ms.take() {
             // The previous process ended before checking the /usage result. Zero use can't be confirmed, so stop
             self.state.guard_tripped = true;
@@ -858,25 +939,64 @@ impl Provider for ClaudeProvider {
             self.state.last_attempt_ms = self.state.last_attempt_ms.max(started);
             self.log_diag("usage (stopped by safety guard)", Diag::Interrupted);
         }
-        if std::mem::take(&mut self.accept_account_pending) && self.state.account_changed {
+        // An acceptance only under a usable clock epoch (one that can't be confirmed now isn't made; the switch stays pending). Asked
+        // for once: never left to accept a later switch
+        self.accepted = None;
+        let asked = std::mem::take(&mut self.accept_account_pending);
+        if asked && self.state.account_changed {
+            self.accepted = Some(false);
+        }
+        if asked && self.state.account_changed && self.epoch.is_some() {
+            // Saved at once and by itself, before anything else is saved or run: what is said (and logged) is what was saved. One
+            // that can't be saved isn't made (the switch stays pending, so nothing is fetched)
+            let before = (
+                self.state.account_changed,
+                self.state.account_accepted_ms,
+                self.state.last_error,
+            );
             self.state.account_changed = false;
             self.state.account_accepted_ms = now;
             if self.state.last_error == Some(Diag::AccountChanged) {
                 self.state.last_error = None;
             }
-            self.log
-                .log("claude: accepted the account switch and resumed fetching");
+            match write_json_atomic(&state_path, &self.state) {
+                Ok(()) => {
+                    self.accepted = Some(true);
+                    self.log
+                        .log("claude: accepted the account switch and resumed fetching");
+                }
+                Err(e) => {
+                    (
+                        self.state.account_changed,
+                        self.state.account_accepted_ms,
+                        self.state.last_error,
+                    ) = before;
+                    self.log.log(&format!(
+                        "claude: couldn't save the account acceptance: {}",
+                        e.kind()
+                    ));
+                }
+            }
         }
         self.refresh_account(now);
         let switched = self.state.account_switched_ms;
-        self.capture = if self.state.account_changed {
+        let capture = if self.state.account_changed {
             None
         } else {
-            read_capture(&self.home).filter(|(at, _)| *at >= switched)
+            read_capture_in(&self.home, self.epoch).filter(|(at, _)| *at >= switched)
         };
+        // The clock is read again after the statusLine value (one written since the time above isn't ahead of it)
+        let capture_now = self.clock.map_or(now, |clock| clock());
+        if let Some((at, _)) = &capture
+            && *at > capture_now
+        {
+            self.state.capture_ahead_ms = Some(*at);
+        }
+        self.capture = capture.filter(|(at, _)| self.state.capture_ahead_ms != Some(*at));
         self.refresh_cli(now, force);
         self.capture_dirty = false;
-        let allowed = self.state.cli_supported == Some(true)
+        let allowed = self.epoch.is_some()
+            && self.state.cli_supported == Some(true)
             && !self.state.account_changed
             // Only a confirmed claude.ai subscription sign-in (an unknown sign-in method is not enough)
             && self.state.account.as_ref().and_then(|a| a.subscription) == Some(true)
@@ -899,6 +1019,10 @@ impl Provider for ClaudeProvider {
         self.build(now)
     }
 
+    fn account_accepted(&self) -> Option<bool> {
+        self.accepted
+    }
+
     fn fetch_due_ms(&self, now: i64) -> i64 {
         self.usage_due_ms(now)
     }
@@ -906,6 +1030,77 @@ impl Provider for ClaudeProvider {
     fn hold_fetch_until(&mut self, until_ms: i64) -> bool {
         self.fetch_hold_until_ms = until_ms;
         true
+    }
+
+    fn takes_passive_values(&self) -> bool {
+        true
+    }
+
+    fn forget_cached(&mut self) -> bool {
+        // Under the state lock (a manual collect may be saving); without it, tried again next round
+        let Some(_lock) = StateLock::acquire(&self.home, LOCK_WAIT) else {
+            return false;
+        };
+        let state_path = self.home.join(STATE_FILE);
+        // A file that exists but can't be read may still hold a value (it would come back once readable): not forgotten, tried again
+        let Some(state) = read_state(&state_path) else {
+            self.log
+                .log("claude: couldn't read the state to forget the cached values");
+            return false;
+        };
+        self.state = state;
+        // The /usage value and the statusLine value (both stamped by the refused clock) are not used again
+        let Ok(capture) = capture_at(&self.home) else {
+            self.log
+                .log("claude: couldn't read the statusLine value to forget it");
+            return false;
+        };
+        // The epoch usable now. When that can't be told (the state can't be read now, or a send's result is pending), nothing is
+        // tidied: a value of the current epoch would be taken for one of another (tried again next round)
+        let current = match crate::clock::clock_epoch(&self.home) {
+            crate::clock::EpochRead::Read {
+                epoch,
+                trusted: true,
+                in_flight: None,
+            } => Some(epoch),
+            crate::clock::EpochRead::Read {
+                trusted: false,
+                in_flight: None,
+                ..
+            } => None,
+            _ => {
+                self.log.log(
+                    "claude: the clock state can't be told now; the cached values are tidied later",
+                );
+                return false;
+            }
+        };
+        let stale_ok = self
+            .state
+            .last_ok
+            .as_ref()
+            .is_some_and(|o| o.epoch.is_none() || o.epoch != current);
+        let stale_capture = capture
+            .filter(|(_, e)| e.is_none() || *e != current)
+            .map(|(at, _)| at);
+        if !stale_ok && (stale_capture.is_none() || self.state.capture_ahead_ms == stale_capture) {
+            return true;
+        }
+        if stale_ok {
+            self.state.last_ok = None;
+        }
+        if stale_capture.is_some() {
+            self.state.capture_ahead_ms = stale_capture;
+            self.capture = None;
+        }
+        match write_json_atomic(&state_path, &self.state) {
+            Ok(()) => true,
+            Err(e) => {
+                self.log
+                    .log(&format!("claude: couldn't save the state: {e}"));
+                false
+            }
+        }
     }
 
     fn last_fetch_attempt_ms(&self) -> Option<i64> {
@@ -1592,7 +1787,9 @@ mod tests {
     }
 
     fn home(name: &str) -> crate::test_util::TempHome {
-        crate::test_util::TempHome::new(&format!("headroom-claude-{name}"))
+        let h = crate::test_util::TempHome::new(&format!("headroom-claude-{name}"));
+        crate::test_util::trust_clock(&h);
+        h
     }
 
     fn usage_text(session: u32) -> String {
@@ -1690,6 +1887,7 @@ mod tests {
     }
 
     fn provider_with(h: &Path, fake: &Fake, log: Logger) -> ClaudeProvider {
+        crate::test_util::trust_clock(h);
         let mut p =
             ClaudeProvider::with_cli(h, ClaudeConfig::default(), log, Box::new(fake.clone()));
         p.set_time_zone(tokyo());
@@ -1891,15 +2089,16 @@ Current session limit for org: 100% used
     #[test]
     fn a_maxed_out_model_week_from_statusline_does_not_block() {
         let h = home("statusline-model");
+        let fake = Fake::new(vec![Ok(usage_text(10))]);
+        let mut p = provider_with(&h, &fake, Logger::stderr());
+        p.collect(NOW - MINUTE_MS, false);
+        // written after that /usage (a value written ahead of the clock would never be used)
         crate::statusline::save_capture(
             &h,
             &json!({"five_hour": {"used_percentage": 20}, "seven_day": {"used_percentage": 20}, "seven_day_opus": {"used_percentage": 100}}),
             NOW,
         )
         .unwrap();
-        let fake = Fake::new(vec![Ok(usage_text(10))]);
-        let mut p = provider_with(&h, &fake, Logger::stderr());
-        p.collect(NOW - MINUTE_MS, false);
         let snap = p.collect(NOW, false);
         let opus = snap
             .windows
@@ -1929,6 +2128,7 @@ Current session limit for org: 100% used
             last_ok: Some(Observation {
                 fetched_ms: NOW - MINUTE_MS,
                 windows: vec![five, extra],
+                epoch: Some(1),
             }),
             cli_supported: Some(true),
             ..Default::default()
@@ -2304,6 +2504,319 @@ Current session limit for org: 100% used
     }
 
     #[test]
+    fn a_clock_that_went_back_doesnt_hold_the_next_usage_off_until_it_catches_up() {
+        // fetched while the clock was 6 hours ahead, then the clock was set back
+        let (mut p, fake, h) = provider("clock-back", vec![Ok(usage_text(10)), Ok(usage_text(11))]);
+        let ahead = NOW + 6 * 60 * MINUTE_MS;
+        p.collect(ahead, false);
+        assert_eq!(fake.calls(), 1);
+        // Back on the right clock: due at once, so the times are rewritten to now (no fetch yet: the interval counts from now)
+        assert_eq!(p.next_due_ms(NOW), NOW);
+        p.collect(NOW, false);
+        assert_eq!(fake.calls(), 1);
+        assert_eq!(
+            p.usage_due_ms(NOW),
+            NOW + 5 * MINUTE_MS,
+            "the interval from now, not from 6 hours ahead"
+        );
+        p.collect(NOW + 5 * MINUTE_MS, false);
+        assert_eq!(fake.calls(), 2, "fetched again after the interval");
+        let _ = std::fs::remove_dir_all(h);
+    }
+
+    static CLAUDE_CLOCK: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+    fn claude_clock() -> i64 {
+        CLAUDE_CLOCK.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[test]
+    fn an_attempt_saved_by_another_process_while_waiting_is_not_taken_for_a_clock_gone_back() {
+        // The agent read 12:00:00, then waited; a manual collect fetched at 12:00:30 meanwhile. The clock reads 12:00:40 under the lock
+        let (mut p, fake, h) = provider("clock-race", vec![Ok(usage_text(10))]);
+        let mut other = load_state(&h.join(STATE_FILE));
+        other.last_attempt_ms = NOW + 30_000;
+        write_json_atomic(&h.join(STATE_FILE), &other).unwrap();
+        p.clock = Some(claude_clock);
+        CLAUDE_CLOCK.store(NOW + 40_000, std::sync::atomic::Ordering::SeqCst);
+        p.collect(NOW, false);
+        assert_eq!(fake.calls(), 0, "the other process's fetch counts");
+        assert_eq!(
+            load_state(&h.join(STATE_FILE)).last_attempt_ms,
+            NOW + 30_000,
+            "not rewritten to an earlier time"
+        );
+        let _ = std::fs::remove_dir_all(h);
+    }
+
+    #[test]
+    fn a_value_fetched_ahead_of_the_clock_neither_shows_nor_holds_the_schedule() {
+        // 100% fetched while the clock ran 3 hours ahead; set back, the next fetch is due after the normal interval, not the 60 minutes
+        // of a reached limit
+        let (mut p, _fake, h) = provider("ahead-value", vec![Ok(usage_text(100))]);
+        let ahead = NOW + 3 * 60 * MINUTE_MS;
+        p.collect(ahead, false);
+        let snap = p.collect(NOW, false);
+        assert!(snap.windows.is_empty(), "not shown");
+        assert_eq!(p.usage_due_ms(NOW), NOW + 5 * MINUTE_MS);
+        let _ = std::fs::remove_dir_all(h);
+    }
+
+    #[test]
+    fn a_statusline_value_stamped_ahead_is_never_used_also_once_the_time_catches_up() {
+        // written at 12:06 by a clock 6 minutes ahead; the clock is synced to 12:00 before the agent reads it
+        let (mut p, _fake, h) = provider("capture-ahead", vec![Ok(usage_text(10))]);
+        p.collect(NOW, false);
+        crate::statusline::save_capture(
+            &h,
+            &json!({"five_hour": {"used_percentage": 55, "resets_at": 1794844800}}),
+            NOW + 6 * MINUTE_MS,
+        )
+        .unwrap();
+        p.on_event(&Event::ClaudeStatuslineCaptured);
+        p.collect(NOW + MINUTE_MS, false);
+        // The next /usage fails, so nothing newer replaces either value
+        _fake.push_usage(Err(UsageError::Retry(Diag::CliError)));
+        p.on_event(&Event::ClaudeStatuslineCaptured);
+        let later = p.collect(NOW + 7 * MINUTE_MS, false);
+        let five = later.windows.iter().find(|w| w.id == "five_hour").unwrap();
+        assert_eq!(
+            five.used_percent, 10.0,
+            "the value from the clock ahead stays out, the /usage value stays"
+        );
+        let _ = std::fs::remove_dir_all(h);
+    }
+
+    #[test]
+    fn a_refused_clock_makes_claude_forget_what_it_cached() {
+        // the /usage value and a newer statusLine value of the same window, both stamped by a clock the destination refused
+        let (mut p, fake, h) = provider("forget-cached", vec![Ok(usage_text(10))]);
+        p.collect(NOW, false);
+        crate::statusline::save_capture(
+            &h,
+            &json!({"five_hour": {"used_percent": 55, "used_percentage": 55, "resets_at": 1794844800}}),
+            NOW + MINUTE_MS,
+        )
+        .unwrap();
+        p.on_event(&Event::ClaudeStatuslineCaptured);
+        p.collect(NOW + MINUTE_MS, false);
+        // the destination refused the clock, and lifted it again: both values are of the epoch before
+        let step = |trusted: bool| {
+            let _lock = crate::clock::hold_clock_lock(&h).unwrap();
+            let state = crate::clock::ensure_locked(&h, || Ok(false)).unwrap();
+            crate::clock::advance_locked(&h, &state, trusted).unwrap();
+        };
+        step(false);
+        step(true);
+        assert!(p.forget_cached());
+        // the statusLine value goes away; neither comes back
+        fake.push_usage(Err(UsageError::Retry(Diag::CliError)));
+        let later = p.collect(NOW + 10 * MINUTE_MS, false);
+        assert!(later.windows.is_empty(), "{later:?}");
+        // a new statusLine value is used again
+        crate::statusline::save_capture(
+            &h,
+            &json!({"five_hour": {"used_percentage": 60, "resets_at": 1794844800}}),
+            NOW + 11 * MINUTE_MS,
+        )
+        .unwrap();
+        p.on_event(&Event::ClaudeStatuslineCaptured);
+        let fresh = p.collect(NOW + 11 * MINUTE_MS, false);
+        assert_eq!(fresh.windows.len(), 1);
+        let _ = std::fs::remove_dir_all(h);
+    }
+
+    #[test]
+    fn g3_nothing_is_fetched_without_a_trusted_clock_and_no_value_of_an_earlier_epoch_shows() {
+        let (mut p, _fake, h) = provider("epochs", vec![Ok(usage_text(10)), Ok(usage_text(20))]);
+        let first = p.collect(NOW, false);
+        let five = |s: &ProviderSnapshot| {
+            s.windows
+                .iter()
+                .find(|w| w.id == "five_hour")
+                .map(|w| w.used_percent)
+        };
+        assert_eq!(five(&first), Some(10.0));
+        let step = |trusted: bool| {
+            let _lock = crate::clock::hold_clock_lock(&h).unwrap();
+            let state = crate::clock::ensure_locked(&h, || Ok(false)).unwrap();
+            crate::clock::advance_locked(&h, &state, trusted).unwrap();
+        };
+        // refused: nothing fetched (also when forced), and the value before isn't shown
+        step(false);
+        let held = p.collect(NOW + 10 * MINUTE_MS, true);
+        assert_eq!(five(&held), None);
+        // lifted: the value of the epoch before still isn't shown; a new fetch is
+        step(true);
+        let again = p.collect(NOW + 11 * MINUTE_MS, true);
+        assert_eq!(
+            five(&again),
+            Some(20.0),
+            "fetched anew (the queued 20 was not used while refused)"
+        );
+    }
+
+    #[test]
+    fn g3_b_values_of_an_epoch_gone_show_nowhere_also_between_collects_and_a_new_statusline_value_stays()
+     {
+        let (mut p, _fake, h) = provider("epoch-between", vec![Ok(usage_text(100))]);
+        p.collect(NOW, false);
+        let five = |s: &ProviderSnapshot| {
+            s.windows
+                .iter()
+                .find(|w| w.id == "five_hour")
+                .map(|w| w.used_percent)
+        };
+        assert_eq!(five(&p.build(NOW)), Some(100.0));
+        let step = |trusted: bool| {
+            let _lock = crate::clock::hold_clock_lock(&h).unwrap();
+            let state = crate::clock::ensure_locked(&h, || Ok(false)).unwrap();
+            crate::clock::advance_locked(&h, &state, trusted).unwrap();
+        };
+        step(false);
+        step(true);
+        // no collect since (e.g. the state lock was busy): the value of the epoch before is neither shown nor holds the fetch off
+        assert_eq!(five(&p.build(NOW + MINUTE_MS)), None);
+        // a statusLine value taken in the new epoch: tidying the old one leaves it
+        crate::statusline::save_capture(
+            &h,
+            &json!({"five_hour": {"used_percentage": 30, "resets_at": 1794844800}}),
+            NOW + 2 * MINUTE_MS,
+        )
+        .unwrap();
+        assert!(p.forget_cached());
+        p.on_event(&Event::ClaudeStatuslineCaptured);
+        let after = p.collect(NOW + 3 * MINUTE_MS, false);
+        assert_eq!(five(&after), Some(30.0));
+    }
+
+    #[test]
+    fn g3_e_tidying_waits_while_the_clock_state_cant_be_read_so_a_new_statusline_value_stays() {
+        let (mut p, _fake, h) = provider("epoch-unreadable", vec![Ok(usage_text(100))]);
+        p.collect(NOW, false);
+        let five = |s: &ProviderSnapshot| {
+            s.windows
+                .iter()
+                .find(|w| w.id == "five_hour")
+                .map(|w| w.used_percent)
+        };
+        let step = |trusted: bool| {
+            let _lock = crate::clock::hold_clock_lock(&h).unwrap();
+            let state = crate::clock::ensure_locked(&h, || Ok(false)).unwrap();
+            crate::clock::advance_locked(&h, &state, trusted).unwrap();
+        };
+        step(false);
+        step(true);
+        crate::statusline::save_capture(
+            &h,
+            &json!({"five_hour": {"used_percentage": 30, "resets_at": 1794844800}}),
+            NOW + 2 * MINUTE_MS,
+        )
+        .unwrap();
+        // the clock state can't be read just while tidying: nothing is tidied (a value of the current epoch isn't taken for an old one)
+        let path = h.join("clock-epoch.json");
+        let saved = std::fs::read(&path).unwrap();
+        std::fs::write(&path, b"{").unwrap();
+        assert!(!p.forget_cached());
+        std::fs::write(&path, saved).unwrap();
+        assert!(p.forget_cached());
+        p.on_event(&Event::ClaudeStatuslineCaptured);
+        let after = p.collect(NOW + 3 * MINUTE_MS, false);
+        assert_eq!(five(&after), Some(30.0), "the new value is kept");
+    }
+
+    #[test]
+    fn an_acceptance_is_made_only_under_a_trusted_clock_and_said_only_once_saved() {
+        let (mut p, _fake, h) = provider("accept-epoch", vec![Ok(usage_text(10))]);
+        p.state.account_changed = true;
+        write_json_atomic(&h.join(STATE_FILE), &p.state).unwrap();
+        {
+            let _lock = crate::clock::hold_clock_lock(&h).unwrap();
+            let state = crate::clock::ensure_locked(&h, || Ok(false)).unwrap();
+            crate::clock::advance_locked(&h, &state, false).unwrap();
+        }
+        p.accept_account();
+        p.collect(NOW, true);
+        assert_eq!(p.account_accepted(), Some(false));
+        assert!(
+            load_state(&h.join(STATE_FILE)).account_changed,
+            "still pending"
+        );
+        // asked once: a later collect under a trusted clock doesn't accept it on its own
+        crate::push::trust_without_push(&h).unwrap();
+        p.collect(NOW + MINUTE_MS, true);
+        assert!(load_state(&h.join(STATE_FILE)).account_changed);
+        // the control: asked under a trusted clock, accepted and saved
+        p.accept_account();
+        p.collect(NOW + 2 * MINUTE_MS, true);
+        assert_eq!(p.account_accepted(), Some(true));
+        assert!(!load_state(&h.join(STATE_FILE)).account_changed);
+    }
+
+    #[test]
+    fn g3_i_an_acceptance_that_cant_be_saved_isnt_made_and_one_that_can_is_said() {
+        let (mut p, _fake, h) =
+            provider("accept-save", vec![Ok(usage_text(10)), Ok(usage_text(10))]);
+        p.state.account_changed = true;
+        write_json_atomic(&h.join(STATE_FILE), &p.state).unwrap();
+        // the state can't be written (a folder where its temporary file goes)
+        let tmp = h
+            .join(STATE_FILE)
+            .with_extension(format!("{}.tmp", std::process::id()));
+        std::fs::create_dir(&tmp).unwrap();
+        p.accept_account();
+        p.collect(NOW, true);
+        assert_eq!(p.account_accepted(), Some(false));
+        assert!(
+            p.state.account_changed,
+            "not made: nothing is fetched for the new account"
+        );
+        assert!(load_state(&h.join(STATE_FILE)).account_changed);
+        // the control: it can be saved, so it is made and said (saved by itself before the fetch and the last save)
+        std::fs::remove_dir(&tmp).unwrap();
+        p.accept_account();
+        p.collect(NOW + MINUTE_MS, true);
+        assert_eq!(p.account_accepted(), Some(true));
+        assert!(!load_state(&h.join(STATE_FILE)).account_changed);
+    }
+
+    #[test]
+    fn files_that_cant_be_read_are_not_taken_as_nothing_to_forget() {
+        let (mut p, _fake, h) = provider("forget-unreadable", vec![Ok(usage_text(10))]);
+        p.collect(NOW, false);
+        // a new epoch: the value is of the one before, so there is something to forget
+        {
+            let _lock = crate::clock::hold_clock_lock(&h).unwrap();
+            let state = crate::clock::ensure_locked(&h, || Ok(false)).unwrap();
+            crate::clock::advance_locked(&h, &state, true).unwrap();
+        }
+        // the state holds the /usage value but can't be read while forgetting (a folder in its place stands for an I/O error)
+        let state = h.join(STATE_FILE);
+        let saved = std::fs::read(&state).unwrap();
+        std::fs::remove_file(&state).unwrap();
+        std::fs::create_dir(&state).unwrap();
+        assert!(
+            !p.forget_cached(),
+            "not forgotten: the value may be read back later"
+        );
+        std::fs::remove_dir(&state).unwrap();
+        std::fs::write(&state, &saved).unwrap();
+        assert!(load_state(&state).last_ok.is_some(), "still there");
+        // the statusLine value can't be read: not forgotten either
+        let capture = h.join(crate::statusline::CAPTURE_FILE);
+        let _ = std::fs::remove_file(&capture);
+        std::fs::create_dir(&capture).unwrap();
+        assert!(!p.forget_cached());
+        std::fs::remove_dir(&capture).unwrap();
+        // readable again: forgotten
+        assert!(p.forget_cached());
+        assert!(load_state(&state).last_ok.is_none());
+        // contents that aren't a state are never read as values: nothing to forget (a broken file doesn't keep the refusal forever)
+        std::fs::write(&state, "not a state").unwrap();
+        assert!(p.forget_cached());
+        let _ = std::fs::remove_dir_all(h);
+    }
+
+    #[test]
     fn blocked_slows_down_until_reset() {
         // 5-hour window at 100%, reset 3 hours after NOW (11/17 1:00 JST = 16:00Z)
         let (mut p, fake, h) = provider(
@@ -2487,7 +3000,7 @@ Current session limit for org: 100% used
         assert_eq!(fake.calls(), 1);
         assert_eq!(
             p2.next_due_ms(NOW + 60 * MINUTE_MS),
-            p2.cli_check_due_ms(),
+            p2.cli_check_due_ms(NOW + 60 * MINUTE_MS),
             "no /usage scheduled"
         );
 
@@ -3056,7 +3569,7 @@ Current session limit for org: 100% used
         at += 8 * MINUTE_MS;
         p.collect(at, false);
         assert_eq!(fake.calls(), 1, "back to normal fetching once verified");
-        assert_eq!(p.cli_check_due_ms(), at + AUTH_INTERVAL_MS);
+        assert_eq!(p.cli_check_due_ms(at), at + AUTH_INTERVAL_MS);
         let _ = std::fs::remove_dir_all(h);
 
         // No schedule while stopped by organization managed settings either (next check in 1 hour)

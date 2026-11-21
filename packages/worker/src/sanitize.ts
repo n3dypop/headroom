@@ -13,6 +13,7 @@
 import {
   KNOWN_PLANS,
   KNOWN_SCOPES,
+  CLOCK_TOLERANCE_MS,
   KNOWN_WINDOWS,
   shouldReplaceCollectorSnapshot,
   type ErrorCode,
@@ -263,6 +264,27 @@ function cleanSnapshot(v: unknown, collector: string): Snapshot {
     if (p !== undefined && p !== null) providers[id] = cleanProvider(id, p, collector);
   }
   return { schema_version: 2, generated_at: generatedAt, providers, collector };
+}
+
+/**
+ * A PC's saved latest value held to today's clock rules (a row an earlier Worker kept may break them): a row sent with a clock off by more
+ * than the tolerance from its receipt keeps no values (today it would have been refused), and values stamped after the row's send time
+ * are dropped. Rows saved by today's Worker pass unchanged
+ */
+export function heldToClock(snapshot: Snapshot, receivedAt: string): Snapshot {
+  const skewed = !withinClock(snapshot, receivedAt);
+  const providers: Snapshot["providers"] = {};
+  for (const [id, p] of Object.entries(snapshot.providers) as [ProviderId, ProviderSnapshot][]) {
+    providers[id] = skewed ? { ...p, windows: [], fetched_at: null, blocked: null } : notAfterSend(id, p, snapshot.generated_at);
+  }
+  return { ...snapshot, providers };
+}
+
+/** Whether a saved row was sent with a clock today's Worker accepts (within the tolerance of its receipt) */
+export function withinClock(snapshot: Snapshot, receivedAt: string): boolean {
+  const sent = Date.parse(snapshot.generated_at);
+  const received = Date.parse(receivedAt);
+  return Number.isFinite(sent) && Number.isFinite(received) && Math.abs(sent - received) <= CLOCK_TOLERANCE_MS;
 }
 
 /**

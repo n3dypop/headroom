@@ -38,6 +38,39 @@ function loadLib(): Lib {
 const lib = loadLib();
 /** Copy values created inside vm to this realm (deepEqual doesn't treat arrays/objects from another realm as equal) */
 const plain = <T>(x: T): T => JSON.parse(JSON.stringify(x));
+
+/** The id of the settings generation the Keychain names now (null: settings of an earlier version, or none) */
+function currentId(k: Map<string, string>): string | null {
+  const current = k.get(lib.KEYCHAIN_CURRENT);
+  return current === undefined ? null : JSON.parse(current).id;
+}
+
+/** The settings saved now, in either form (a generation's own item, or the single item of earlier versions); null without */
+function savedConfig(k: Map<string, string>): any {
+  const id = currentId(k);
+  const text = id === null ? k.get(lib.KEYCHAIN_CONFIG) : k.get(`headroom.config.${id}`);
+  return text === undefined ? null : JSON.parse(text);
+}
+
+/** The Keychain's item names (seen markers left out), with the current generation's id shown as <id> */
+function itemNames(k: Map<string, string>): string[] {
+  const id = currentId(k);
+  return [...k.keys()].filter((x) => !x.startsWith("headroom.seen.")).map((x) => (id ? x.replace(id, "<id>") : x)).sort();
+}
+
+/** Settings saved by another run of this version: their own items, then the item naming them */
+function saveAs(k: Map<string, string>, config: string, switches: string | null = null): void {
+  const id = JSON.parse(config).id;
+  if (switches !== null) k.set(`headroom.notify.${id}`, switches);
+  k.set(`headroom.config.${id}`, config);
+  k.set(lib.KEYCHAIN_CURRENT, JSON.stringify({ id }));
+}
+
+/** The stored switches of the settings saved now (their generation's item, or the shared one of earlier versions); null without */
+function savedSwitches(k: Map<string, string>): string | null {
+  const id = currentId(k);
+  return k.get(id === null ? lib.KEYCHAIN_NOTIFY : `headroom.notify.${id}`) ?? null;
+}
 const TAG: string = lib.cacheTag({ id: lib.DEFAULT_CONFIG_ID }, "https://headroom.example.com");
 
 const fixture = (): Snapshot =>
@@ -164,6 +197,8 @@ function makeStack(kind: string): any {
     centerAlignContent() { node.props.align = "center"; }, topAlignContent() { node.props.align = "top"; }, bottomAlignContent() { node.props.align = "bottom"; },
     setPadding(...a: number[]) { node.props.padding = a; },
     set size(v: any) { node.props.size = v; },
+    set url(v: string) { node.props.url = v; },
+    get url() { return node.props.url as string; },
     addText(text: string) {
       const n = new Node("text", { text });
       node.children.push(n);
@@ -241,7 +276,7 @@ interface RunOptions {
   /** Make writes fail only for files whose name matches this */
   writeFailsFor?: RegExp;
   /** Called before returning the response (simulates settings changing during a fetch) */
-  onLoad?: (keychain: Map<string, string>) => void;
+  onLoad?: (keychain: Map<string, string>, url: string) => void;
   /** Called on every write (simulates another run interleaving) */
   onWrite?: (path: string, files: Map<string, string>) => void;
   removeFails?: boolean;
@@ -258,18 +293,50 @@ interface RunOptions {
   badImage?: boolean;
   /** Response per URL (return undefined to use response) */
   responder?: (url: string) => { status: number; body: unknown } | undefined;
+  /** Run outside a widget without the menu (opened by a URL or a shortcut) */
+  inApp?: boolean;
+  /** args.queryParameters (opened by a URL) and args.shortcutParameter */
+  query?: Record<string, string>;
+  shortcut?: unknown;
+  /** Device files and notifications kept across runs (a new set when omitted) */
+  files?: Map<string, string>;
+  notifier?: Notifier;
+  /** URLScheme.forRunningScript() (null: no URLScheme) */
+  scriptUrl?: string | null;
+  /** Make Notification.schedule fail */
+  scheduleFails?: boolean;
+  /** Make FileManager.listContents fail */
+  listFails?: boolean;
+  /** Let this many Notification.schedule calls succeed, then fail */
+  scheduleFailsAfter?: number;
 }
+
+/** Notifications on the stub device: pending (with a trigger), delivered, and everything scheduled in order */
+interface Notifier {
+  pending: Map<string, any>;
+  delivered: Map<string, any>;
+  log: any[];
+}
+const newNotifier = (): Notifier => ({ pending: new Map(), delivered: new Map(), log: [] });
 
 async function runWidget(opts: RunOptions) {
   const keychain = new Map(Object.entries(opts.keychain ?? { "headroom.url": "https://headroom.example.com", "headroom.token": "read-token-xyz" }));
   const sheets = Array.isArray(opts.app?.menu) ? [...opts.app!.menu] : [];
   const shownSizes: string[] = [];
-  const files = new Map<string, string>();
+  const files = opts.files ?? new Map<string, string>();
+  const notifier = opts.notifier ?? newNotifier();
+  const webPages: string[] = [];
+  const alertTitles: string[] = [];
+  const actionLabels: string[] = [];
+  let deliveredCalls = 0;
+  const copied: string[] = [];
+  let shortcutOutput: unknown = undefined;
   for (const c of [...(opts.cached ? [opts.cached] : []), ...(opts.cachedMany ?? [])]) {
     files.set(`/docs/${lib.cacheFileName(lib.cacheTag({ id: lib.DEFAULT_CONFIG_ID }, JSON.parse(c).origin), JSON.parse(c).view.data_version)}`, c);
   }
   for (const name of opts.extraFiles ?? []) files.set(`/docs/${name}`, "");
   const requests: any[] = [];
+  const listed = (dir: string) => [...files.keys()].filter((p) => p.startsWith(`${dir}/`)).map((p) => p.slice(dir.length + 1));
   let shown: any = null;
   class Color {
     hex: string;
@@ -282,16 +349,63 @@ async function runWidget(opts: RunOptions) {
   const globals = {
     console, Intl, Math, JSON, encodeURIComponent, Number, String, Object, Boolean, structuredClone,
     Date: fixedDate(clock),
-    config: { runsInWidget: !opts.app, widgetFamily: opts.family },
-    args: { widgetParameter: opts.parameter ?? null },
-    Script: { setWidget(w: any) { shown = w; }, complete() {} },
+    config: { runsInWidget: !opts.app && !opts.inApp, widgetFamily: opts.family },
+    args: { widgetParameter: opts.parameter ?? null, queryParameters: opts.query ?? {}, shortcutParameter: opts.shortcut ?? null },
+    Script: { setWidget(w: any) { shown = w; }, complete() {}, setShortcutOutput(v: unknown) { shortcutOutput = v; } },
+    ...(opts.scriptUrl === null ? {} : { URLScheme: { forRunningScript: () => opts.scriptUrl ?? "scriptable:///run/Headroom" } }),
+    Notification: class {
+      identifier = ""; title = ""; body = ""; threadIdentifier = ""; sound: string | null = null; openURL: string | null = null; userInfo: any = {};
+      trigger: Date | null = null;
+      setTriggerDate(d: Date) { this.trigger = d; }
+      async schedule() {
+        (opts as any).onSchedule?.(this.identifier, notifier, files);
+        if (opts.scheduleFails) throw new Error("not allowed");
+        if (opts.scheduleFailsAfter !== undefined && notifier.log.length >= opts.scheduleFailsAfter) throw new Error("failed");
+        const n = { id: this.identifier, title: this.title, body: this.body, openURL: this.openURL, trigger: this.trigger?.getTime() ?? null, at: clock.now.getTime(), userInfo: this.userInfo };
+        notifier.log.push(n);
+        if (n.trigger !== null) notifier.pending.set(n.id, n);
+        else notifier.delivered.set(n.id, n);
+      }
+      static async allPending() {
+        if ((opts as any).pendingFails) throw new Error("notifications");
+        (opts as any).onAllPending?.(keychain, notifier);
+        return [...notifier.pending.values()].map((n) => ({ identifier: n.id }));
+      }
+      static async allDelivered() {
+        deliveredCalls++;
+        if ((opts as any).deliveredFailsOnCall === deliveredCalls) throw new Error("notifications");
+        (opts as any).onAllDelivered?.(notifier, deliveredCalls);
+        return [...notifier.delivered.values()].map((n) => ({ identifier: n.id, title: n.title, body: n.body, userInfo: n.userInfo ?? {} }));
+      }
+      static async removePending(ids: string[]) {
+        for (const id of ids) notifier.pending.delete(id);
+        // removed, then the run stops (nothing after it in that run)
+        if ((opts as any).removePendingThenFails) throw new Error("stopped");
+      }
+      static async removeDelivered(ids: string[]) { for (const id of ids) notifier.delivered.delete(id); }
+    },
+    Pasteboard: { copyString: (text: string) => { copied.push(text); } },
+    WebView: class {
+      async loadHTML(html: string) { webPages.push(html); (opts as any).onLoadHTML?.(keychain); }
+      async present() {}
+    },
     // Scriptable also defines module (exports is an empty object) for every script. main must still run
     module: { exports: {} },
     Keychain: {
-      contains: (k: string) => keychain.has(k),
-      get: (k: string) => { if (opts.keychainGetFails) throw new Error("removed"); return keychain.get(k); },
-      set: (k: string, v: string) => { if (opts.keychainSetFails) throw new Error("keychain"); keychain.set(k, v); },
-      remove: (k: string) => keychain.delete(k),
+      contains: (k: string) => {
+        (opts as any).onKeychainContains?.(keychain, k);
+        return keychain.has(k);
+      },
+      get: (k: string) => {
+        if (opts.keychainGetFails || (opts as any).keychainGetFailsFor === k || (opts as any).keychainGetFailsWhen?.(k)) throw new Error("removed");
+        return keychain.get(k);
+      },
+      set: (k: string, v: string) => { if (opts.keychainSetFails) throw new Error("keychain"); (opts as any).onKeychainSet?.(k, v); keychain.set(k, v); },
+      remove: (k: string) => {
+        if ((opts as any).removeKeychainFails) throw new Error("keychain");
+        (opts as any).keychainRemove?.(k);
+        return keychain.delete(k);
+      },
     },
     Request: class {
       url: string;
@@ -303,7 +417,7 @@ async function runWidget(opts: RunOptions) {
       async load() {
         requests.push(this);
         if (opts.advanceTo) clock.now = opts.advanceTo;
-        opts.onLoad?.(keychain);
+        opts.onLoad?.(keychain, this.url);
         const r = opts.responder?.(this.url) ?? (opts.response === undefined ? { status: 200, body: sampleView() } : opts.response);
         if (r === null) throw new Error("offline");
         this.response = { statusCode: r.status };
@@ -316,14 +430,17 @@ async function runWidget(opts: RunOptions) {
         documentsDirectory: () => "/docs",
         joinPath: (a: string, b: string) => `${a}/${b}`,
         writeString: (p: string, s: string) => {
-          if (opts.writeFails || opts.writeFailsFor?.test(p)) throw new Error("disk");
+          if (opts.writeFails || opts.writeFailsFor?.test(p) || (opts as any).writeFailsWhen?.(p, s)) throw new Error("disk");
           files.set(p, s);
           opts.onWrite?.(p, files);
         },
-        readString: (p: string) => files.get(p),
+        readString: (p: string) => {
+          if ((opts as any).readFailsWhen?.(p)) throw new Error("disk");
+          return files.get(p);
+        },
         fileExists: (p: string) => files.has(p),
         remove: (p: string) => { if (opts.removeFails) throw new Error("disk"); files.delete(p); },
-        listContents: (dir: string) => [...files.keys()].filter((p) => p.startsWith(`${dir}/`)).map((p) => p.slice(dir.length + 1)),
+        listContents: (dir: string) => { if (opts.listFails || (opts as any).listFailsWhen?.()) throw new Error("disk"); return listed(dir); },
       }),
     },
     ListWidget: class {
@@ -334,6 +451,9 @@ async function runWidget(opts: RunOptions) {
           async presentSmall() { shown = root; shownSizes.push("small"); },
           async presentMedium() { shown = root; shownSizes.push("medium"); },
           async presentLarge() { shown = root; shownSizes.push("large"); },
+          async presentAccessoryRectangular() { shown = root; shownSizes.push("accessoryRectangular"); },
+          async presentAccessoryCircular() { shown = root; shownSizes.push("accessoryCircular"); },
+          async presentAccessoryInline() { shown = root; shownSizes.push("accessoryInline"); },
         });
       }
     },
@@ -361,25 +481,26 @@ async function runWidget(opts: RunOptions) {
     Alert: class {
       title = ""; message = "";
       fields: string[] = [];
-      addAction() {} addDestructiveAction() {} addCancelAction() {}
+      addAction(label: string) { actionLabels.push(label); } addDestructiveAction(label: string) { actionLabels.push(label); } addCancelAction() {}
       addTextField() { this.fields.push(""); } addSecureTextField() { this.fields.push(""); }
       async presentSheet() {
         presented.push("menu");
+        (opts as any).onSheet?.(keychain, presented.filter((p) => p === "menu").length);
         // A number picks the same option every time; an array picks in order (Cancel once exhausted)
         return Array.isArray(opts.app?.menu) ? (sheets.shift() ?? -1) : opts.app?.menu ?? 0;
       }
-      async present() { presented.push(this.fields.length ? "form" : "notice"); return 0; }
+      async present() { presented.push(this.fields.length ? "form" : "notice"); alertTitles.push(this.title); (opts as any).beforeConfirm?.(keychain); return (opts as any).answers?.shift() ?? 0; }
       textFieldValue(i: number) { return opts.app?.form?.[i] ?? ""; }
     },
   };
-  const context = vm.createContext(globals);
+  const context = vm.createContext({ ...globals, ...((opts as any).globals ?? {}) });
   let error: unknown = null;
   try {
     await vm.runInContext(`(async () => {\n${opts.code ?? code}\n})()`, context);
   } catch (e) {
     error = e;
   }
-  return { widget: shown, requests, files, keychain, presented, error, shownSizes };
+  return { widget: shown, requests, files, keychain, presented, error, shownSizes, notifier, webPages, shortcutOutput, copied, alertTitles, actionLabels };
 }
 
 test("Widget (medium): shows headings, usage, bars and reset timers, doesn't follow redirects, and saves the previous view with trimmed fields", async () => {
@@ -421,7 +542,7 @@ test("When fetching fails, shows the same server's previous view with staleness 
   const all = texts(stale.widget.node);
   const i = all.indexOf("5h limit", all.indexOf("Claude"));
   assert.equal(all[i + 1], "100%", "0% used after reset (estimated)");
-  assert.ok(all.includes("Reset?"));
+  assert.ok(all.includes("Reset"), "the time row keeps ↻ and says Reset once the reset time has passed");
   assert.ok(all.some((t) => /data from 3h 30m ago/.test(t)), all.join(" | "));
   const inline = await runWidget({ family: "accessoryInline", response: null, cached, now: late });
   assert.match(texts(inline.widget.node)[0]!, /^⚠︎ /, "the inline widget also shows the update failed");
@@ -448,18 +569,18 @@ test("When setting up again, older Access items are deleted, and changing the se
     "headroom.access_id": "old-id", "headroom.access_secret": "old-secret",
   };
   const cached = JSON.stringify({ saved_at: NOW.toISOString(), origin: "https://old.example", view: lib.sanitizeView(sampleView()) });
-  const run = await runWidget({ family: "medium", keychain, cached, app: { menu: 2, form: ["https://new.example", "new-token"] } });
-  const saved = JSON.parse(run.keychain.get("headroom.config")!);
+  const run = await runWidget({ family: "medium", keychain, cached, app: { menu: [3, 0], form: ["https://new.example", "new-token"] } });
+  const saved = savedConfig(run.keychain);
   assert.deepEqual([saved.url, saved.token, "accessId" in saved], ["https://new.example", "new-token", false]);
-  assert.deepEqual([...run.keychain.keys()].filter((k) => !k.startsWith("headroom.seen.")), ["headroom.config"], "older versions' separate items are not kept");
-  assert.equal(run.requests[0].headers["CF-Access-Client-Id"], undefined, "no Access headers");
+  assert.deepEqual(itemNames(run.keychain), ["headroom.config.<id>", "headroom.current", "headroom.notify.<id>"], "older versions' separate items are not kept");
+  assert.equal(run.requests.length, 0, "saving goes back to the menu without fetching");
   assert.ok(!latestCache(run.files)?.includes("old.example"), "the old server's values are not kept");
   // An empty token is not saved (the previous settings remain)
-  const empty = await runWidget({ family: "medium", keychain, app: { menu: 2, form: ["https://new.example", ""] } });
-  assert.equal(empty.keychain.has("headroom.config"), false, "not saved when the token is empty");
+  const empty = await runWidget({ family: "medium", keychain, app: { menu: [3, 0], form: ["https://new.example", ""] } });
+  assert.ok(currentId(empty.keychain) === null && !empty.keychain.has("headroom.config"), "not saved when the token is empty");
   assert.equal(empty.keychain.get("headroom.url"), "https://old.example");
   // Delete settings
-  const removed = await runWidget({ family: "medium", keychain, cached, app: { menu: 3 } });
+  const removed = await runWidget({ family: "medium", keychain, cached, app: { menu: [3, 2] } });
   assert.equal(removed.keychain.size, 0);
   assert.equal(removed.files.size, 0);
 });
@@ -505,10 +626,11 @@ test("If a reset passes while waiting for the fetch, drawing uses the time after
 
 test("Saving in the app writes the new item before deleting the old ones; if the write fails the old settings remain", async () => {
   const keychain = { "headroom.url": "https://old.example", "headroom.token": "old-token" };
-  const saved = await runWidget({ family: "medium", keychain, app: { menu: 2, form: ["https://new.example", "new-token", "", ""] } });
-  assert.deepEqual([...saved.keychain.keys()].filter((k) => !k.startsWith("headroom.seen.")), ["headroom.config"]);
-  const failed = await runWidget({ family: "medium", keychain, keychainSetFails: true, app: { menu: 2, form: ["https://new.example", "new-token", "", ""] } });
-  assert.ok(failed.error, "the write failed");
+  const saved = await runWidget({ family: "medium", keychain, app: { menu: [3, 0], form: ["https://new.example", "new-token", "", ""] } });
+  assert.deepEqual(itemNames(saved.keychain), ["headroom.config.<id>", "headroom.current", "headroom.notify.<id>"]);
+  const failed = await runWidget({ family: "medium", keychain, keychainSetFails: true, app: { menu: [3, 0], form: ["https://new.example", "new-token", "", ""] } });
+  assert.equal(failed.error, null);
+  assert.ok(failed.presented.includes("notice"), "says it couldn't save");
   // On failure the old items remain (not deleted before writing)
   assert.deepEqual([...failed.keychain.keys()].filter((k) => !k.startsWith("headroom.seen.")), ["headroom.url", "headroom.token"]);
 });
@@ -598,7 +720,7 @@ test("Deleting settings removes only Headroom's files (user scripts with the sam
   const keychain = { "headroom.config": JSON.stringify({ url: "https://headroom.example.com", token: "t", accessId: "", accessSecret: "" }) };
   const own = [lib.seenFileName(TAG, 100), lib.cacheFileName(TAG, 100), "headroom-view.json"];
   const user = ["headroom-notes.js", "headroom-view-backup.json", "headroom-seen-mine.txt"];
-  const removed = await runWidget({ family: "medium", keychain, extraFiles: [...own, ...user], app: { menu: 3 } });
+  const removed = await runWidget({ family: "medium", keychain, extraFiles: [...own, ...user], app: { menu: [3, 2] } });
   assert.deepEqual([...removed.files.keys()].map((p) => p.split("/").pop()).sort(), [...user].sort());
   for (const name of user) assert.equal(lib.OWN_FILE.test(name), false, name);
   // Register the same URL again (D1 recreated, numbers start from 1)
@@ -634,8 +756,8 @@ test("Re-saving settings changes the generation, so numbers from fetches started
   assert.ok(texts(run.widget.node).includes("5h limit"), "number 1 of the new generation is used");
   assert.ok(run.files.has(`/docs/${lib.seenFileName(lib.cacheTag({ id }, "https://headroom.example.com"), 1)}`));
   // Every save in the app makes a new generation
-  const saved = await runWidget({ family: "medium", keychain, app: { menu: 2, form: ["https://headroom.example.com", "t", "", ""] } });
-  const newId = JSON.parse(saved.keychain.get("headroom.config")!).id;
+  const saved = await runWidget({ family: "medium", keychain, app: { menu: [3, 0], form: ["https://headroom.example.com", "t", "", ""] } });
+  const newId = savedConfig(saved.keychain).id;
   assert.match(newId, /^[0-9a-f]{16}$/);
   assert.notEqual(newId, id);
 });
@@ -969,12 +1091,12 @@ test("When an old response leads to showing a newer previous view, the trend is 
   assert.equal(run.requests.filter((r: any) => r.url.includes("/v2/history")).length, 0);
 });
 
-test("Even small adds est. to limits that are reset (estimated), and the header dot uses the oldest fetch among the shown limits", async () => {
+test("Even small puts ↻ before limits that are reset (estimated), and the header dot uses the oldest fetch among the shown limits", async () => {
   const view = sampleView();
   view.claude!.windows.five_hour!.fetched_at = "2026-11-16T15:35:00.000Z";
   view.claude!.windows.seven_day!.fetched_at = "2026-11-16T16:00:00.000Z";
   const run = await runWidget({ family: "small", response: { status: 200, body: view }, now: new Date("2026-11-16T16:01:00.000Z") });
-  assert.ok(texts(run.widget.node).includes("100% · est."), texts(run.widget.node).join(" | "));
+  assert.ok(texts(run.widget.node).includes("↻ 100%"), texts(run.widget.node).join(" | "));
   assert.deepEqual(plain(lib.freshnessOf(lib.sanitizeView(view), "claude", new Date("2026-11-16T16:01:00.000Z"))), { level: "stale", text: "26m" });
 });
 
@@ -1361,9 +1483,9 @@ test("Demo: draws every state with made-up values only (no network, no saving; D
   assert.ok(images(chart.widget.node).some((n) => (n.props.strokes as number) >= 5), "draws the demo 7-day trend");
 });
 
-test("The app menu's 'Show demo': choose a demo and size to show, and choose again after closing (no network)", async () => {
-  // Menu: Show demo -> demo runout -> Large -> demo stale -> Small -> Done
-  const run = await runWidget({ family: "medium", runsInWidget: false, app: { menu: [1, 1, 2, 3, 0, -1] } } as any);
+test("The app menu's 'Preview widget' > 'Sample data': choose a sample and sizes to show, and choose again after closing (no network)", async () => {
+  // Menu: Preview widget -> Sample data -> runs out -> Large -> Back -> stale -> Small -> Back, Back, Back, Close
+  const run = await runWidget({ family: "medium", runsInWidget: false, app: { menu: [1, 1, 1, 2, -1, 3, 0] } } as any);
   assert.equal(run.error, null, String(run.error));
   assert.deepEqual(run.shownSizes, ["large", "small"]);
   assert.equal(run.requests.length, 0);
@@ -1451,16 +1573,22 @@ test("Lock screen marks stack reset estimate, staleness and approximation (also 
   assert.equal(lib.shortMark({ value_status: "stale", age_minutes: 20, provider_blocked: true }), "", "at the limit, no age (the red dot alone at home)");
   assert.equal(lib.shortMark({ value_status: null }), "", "unknown age (the gray dot alone at home)");
   assert.equal(lib.shortMark({ value_status: "fresh", age_minutes: 3 }), "");
-  assert.equal(lib.shortMark({ value_status: "reset_estimated", recent_quality: "unknown" }), "est.");
+  assert.equal(lib.shortMark({ value_status: "reset_estimated", recent_quality: "unknown" }), "↻");
+  assert.equal(lib.shortMark({ value_status: "reset_estimated" }, true), "", "left to the time row (↻ Reset) where there is one");
   const cached = JSON.stringify({ saved_at: NOW.toISOString(), origin: "https://headroom.example.com", view: lib.sanitizeView(sampleView()) });
   const late = new Date("2026-11-16T16:30:00.000Z");
   const inline = await runWidget({ family: "accessoryInline", parameter: "claude.five_hour", response: null, cached, now: late });
-  assert.equal(texts(inline.widget.node)[0], "⚠︎ Claude 5h 100% (est.)");
+  assert.equal(texts(inline.widget.node)[0], "⚠︎ Claude 5h ↻100%");
   const circular = await runWidget({ family: "accessoryCircular", parameter: "claude.five_hour", response: null, cached, now: late });
-  assert.deepEqual(texts(circular.widget.node), ["5h ⚠︎ est."]);
+  assert.deepEqual(texts(circular.widget.node), ["5h ⚠︎ ↻"]);
   assert.equal((images(circular.widget.node).find((n) => n.props.ring)?.props.drawnTexts as string[]).at(-1), "100%");
   const rect = await runWidget({ family: "accessoryRectangular", parameter: "claude.five_hour", response: null, cached, now: late });
   assert.ok(texts(rect.widget.node).some((x) => x.includes("Can't update")), texts(rect.widget.node).join(" | "));
+  assert.ok(texts(rect.widget.node).includes("↻"), "with no time row (the failure note instead), ↻ goes next to the value");
+  const fresh = { ...lib.sanitizeView(sampleView()), data_version: 1, view_version: 1 };
+  const reset = await runWidget({ family: "accessoryRectangular", parameter: "claude.five_hour", response: { status: 200, body: fresh }, now: late });
+  const all = texts(reset.widget.node);
+  assert.ok(all.includes("Reset") && !all.includes("↻"), all.join(" | "));
 });
 
 test("Without embedded icons, the provider's initial is drawn inside the ring (no untinted fallback symbol)", async () => {
@@ -1766,13 +1894,13 @@ test("Header: icon, name and freshness dot are centered; the plan aligns with th
   assert.equal((header.props.size as any).h, lib.SCALES.medium.header, "header height is fixed");
 });
 
-test("Compacting the inline text keeps the est. reset estimate; with two scoped limits the names are shortened", () => {
+test("Compacting the inline text keeps the ↻ reset estimate; with two scoped limits the names are shortened", () => {
   const w = (id: string, used: number, extra: any = {}) => ({ id, used_percent: used, remaining_percent: 100 - used, remaining_percent_int: 100 - used, value_status: "fresh", scope: null, ...extra });
   const est = lib.inlineText([
     { provider: "codex", providerName: "Codex", window: w("five_hour", 0, { value_status: "reset_estimated" }) },
     { provider: "claude", providerName: "Claude", window: w("five_hour", 0, { value_status: "reset_estimated" }) },
   ], true, "Demo · ");
-  assert.equal((est.match(/est\.|~\d/g) ?? []).length, 2, `estimate marks (est. or ~) kept on both: ${est}`);
+  assert.equal((est.match(/↻/g) ?? []).length, 2, `reset marks kept on both: ${est}`);
   assert.ok(lib.textWidth(est, 11) <= lib.INLINE_WIDTH, `${est}: ${lib.textWidth(est, 11)}`);
   const scoped = lib.inlineText([
     { provider: "codex", providerName: "Codex", window: w("codex_other_seven_day", 12, { scope: "codex_other", value_status: "stale", age_minutes: 26 }) },
@@ -1798,7 +1926,7 @@ test("Fixed row heights match the visible-row estimate; inline fits even when bo
     { provider: "claude", providerName: "Claude", window: w("seven_day_fable", "Fable") },
   ], true);
   assert.ok(lib.textWidth(text, 11) <= lib.INLINE_WIDTH, `${text}: ${lib.textWidth(text, 11)}`);
-  assert.ok(text.startsWith(lib.WARN_MARK) && (text.match(/~\d/g) ?? []).length === 2, text);
+  assert.ok(text.startsWith(lib.WARN_MARK) && (text.match(/↻/g) ?? []).length === 2, text);
 });
 
 test("Medium/large Not available is left-aligned (the row width is fixed, so a flexible spacer follows)", async () => {
@@ -1884,24 +2012,53 @@ test("While a provider is at its limit, values that stopped updating get a red d
   const view = lib.sanitizeView(raw);
   assert.equal(view.claude.blocked, true, "the limit flag survives reading the response");
   assert.notEqual(lib.sanitizeView(sampleView()).claude.blocked, true);
-  assert.equal(lib.freshnessOf(view, "claude", NOW).level, "fresh", "still fresh right after a fetch");
+  assert.equal(lib.freshnessOf(lib.sanitizeView(sampleView()), "claude", NOW).level, "fresh");
+  assert.equal(lib.freshnessOf(view, "claude", NOW).level, "limit", "red right after a fetch too (fetching slows to hourly at the limit)");
   assert.deepEqual(plain(lib.freshnessOf(view, "claude", new Date("2026-11-16T13:30:00.000Z"))), { level: "limit", text: "" }, "no age next to the red dot");
   assert.equal(lib.FRESH_COLORS.limit, "#FF3B30");
 });
 
-test("After the run-out time passes with no newer value, the row says Limit?; after a reset time, Reset?", async () => {
+test("Once every shown limit at 100% is past its reset, the dot goes back to the age", () => {
+  const raw = sampleView();
+  raw.claude!.blocked = true;
+  const view = lib.sanitizeView(raw);
+  const ids = view.claude.main_window_ids as string[];
+  for (const id of ids) view.claude.windows[id].used_percent = 100;
+  const resets = ids.map((id) => Date.parse(view.claude.windows[id].resets_at));
+  const before = new Date(Math.max(...resets) - 60000);
+  assert.equal(lib.freshnessOf(view, "claude", before).level, "limit");
+  const after = new Date(Math.max(...resets) + 60000);
+  assert.notEqual(lib.freshnessOf(view, "claude", after).level, "limit");
+  // None at 100% before any reset (the limit that blocks isn't among the shown ones): still red
+  for (const id of ids) view.claude.windows[id].used_percent = 50;
+  assert.equal(lib.freshnessOf(view, "claude", new Date(Math.min(...resets) - 60000)).level, "limit");
+  // a view the server built after the reset shows the passed limit as 0% with the flag still set: the dot goes back to the age
+  const rebuilt = lib.sanitizeView(raw);
+  rebuilt.claude.windows[ids[0]!].used_percent = 0;
+  const pastFirst = new Date(Math.min(...resets) + 60000);
+  for (const id of ids.slice(1)) rebuilt.claude.windows[id].used_percent = 40;
+  assert.notEqual(lib.freshnessOf(rebuilt, "claude", pastFirst).level, "limit");
+  // Red even when the fetch time is unknown (still at 100% with the reset ahead)
+  const unknown = lib.sanitizeView(raw);
+  for (const id of ids) Object.assign(unknown.claude.windows[id], { used_percent: 100, fetched_at: null });
+  assert.equal(lib.freshnessOf(unknown, "claude", new Date(Math.min(...resets) - 60000)).level, "limit");
+});
+
+test("After the run-out time passes with no newer value, the row keeps ⚠ and says Limit; after a reset time, ↻ Reset", async () => {
   const now = new Date("2026-11-16T13:05:00.000Z");
   const view = lib.demoResult("runout", now).view;
   const five = view.claude.windows.five_hour;
   const at = lib.projectionOf(lib.atDisplayTime(five, now), now).at as number;
   const later = new Date(at + 2 * 60000);
-  assert.deepEqual(plain(lib.timeShort(lib.atDisplayTime(five, later), later)), { warn: true, kind: "text", text: "Limit?" });
+  assert.deepEqual(plain(lib.timeShort(lib.atDisplayTime(five, later), later)), { warn: true, kind: "text", text: "Limit" });
   const run = await runWidget({ family: "medium", response: { status: 200, body: { ...view, data_version: 1, view_version: 1 } }, now: later });
-  assert.ok(texts(run.widget.node).includes("Limit?"), texts(run.widget.node).join(" | "));
-  // A newer value at 100% shows the reset again, and past the reset it is Reset?
+  assert.ok(texts(run.widget.node).includes("Limit"), texts(run.widget.node).join(" | "));
+  const small = await runWidget({ family: "small", response: { status: 200, body: { ...view, data_version: 1, view_version: 1 } }, now: later });
+  assert.ok(texts(small.widget.node).some((t) => t.startsWith("⚠︎ ")), "small (no time row) puts ⚠ before the value");
+  // A newer value at 100% shows the reset again, and past the reset it is ↻ Reset
   assert.equal(lib.timeShort(lib.atDisplayTime({ ...five, used_percent: 100, fetched_at: later.toISOString() }, later), later).warn, false);
   const afterReset = new Date(Date.parse(five.resets_at) + 60000);
-  assert.equal(lib.timeShort(lib.atDisplayTime(five, afterReset), afterReset), null);
+  assert.deepEqual(plain(lib.timeShort(lib.atDisplayTime(five, afterReset), afterReset)), { warn: false, kind: "text", text: "Reset" });
 });
 
 test("The provider name is never cut off: when the header is too narrow, the plan is left out first", async () => {
@@ -1961,4 +2118,2650 @@ test("Lock screen: a provider at its limit shows no age, like the red dot at hom
   assert.ok(!texts(rect.widget.node).some((x) => /^\d+m$/.test(x)), texts(rect.widget.node).join(" | "));
   const home = await runWidget({ family: "medium", response: { status: 200, body }, now: later });
   assert.ok(images(home.widget.node).some((n) => (n.props.fills as any[])?.some((c) => c?.hex === lib.FRESH_COLORS.limit)), "the home screen shows the red dot");
+});
+
+test("The large chart marks each provider's weekly reset times this week with a dashed line", async () => {
+  const now = new Date("2026-11-19T12:00:00");
+  const range = lib.weekRange(now);
+  const reset = new Date("2026-11-20T19:51:00").getTime();
+  // This cycle's reset and the one before it (the start of this cycle) when both fall in the week; the next one is in next week
+  assert.deepEqual(plain(lib.resetTimes({ resets_at: new Date(reset).toISOString() }, range)), [reset]);
+  const early = new Date("2026-11-17T10:00:00").getTime();
+  assert.deepEqual(plain(lib.resetTimes({ resets_at: new Date(early + 7 * 86_400_000).toISOString() }, range)), [early]);
+  assert.deepEqual(plain(lib.resetTimes({ resets_at: null }, range)), []);
+  const strokes = async (resets: boolean) => {
+    const view = lib.demoResult("normal", now).view;
+    if (!resets) for (const p of [view.codex, view.claude]) for (const w of Object.values(p.windows) as any[]) w.resets_at = null;
+    const run = await runWidget({ family: "large", response: { status: 200, body: { ...view, data_version: 1, view_version: 1 } }, now });
+    const chart = images(run.widget.node).find((n) => ((n.props as any).drawnTexts ?? []).includes("100%"));
+    return chart!.props.strokes as number;
+  };
+  assert.ok(await strokes(true) > await strokes(false), "reset lines are drawn");
+});
+
+test("The large chart's even pace runs from 0% at the cycle start to 100% at the reset, clipped to the week", () => {
+  const now = new Date("2026-11-19T12:00:00");
+  const range = lib.weekRange(now);
+  const week = 7 * 86_400_000;
+  const reset = new Date("2026-11-20T19:51:00").getTime();
+  const guide = plain(lib.paceGuide({ resets_at: new Date(reset).toISOString() }, range, now));
+  assert.deepEqual(guide[1], [reset, 100], "ends at 100% at the reset");
+  assert.equal(guide[0][0], range.start, "starts at the week's start when the cycle began last week");
+  assert.ok(Math.abs(guide[0][1] - (100 * (range.start - (reset - week))) / week) < 1e-9, "interpolated at the edge");
+  // A reset that passed since the fetch: the next cycle starts at that time
+  const passed = new Date("2026-11-19T10:00:00").getTime();
+  const next = plain(lib.paceGuide({ resets_at: new Date(passed).toISOString() }, range, now));
+  assert.deepEqual(next[0], [passed, 0]);
+  assert.equal(next[1][0], range.end);
+  assert.equal(lib.paceGuide({ resets_at: null }, range, now), null);
+});
+
+test("The large chart's forecast continues at the bar's rate to the run-out time (ring) or to the reset", () => {
+  const now = new Date("2026-11-19T12:00:00");
+  const range = lib.weekRange(now);
+  const fetched = now.getTime() - 60_000;
+  const w = (o: Record<string, unknown>) => ({ id: "seven_day", used_percent: 60, confidence: "high", fetched_at: new Date(fetched).toISOString(),
+    resets_at: new Date(now.getTime() + 3 * 86_400_000).toISOString(), rate_pace: 2, ...o });
+  // 40% left at 2%/h runs out in 20 hours, before the reset in 3 days
+  const fast = plain(lib.forecastSegment(w({}), range, now));
+  assert.equal(fast.runsOut, true);
+  assert.deepEqual(fast.segment[0], [fetched, 60]);
+  assert.deepEqual(fast.segment[1], [fetched + 20 * 3_600_000, 100]);
+  // 0.1%/h lasts until the reset; the line is cut at the end of the week (Sunday 00:00) and isn't a run-out
+  const slow = plain(lib.forecastSegment(w({ rate_pace: 0.1 }), range, now));
+  assert.equal(slow.runsOut, false);
+  assert.equal(slow.segment[1][0], range.end);
+  assert.ok(slow.segment[1][1] < 100);
+  // Same conditions as the bar's forecast
+  assert.equal(lib.forecastSegment(w({ confidence: "low" }), range, now), null);
+  assert.equal(lib.forecastSegment(w({ used_percent: 100 }), range, now), null);
+  assert.equal(lib.forecastSegment(w({ rate_pace: 0 }), range, now), null, "a rate too small to measure draws nothing");
+});
+
+test("The large chart draws the even pace and a dotted forecast with a ring where it runs out", async () => {
+  const now = new Date("2026-11-19T12:00:00");
+  const chartOf = async (view: any) => {
+    const run = await runWidget({ family: "large", response: { status: 200, body: { ...view, data_version: 1, view_version: 1 } }, now });
+    return images(run.widget.node).find((n) => ((n.props as any).drawnTexts ?? []).includes("100%"))!.props as any;
+  };
+  // Demo "runs out": Codex weekly 65% at 1.2%/h runs out in about a day, before its reset in 3 days
+  const runout = await chartOf(lib.demoResult("runout", now).view);
+  assert.equal(runout.ellipses, 1, "a ring where Codex runs out");
+  assert.ok(runout.widths.includes(1.5), "dotted forecast");
+  const normal = await chartOf(lib.demoResult("normal", now).view);
+  assert.equal(normal.ellipses, 0, "no ring when both last until the reset");
+  const marks = plain(lib.trendMarks([{ provider: "codex", window: lib.demoResult("runout", now).view.codex.windows.seven_day }], lib.weekRange(now), now, 300, 100));
+  assert.equal(marks.guides.length, 1);
+  assert.equal(marks.forecasts.length, 1);
+  assert.equal(marks.forecasts[0].runsOut, true);
+  assert.ok(marks.forecasts[0].to[1] < marks.forecasts[0].from[1], "heads up toward 100%");
+});
+
+// ---- Notifications and the details screen ----
+
+const NOTE_NOW = new Date("2026-11-19T12:00:00Z");
+/** A sanitized event (defaults: Claude 5h, cycle ending at 15:00Z, created a minute before NOTE_NOW) */
+const ev = (seq: number, kind: string, o: Record<string, unknown> = {}) => ({
+  seq, created_at: new Date(NOTE_NOW.getTime() - 60_000).toISOString(), kind, provider: "claude", window_id: "five_hour", label: "5h", scope: null,
+  cycle: "2026-11-19T15:00:00.000Z", threshold: null, used_percent: null, eta_minutes: null, resets_at: "2026-11-19T15:00:00.000Z",
+  blocked: null, error_code: null, confirmed: null, last_received_at: null, ...o,
+});
+/** What each alert says: provider, limit and text ("claude 5h ⊘ Limit reached · ↻ 3:00 PM") */
+const titles = (r: any) => plain(r.alerts.map((a: any) => [a.provider, a.limit, a.text].filter(Boolean).join(" ")));
+const S = lib.SYMBOLS;
+
+test("Notifications: \"notify\" in the parameter chooses the notifying widget; the rest chooses what to show", () => {
+  assert.deepEqual(plain(lib.splitNotify("notify")), { display: "", notify: true });
+  assert.deepEqual(plain(lib.splitNotify("claude, notify")), { display: "claude", notify: true });
+  assert.deepEqual(plain(lib.splitNotify("claude.five_hour, NOTIFY, codex.seven_day")), { display: "claude.five_hour, codex.seven_day", notify: true });
+  assert.deepEqual(plain(lib.splitNotify("claude.five_hour,codex.seven_day")), { display: "claude.five_hour,codex.seven_day", notify: false }, "unchanged without notify");
+  assert.deepEqual(plain(lib.splitNotify(null)), { display: null, notify: false });
+  assert.equal(lib.splitNotify("notifyme").notify, false);
+  assert.deepEqual(plain(lib.notifyPrefs(null)), { events: true, times: true, rev: 0, times_off_at: null, cancel_pending: false, cancelled: [], cancels: [] }, "both on until turned off");
+  assert.deepEqual(plain(lib.notifyPrefs('{"times":false,"rev":3,"times_off_at":5}')), { events: true, times: false, rev: 3, times_off_at: 5, cancel_pending: false, cancelled: [], cancels: [] });
+  assert.equal(lib.notifyPrefs("not json"), null, "a corrupt value is not taken for the defaults");
+  // an earlier format: identifiers alone, cancelled when time reminders were last turned off
+  assert.deepEqual(plain(lib.notifyPrefs('{"times":false,"times_off_at":7,"cancelled":["headroom.0000000000000000.back.claude.all.1"]}')).cancelled,
+    [{ id: "headroom.0000000000000000.back.claude.all.1", at: 7 }]);
+});
+
+test("Time reminders: one at the latest reset of a provider at its limit, one 15 minutes before a forecast run-out", () => {
+  const now = NOTE_NOW;
+  // Demo "reset": Codex 5h at 100% resets in 2 hours (Claude's 5h reset has passed)
+  const view = plain(lib.demoResult("reset", now).view);
+  const back = plain(lib.reminderPlan(view, now));
+  assert.deepEqual(back.map((x: any) => [x.kind, x.provider, x.window_id]), [["back", "codex", "five_hour"]]);
+  assert.equal(back[0].fire_at, now.getTime() + 120 * 60_000);
+  assert.equal(back[0].title, "Codex · 5h limit", "the provider's name first, then the limit's full name");
+  assert.equal(back[0].body, `${S.reset} Reset · usable again`);
+  // Both limits at 100%: it can't be used until the later one resets, so only that one
+  view.codex.windows.seven_day.used_percent = 100;
+  const both = plain(lib.reminderPlan(view, now));
+  assert.equal(both.length, 1);
+  assert.equal(both[0].window_id, "seven_day");
+  assert.equal(both[0].fire_at, Date.parse(view.codex.windows.seven_day.resets_at));
+  // Demo "runs out": Claude 5h runs out in about an hour, Codex weekly in about a day
+  const runout = plain(lib.reminderPlan(plain(lib.demoResult("runout", now).view), now));
+  assert.deepEqual(runout.map((x: any) => [x.kind, x.provider, x.window_id]), [["runout", "codex", "seven_day"], ["runout", "claude", "five_hour"]]);
+  const claude = runout[1];
+  assert.equal(claude.fire_at, now.getTime() - 60_000 + 60 * 60_000 - lib.RUNOUT_LEAD_MINUTES * 60_000, "15 minutes before the run-out time");
+  assert.equal(claude.title, "Claude · 5h limit");
+  assert.ok(claude.body.startsWith(`${S.runout} ~15 min left (runs out `), claude.body);
+  // Less than 15 minutes left: right away, with the minutes left
+  const close = plain(lib.demoResult("runout", now).view);
+  close.claude.windows.five_hour.used_percent = 95;
+  const soon = plain(lib.reminderPlan(close, now)).find((x: any) => x.provider === "claude");
+  assert.equal(soon.fire_at, now.getTime());
+  assert.match(soon.body, new RegExp(`^${S.runout} ~9 min left`));
+});
+
+test("Time reminders are scheduled once per cycle: moved while pending, cancelled when no longer planned, never rung twice", () => {
+  const now = NOTE_NOW.getTime();
+  const gen = "0123456789abcdef";
+  const reset = now + 3 * 3_600_000;
+  const item = { kind: "runout", provider: "claude", window_id: "five_hour", cycle: reset, fire_at: now + 44 * 60_000, title: "t", body: "b" };
+  const first = plain(lib.reconcileReminders([], [item], NOTE_NOW, gen));
+  assert.equal(first.schedule.length, 1);
+  // no account stamp in the plan (x), then the operation's own mark
+  const id = first.schedule[0].id;
+  assert.match(id, new RegExp(`^headroom\\.${gen}\\.runout\\.claude\\.five_hour\\.${Math.round(reset / 60_000)}\\.x\\.[0-9a-f]{8}$`));
+  const same = plain(lib.reconcileReminders(first.reminders, [{ ...item, cycle: reset + 90_000, fire_at: item.fire_at + 60_000 }], new Date(now + 60_000), gen));
+  assert.deepEqual([same.schedule.length, same.cancel.length], [0, 0], "a jittering reset time or a minute's change doesn't reschedule");
+  const moved = plain(lib.reconcileReminders(first.reminders, [{ ...item, fire_at: item.fire_at - 10 * 60_000 }], NOTE_NOW, gen));
+  assert.equal(moved.schedule.length, 1);
+  assert.notEqual(moved.schedule[0].id, id, "a new time is a new operation, under its own identifier");
+  assert.deepEqual(plain(moved.cancel), [id], "and the old one is cancelled");
+  const gone = plain(lib.reconcileReminders(first.reminders, [], NOTE_NOW, gen));
+  assert.deepEqual(gone.cancel, [id], "cancelled when the forecast no longer runs out");
+  assert.deepEqual(gone.reminders, []);
+  const after = new Date(item.fire_at + 60_000);
+  const rung = plain(lib.reconcileReminders(first.reminders, [{ ...item, fire_at: after.getTime() + 5 * 60_000 }], after, gen));
+  assert.deepEqual([rung.schedule.length, rung.cancel.length, rung.reminders.length], [0, 0, 1], "a reminder that rang isn't scheduled again in its cycle");
+  const kept = plain(lib.reconcileReminders(first.reminders, [], after, gen));
+  assert.deepEqual([kept.cancel.length, kept.reminders.length], [0, 1], "remembered after it rang");
+  const lost = plain(lib.reconcileReminders(first.reminders, [item], NOTE_NOW, gen, new Set()));
+  assert.deepEqual(plain(lost.schedule.map((x: any) => x.id)), [id], "a pending one the device no longer has is scheduled again");
+  const there = plain(lib.reconcileReminders(first.reminders, [item], NOTE_NOW, gen, new Set([id])));
+  assert.equal(there.schedule.length, 0, "not while the device still has it");
+  const forgotten = plain(lib.reconcileReminders(first.reminders, [], new Date(item.fire_at + 9 * 86_400_000), gen));
+  assert.equal(forgotten.reminders.length, 0, "forgotten after 8 days");
+});
+
+test("Events: the response is validated; a malformed event is skipped", () => {
+  assert.equal(lib.sanitizeEvents(null), null);
+  assert.equal(lib.sanitizeEvents({ last_seq: -1, events: [] }), null);
+  assert.equal(lib.sanitizeEvents({ last_seq: 3, events: "x" }), null);
+  const clean = plain(lib.sanitizeEvents({ last_seq: 9, oldest_seq: 2, events: [
+    { ...ev(5, "limit"), extra: "dropped" }, { seq: "6", kind: "limit" }, { ...ev(7, "unknown") }, { ...ev(4, "reset"), window_id: null, provider: "x" },
+  ] }));
+  assert.deepEqual(clean.events.map((e: any) => e.seq), [4, 5], "sorted, malformed ones skipped");
+  assert.equal(clean.events[0].window_id, null);
+  assert.equal(clean.events[0].provider, null);
+  assert.ok(!("extra" in clean.events[1]));
+  assert.equal(clean.last_seq, 9);
+});
+
+test("Alerts: a limit that runs out rings at most three times per cycle (warning, limit, reset); time reminders take the warning", () => {
+  const told = { limits: [], warned: [] };
+  const batch = [ev(1, "soon", { threshold: 30, eta_minutes: 30 }), ev(2, "threshold", { threshold: 95 }), ev(3, "soon", { threshold: 15, eta_minutes: 15 })];
+  // Time reminders off: the first warning of the cycle only
+  const warn = lib.selectAlerts(batch, null, NOTE_NOW, { told, times: false });
+  assert.deepEqual(titles(warn), [`claude 5h ${S.runout} ~29 min left at this pace`], "counted from now (created a minute ago)");
+  assert.deepEqual(titles(lib.selectAlerts([ev(4, "threshold", { threshold: 95 })], null, NOTE_NOW, { told: warn.told, times: false })), [], "once per cycle");
+  // Time reminders on: their run-out reminder rings on time, so the events' warnings are not told
+  assert.deepEqual(titles(lib.selectAlerts(batch, null, NOTE_NOW, { told, times: true })), []);
+  // Limit reached, then the reset of that cycle
+  const limit = lib.selectAlerts([ev(5, "limit", { blocked: true })], null, NOTE_NOW, { told, times: true });
+  assert.equal(titles(limit).length, 1);
+  assert.equal(titles(limit)[0], `claude 5h ${S.limit} Limit reached · ${S.reset} ${lib.clockText(new Date("2026-11-19T15:00:00Z"), NOTE_NOW)}`, "when it comes back");
+  assert.equal(titles(lib.selectAlerts([ev(7, "limit")], null, NOTE_NOW, { told: limit.told })).length, 1, "another limit event of the cycle is another account's (the same event is kept from repeating by the cursor and the numbers told)");
+  const later = new Date("2026-11-19T15:06:00Z");
+  const reset = ev(6, "reset", { confirmed: true, created_at: "2026-11-19T15:05:00Z", resets_at: "2026-11-19T20:00:00Z" });
+  const told2 = plain(limit.told);
+  assert.deepEqual(titles(lib.selectAlerts([reset], null, later, { told: told2, times: true })), [`claude 5h ${S.reset} Reset · usable again`]);
+  assert.deepEqual(titles(lib.selectAlerts([{ ...reset, confirmed: false }], null, later, { told: told2 })), [`claude 5h ${S.reset} Reset (estimated) · usable again`]);
+  const rang = [{ kind: "back", provider: "claude", cycle: Date.parse("2026-11-19T15:00:30Z"), fire_at: Date.parse("2026-11-19T15:00:30Z") }];
+  assert.deepEqual(titles(lib.selectAlerts([reset], null, later, { told: told2, reminders: rang, times: true })), [], "the reminder already rang at the reset");
+  assert.deepEqual(titles(lib.selectAlerts([reset], null, later, { told: told2, reminders: rang, times: false })), [], "a reminder that rang counts even with time reminders now off");
+  const soonToRing = [{ ...rang[0], fire_at: later.getTime() + 30_000 }];
+  assert.deepEqual(titles(lib.selectAlerts([reset], null, later, { told: told2, reminders: soonToRing })), [], "one ringing within a minute counts too (no second notification 30 seconds apart)");
+  assert.deepEqual(titles(lib.selectAlerts([reset], null, later, { told })), [], "no reset without a told limit");
+  // A provider still at another limit: its reset isn't good news yet
+  const full = plain(lib.demoResult("reset", later).view);
+  const codexReset = { ...reset, provider: "codex", window_id: "seven_day", label: "Weekly" };
+  const codexTold = { limits: [{ key: `codex.seven_day.${reset.cycle}`, at: later.getTime() }], warned: [] };
+  assert.deepEqual(titles(lib.selectAlerts([codexReset], full, later, { told: codexTold })), []);
+});
+
+test("Alerts: weekly 80%, collection and sign-in problems are told; noise, stale and old events are not", () => {
+  const told = { limits: [], warned: [] };
+  const pick = (events: any[], now = NOTE_NOW) => titles(lib.selectAlerts(events, null, now, { told, times: true }));
+  assert.deepEqual(pick([ev(1, "threshold", { threshold: 80, window_id: "seven_day", label: "Weekly", resets_at: "2026-11-21T00:00:00Z" })]), [`claude Weekly ${S.left} 20% left · ${S.reset} ${lib.clockText(new Date("2026-11-21T00:00:00Z"), NOTE_NOW)}`]);
+  assert.deepEqual(pick([ev(1, "threshold", { threshold: 80 })]), [], "not the 5h limit's 80%");
+  assert.deepEqual(pick([ev(1, "soon", { threshold: 5, eta_minutes: 5 }), ev(2, "anomalous")]), []);
+  assert.deepEqual(pick([ev(1, "limit", { window_id: "seven_day_fable", scope: "Fable", label: "Fable" })]), [`claude Fable weekly ${S.limit} Limit reached · ${S.reset} ${lib.clockText(new Date("2026-11-19T15:00:00Z"), NOTE_NOW)}`], "per-model limits only when reached");
+  assert.deepEqual(pick([ev(1, "provider_error", { window_id: null, error_code: "login_required" }), ev(2, "provider_error", { window_id: null, error_code: "fetch_failed" })]), [`claude ${S.runout} Sign in required`]);
+  const stop = ev(1, "collection_stopped", { provider: null, window_id: null, last_received_at: "2026-11-19T11:20:00Z" });
+  assert.deepEqual(pick([stop]), [`${S.stopped} No new values from the PCs since ${lib.clockText(new Date("2026-11-19T11:20:00Z"), NOTE_NOW)}`]);
+  assert.deepEqual(pick([stop, ev(2, "collection_resumed", { provider: null, window_id: null })]), [], "stopped and resumed in one batch cancel out");
+  assert.deepEqual(pick([ev(1, "limit")], new Date("2026-11-19T15:01:00Z")), [], "a limit whose reset has passed");
+  assert.deepEqual(pick([ev(1, "limit", { created_at: "2026-11-18T23:00:00Z" })]), [], "older than 12 hours");
+  assert.deepEqual(titles(lib.selectAlerts([ev(1, "soon", { threshold: 30, eta_minutes: 30, created_at: "2026-11-19T11:20:00Z" })], null, NOTE_NOW, { told, times: false })), [], "a warning whose time has passed");
+  // One notification per provider in a run, titled with the provider's name and the limit's full name
+  assert.deepEqual(plain(lib.alertNotifications([])), []);
+  const one = plain(lib.alertNotifications(lib.selectAlerts([ev(1, "limit", { window_id: "seven_day_fable", scope: "Fable", label: "Fable" })], null, NOTE_NOW, { told }).alerts));
+  assert.equal(one.length, 1);
+  assert.equal(one[0].title, "Claude · Fable weekly limit", "the full name, not the short one");
+  const alerts = [
+    { seq: 1, provider: null, limit: null, title_limit: null, text: "stop" }, { seq: 2, provider: "codex", limit: "Weekly", title_limit: "Weekly limit", text: "a" },
+    ...Array.from({ length: 7 }, (_, i) => ({ seq: 3 + i, provider: "claude", limit: "5h", title_limit: "5h limit", text: `t${i}` })),
+  ];
+  const many = plain(lib.alertNotifications(alerts));
+  assert.deepEqual(many.map((n: any) => n.title), ["Codex · Weekly limit", "Claude · 7 updates", "Headroom"], "Codex, Claude, then the rest; several say how many");
+  assert.deepEqual(many[1].body.split("\n"), ["5h limit t0", "5h limit t1", "5h limit t2", "5h limit t3", "5h limit t4", "+2 more"]);
+  assert.equal(lib.fullLimitName({ id: "five_hour", scope: null }), "5h limit");
+  assert.equal(lib.fullLimitName({ id: "codex_other_seven_day", scope: "codex_other" }), "Other weekly limit");
+});
+
+test("Notification state: unreadable parts start empty; the lock expires", () => {
+  const recent = Date.now() - 1000;
+  assert.deepEqual(plain(lib.readNotifyState("garbage")), { reminders: [], told: { limits: [], warned: [] }, sent: [], view_version: null, sending: null, boundaries: null, boundaries_version: null, checked_at: null });
+  const state = plain(lib.readNotifyState(JSON.stringify({
+    reminders: [{ id: "headroom.0123456789abcdef.back.codex.all.29000000", kind: "back", provider: "codex", window_id: "five_hour", cycle: 1, fire_at: 1 },
+      { id: "other.app", kind: "back", provider: "codex", cycle: 1, fire_at: 1 }],
+    told: { limits: [{ key: "k", at: recent }, { key: 5 }, { key: "claude.five_hour.2099-11-25T00:00:00Z", at: 2 }, { key: "old", at: 1 }] }, checked_at: "2026-11-19T12:00:00Z",
+  })));
+  assert.equal(state.reminders.length, 1, "only Headroom's identifiers");
+  const keep = 8 * 24 * 60 * 60_000;
+  assert.deepEqual(state.told, { limits: [{ key: "k", at: recent, until: recent + keep },
+    { key: "claude.five_hour.2099-11-25T00:00:00Z", at: 2, until: Date.parse("2099-11-26T00:00:00Z") }], warned: [] },
+  "an entry without a keep time is kept until a day after its cycle's reset (at least the usual time); one past that is dropped");
+  // Over 2000: those kept longest stay (a weekly cycle isn't pushed out by many short ones)
+  const many = Array.from({ length: 2100 }, (_, i) => ({ key: `claude.five_hour.${i}`, at: recent, until: recent + 3_600_000 + i }));
+  const long = { key: "claude.seven_day.x", at: recent - 5000, until: recent + 7 * 86_400_000 };
+  const kept = lib.readNotifyState(JSON.stringify({ told: { limits: [long, ...many] } })).told.limits;
+  assert.equal(kept.length, 2000);
+  assert.ok(kept.some((x: any) => x.key === "claude.seven_day.x"));
+  assert.equal(lib.lockFree("", NOTE_NOW), true);
+  assert.equal(lib.lockFree(`abc ${NOTE_NOW.getTime() + 1000}`, NOTE_NOW), false);
+  assert.equal(lib.lockFree(`abc ${NOTE_NOW.getTime()}`, NOTE_NOW), true);
+  assert.equal(lib.eventsCursor([`headroom-events-${TAG}-3`, `headroom-events-${TAG}-12`, "headroom-events-ff-99"], TAG), 12);
+  assert.equal(lib.eventsCursor([], TAG), null);
+  assert.ok(lib.OWN_FILE.test(`headroom-notify-${TAG}.json`) && lib.OWN_FILE.test(`headroom-lock-${TAG}`) && lib.OWN_FILE.test(lib.eventsFileName(TAG, 7)));
+});
+
+/** View body for runWidget from a demo */
+const demoBody = (name: string, now: Date) => ({ ...plain(lib.demoResult(name, now).view), data_version: 1, view_version: 1 });
+
+test("The notifying widget schedules reminders, marks where the events are on the first read, then tells each new event once", async () => {
+  const files = new Map<string, string>();
+  const notifier = newNotifier();
+  const now = NOTE_NOW;
+  const body = demoBody("reset", now);
+  let events: any = { last_seq: 3, oldest_seq: 1, events: [ev(3, "limit", { window_id: "seven_day", label: "Weekly", resets_at: "2026-11-20T00:00:00Z" })] };
+  const responder = (url: string) => (url.includes("/v2/events") ? { status: 200, body: events } : undefined);
+  const run = (at: Date, parameter = "claude, notify") => runWidget({ family: "medium", parameter, response: { status: 200, body }, responder, files, notifier, now: at });
+  const first = await run(now);
+  assert.equal(texts(first.widget.node).includes("Claude"), true, "draws as without notify");
+  assert.ok(first.requests.some((r: any) => /\/v2\/events\?after=0$/.test(r.url)));
+  assert.equal(notifier.log.length, 1, "only the reminder (events before the first read are not told)");
+  assert.equal(notifier.log[0].trigger, Date.parse(body.codex.windows.five_hour.resets_at));
+  assert.match(notifier.log[0].id, /^headroom\.0{16}\.back\.codex\.all\.\d+\.[0-9a-f]{16}\.[0-9a-f]{8}$/, "the account's mark, then the operation's");
+  assert.equal(notifier.log[0].openURL, "scriptable:///run/Headroom?open=details&provider=codex", "tapping opens the details");
+  assert.ok(files.has(`/docs/headroom-events-${TAG}-3`));
+  events = { last_seq: 5, oldest_seq: 1, events: [ev(5, "limit", { window_id: "seven_day", label: "Weekly", cycle: "2026-11-20T00:00:00Z", resets_at: "2026-11-20T00:00:00Z" })] };
+  const second = await run(new Date(now.getTime() + 15 * 60_000));
+  assert.ok(second.requests.some((r: any) => /\/v2\/events\?after=3$/.test(r.url)));
+  assert.equal(notifier.log.length, 2, "the reminder isn't scheduled again");
+  assert.equal(notifier.log[1].title, "Claude · Weekly limit");
+  assert.match(notifier.log[1].body, new RegExp(`^${S.limit} Limit reached`));
+  assert.match(notifier.log[1].id, /^headroom.0{16}.events.5.claude$/);
+  assert.equal(notifier.log[1].trigger, null, "told right away");
+  assert.ok(files.has(`/docs/headroom-events-${TAG}-5`) && !files.has(`/docs/headroom-events-${TAG}-3`), "the cursor moved on");
+  await run(new Date(now.getTime() + 30 * 60_000));
+  assert.equal(notifier.log.length, 2, "nothing new");
+  assert.ok(!files.has(`/docs/headroom-lock-${TAG}`), "the lock is released");
+  const quiet = await run(new Date(now.getTime() + 45 * 60_000), "claude");
+  assert.ok(!quiet.requests.some((r: any) => r.url.includes("/v2/events")), "a widget without notify reads no events");
+  // Turned off in the app menu: the reminder is cancelled and the cursor forgotten
+  const off = await runWidget({ family: "medium", parameter: "notify", response: { status: 200, body }, responder, files, notifier, now,
+    keychain: { "headroom.url": "https://headroom.example.com", "headroom.token": "read-token-xyz", [lib.KEYCHAIN_NOTIFY]: '{"events":false,"times":false}' } });
+  assert.ok(!off.requests.some((r: any) => r.url.includes("/v2/events")));
+  assert.equal(notifier.pending.size, 0);
+  assert.ok(![...files.keys()].some((k) => k.includes("headroom-events-")));
+});
+
+test("Notifying: settings changed during the events read undo what this run scheduled and keep the cursor", async () => {
+  const files = new Map<string, string>([[`/docs/headroom-events-${TAG}-3`, ""]]);
+  const notifier = newNotifier();
+  const body = demoBody("reset", NOTE_NOW);
+  const events = { last_seq: 5, oldest_seq: 1, events: [ev(5, "limit", { window_id: "seven_day", label: "Weekly", resets_at: "2026-11-20T00:00:00Z" })] };
+  await runWidget({
+    family: "medium", parameter: "notify", response: { status: 200, body }, files, notifier, now: NOTE_NOW,
+    responder: (url) => (url.includes("/v2/events") ? { status: 200, body: events } : undefined),
+    onLoad: (k, url) => { if (url.includes("/v2/events")) k.set(lib.KEYCHAIN_CONFIG, JSON.stringify({ url: "https://headroom.example.com", token: "t", id: "1111111111111111" })); },
+  });
+  assert.equal(notifier.pending.size, 0, "the reminder scheduled before the change was removed");
+  assert.equal(notifier.delivered.size, 0, "the event isn't told");
+  assert.ok(files.has(`/docs/headroom-events-${TAG}-3`) && !files.has(`/docs/headroom-events-${TAG}-5`));
+  const saved = files.get(`/docs/headroom-notify-${TAG}.json`);
+  assert.ok(!saved || JSON.parse(saved).told.limits.length === 0, "the limit isn't remembered as told");
+});
+
+test("A shortcut with \"notify\" only notifies (no menu, no screen) and returns a summary", async () => {
+  const notifier = newNotifier();
+  const run = await runWidget({ family: "medium", inApp: true, shortcut: "notify", response: { status: 200, body: demoBody("reset", NOTE_NOW) }, notifier, now: NOTE_NOW,
+    responder: (url) => (url.includes("/v2/events") ? { status: 200, body: { last_seq: 0, oldest_seq: null, events: [] } } : undefined) });
+  assert.equal(run.widget, null);
+  assert.deepEqual(run.presented, []);
+  assert.equal(run.shortcutOutput, "No new alerts · 1 reminder scheduled");
+  assert.equal(notifier.pending.size, 1);
+});
+
+test("Tapping the widget opens the details: each column its own provider, the lock screen its limit's provider; not the demo", async () => {
+  const medium = await runWidget({ family: "medium" });
+  assert.equal(medium.widget.url, "scriptable:///run/Headroom?open=details");
+  const cols = columnsOf(medium.widget.node);
+  assert.deepEqual(cols.map((c) => c.props.url), ["scriptable:///run/Headroom?open=details&provider=codex", "scriptable:///run/Headroom?open=details&provider=claude"]);
+  const single = await runWidget({ family: "small", parameter: "claude" });
+  assert.equal(single.widget.url, "scriptable:///run/Headroom?open=details&provider=claude");
+  const lock = await runWidget({ family: "accessoryRectangular", parameter: "claude 5h" });
+  assert.equal(lock.widget.url, "scriptable:///run/Headroom?open=details&provider=claude");
+  const demo = await runWidget({ family: "medium", parameter: "demo" });
+  assert.equal(demo.widget.url, undefined);
+  const noScheme = await runWidget({ family: "medium", scriptUrl: null });
+  assert.equal(noScheme.widget.url, undefined);
+  assert.equal(lib.detailUrl("scriptable:///run/Headroom?x=1", "codex"), "scriptable:///run/Headroom?x=1&open=details&provider=codex");
+});
+
+test("The details screen reads the view, the events and the weekly series, and shows only the tapped provider", async () => {
+  const now = new Date("2026-11-19T12:00:00");
+  const body = demoBody("runout", now);
+  const events = { last_seq: 2, oldest_seq: 1, events: [ev(1, "threshold", { threshold: 80, created_at: new Date(now.getTime() - 3_600_000).toISOString() }),
+    ev(2, "limit", { provider: "codex", created_at: new Date(now.getTime() - 60_000).toISOString() })] };
+  const run = await runWidget({ family: "medium", inApp: true, query: { open: "details", provider: "claude" }, response: { status: 200, body }, now,
+    responder: (url) => (url.includes("/v2/events") ? { status: 200, body: events } : url.includes("/v2/history") ? { status: 404, body: {} } : undefined) });
+  assert.equal(run.webPages.length, 1);
+  assert.deepEqual(run.presented, [], "no menu");
+  assert.deepEqual(plain(run.requests.map((r: any) => new URL(r.url).pathname + (r.url.includes("provider=") ? `?${/provider=\w+/.exec(r.url)![0]}` : ""))),
+    ["/v2/view", "/v2/events", "/v2/history?provider=claude"]);
+  const html = run.webPages[0]!;
+  assert.ok(html.includes(">Claude") && !html.includes(">Codex"), "only Claude");
+  assert.ok(html.includes(`<div class="tile warn"><em>${S.runout} Forecast</em>`) && html.includes("<span>runs out</span>"), "the forecast");
+  assert.ok(html.includes("Weekly usage") && html.includes("<svg"), "the weekly chart (even pace and forecast without a series)");
+  assert.ok(html.includes(`${S.left} 20% left`) && !html.includes("ic-codex\"></i><span class=\"lim\""), "the provider's history");
+  assert.ok(html.includes("<h4>Today</h4>"), "grouped by day");
+  const none = await runWidget({ family: "medium", inApp: true, query: { open: "details" }, keychain: {}, app: { form: [] } } as any);
+  assert.equal(none.webPages.length, 0, "without settings, the setup comes first");
+});
+
+test("The details page escapes what it shows and lists every limit with its pace, forecast and confidence", () => {
+  const now = new Date("2026-11-19T12:00:00");
+  const view = plain(lib.demoResult("normal", now).view);
+  view.claude.windows.seven_day_fable.scope = "<b>x</b>";
+  const html: string = lib.detailHtml({ view, events: [ev(1, "anomalous", { scope: "<img src=x>", window_id: "seven_day_fable" })], trends: {}, now, provider: null, note: "" });
+  assert.ok(!html.includes("<b>x</b>") && html.includes("Other weekly"), "an unexpected scope is shown as Other");
+  assert.ok(!html.includes("<img"));
+  assert.equal(lib.scopeName("Fable"), "Fable");
+  assert.equal(lib.scopeName("codex_other"), "Other");
+  assert.equal(lib.scopeName("Jane Doe <jane@example.com>"), "Other");
+  assert.equal(lib.scopeName("Jane Doe"), "Other", "one plain word only");
+  assert.equal(lib.windowName({ id: "odd", label: "Team plan" }, "odd"), "Limit", "an unknown window's label only if it is one plain word");
+  assert.equal(lib.windowName({ id: "odd", label: "Burst" }, "odd"), "Burst");
+  assert.equal(lib.fullLimitName({ id: "seven_day_x", scope: "<b>x</b>" }), "Other weekly limit");
+  for (const caption of [`${S.reset} Reset`, `${S.lasts} Forecast`, `${S.pace} Pace`, `${S.recent} Recent`, "Confidence"]) assert.ok(html.includes(`<em>${caption}</em>`), caption);
+  assert.equal((html.match(/<div class="tiles">/g) ?? []).length, 5, "a grid of tiles for every limit (Codex 2, Claude 3)");
+  assert.ok(html.includes('class="dot" style="background:#34C759"'), "freshness dot");
+  // Confidence: the word in the same style as the other values, and the worst case (demo Claude 5h: 65% left at 4%/h outlasts the reset)
+  assert.ok(html.includes("<em>Confidence</em><b>High</b><span>worst: lasts</span>"), "confidence word and the worst case");
+  // Demo "runs out": Claude 5h has 30% left at 30%/h, fetched a minute ago, so at worst it runs out in 59 minutes
+  const runout = plain(lib.demoResult("runout", now).view);
+  assert.equal(lib.worstText(lib.atDisplayTime(runout.claude.windows.five_hour, now), now), "worst: 59m");
+  // The faster 15-minute rate: 30% left at 60%/h runs out in 30 minutes from the fetch (a minute ago)
+  assert.equal(lib.worstText({ ...runout.claude.windows.five_hour, rate_15m: 60 }, now), "worst: 29m");
+  assert.equal(lib.worstText(runout.claude.windows.five_hour, new Date(now.getTime() + 70 * 60_000)), "worst: now");
+  assert.equal(lib.worstText({ ...runout.claude.windows.five_hour, rate_pace: 0 }, now), "worst: lasts", "a rate too small to measure");
+  const older = { ...runout.claude.windows.five_hour };
+  delete older.rate_pace;
+  assert.equal(lib.worstText(older, now), "", "nothing for derived values of the old format");
+  // a newer value with older derived values: the worst case follows the newer value, as the forecast does
+  const newer = { ...runout.claude.windows.five_hour, used_percent: 85 };
+  assert.equal(lib.worstText(newer, now), "worst: 29m", "15% left at 30%/h");
+  assert.ok(!html.includes("●●"), "no meter");
+  const low = plain(lib.demoResult("normal", now).view);
+  low.claude.windows.five_hour.confidence = "low";
+  assert.ok(lib.detailHtml({ view: low, events: null, trends: {}, now, provider: "claude", note: "" }).includes("<em>Confidence</em><b>Low</b><span>not drawn</span>"));
+  assert.ok(html.includes(".ic-claude{") && html.includes('<i class="ic ic-claude">'), "provider icons");
+  assert.ok(!html.includes("<h3>Symbols</h3>") && !html.includes("<em>Updated</em>"), "no key and no Updated tile (the age is beside the header dot)");
+  assert.ok(html.includes(`<span class="fresh"><span>1m</span><i class="dot"`), "the age beside the freshness dot");
+  assert.ok(html.includes(`<div class="tile wide"><em>${S.pace} Pace</em>`), "Pace takes two columns");
+  // Not available, as on the widget
+  const no5h = lib.detailHtml({ view: plain(lib.demoResult("no5h", now).view), events: null, trends: {}, now, provider: "codex", note: "" });
+  assert.ok(no5h.includes(`<span class="name">5h limit</span><b>—</b>`) && no5h.includes(`>${lib.NOT_AVAILABLE}<`));
+  assert.ok(no5h.includes("Other weekly"), "per-group limits too");
+  assert.ok(!/https?:\/\//.test(html), "nothing loaded from the network");
+  assert.equal(lib.esc(`a&"'`), "a&amp;&quot;&#39;");
+});
+
+test("Notifying: a notification that can't be scheduled keeps the cursor, so the next run tries again", async () => {
+  const files = new Map<string, string>([[`/docs/headroom-events-${TAG}-3`, ""]]);
+  const events = { last_seq: 5, oldest_seq: 1, events: [ev(5, "limit", { window_id: "seven_day", label: "Weekly", resets_at: "2026-11-20T00:00:00Z" })] };
+  const run = await runWidget({ family: "medium", inApp: true, shortcut: "notify", response: { status: 200, body: demoBody("normal", NOTE_NOW) }, files, now: NOTE_NOW,
+    scheduleFails: true, responder: (url) => (url.includes("/v2/events") ? { status: 200, body: events } : undefined) });
+  assert.equal(run.shortcutOutput, "Couldn't notify");
+  assert.ok(files.has(`/docs/headroom-events-${TAG}-3`) && !files.has(`/docs/headroom-events-${TAG}-5`));
+  assert.ok(!files.has(`/docs/headroom-lock-${TAG}`), "the lock is released");
+});
+
+test("Sample notifications show every kind per provider, built like the real ones", () => {
+  const S = lib.SYMBOLS;
+  const claude = plain(lib.sampleNotifications(["claude"], NOTE_NOW));
+  assert.deepEqual(claude.map((n: any) => n.title), ["Claude · 5h limit", "Claude · 5h limit", "Claude · 5h limit", "Claude · 5h limit", "Claude · 5h limit",
+    "Claude · Weekly limit", "Claude", "Headroom", "Headroom"]);
+  const bodies = claude.map((n: any) => n.body);
+  assert.ok(bodies[0].startsWith(`${S.runout} ~15 min left (runs out `), bodies[0]);
+  assert.equal(bodies[1], `${S.runout} ~30 min left at this pace`, "the event's warning too");
+  assert.ok(bodies[2].startsWith(`${S.limit} Limit reached · ${S.reset} `), bodies[2]);
+  assert.equal(bodies[3], `${S.reset} Reset · usable again`);
+  assert.equal(bodies[4], `${S.reset} Reset (estimated) · usable again`);
+  assert.ok(bodies[5].startsWith(`${S.left} 20% left · ${S.reset} `), bodies[5]);
+  assert.equal(bodies[6], `${S.runout} Sign in required`);
+  assert.ok(bodies[7].startsWith(`${S.stopped} No new values from the PCs since `), bodies[7]);
+  assert.equal(bodies[8], `${S.resumed} Values updating again`, "and collection resumed");
+  const both = plain(lib.sampleNotifications(["claude", "codex"], NOTE_NOW));
+  assert.equal(both.length, 16, "seven per provider and two without");
+  assert.deepEqual([...new Set(both.map((n: any) => n.provider))], ["codex", "claude", null], "Codex first, as on the widget");
+  assert.ok(both.filter((n: any) => n.provider === "codex").every((n: any) => n.title.startsWith("Codex")));
+});
+
+test("The app menu sends the sample notifications of the chosen provider right away", async () => {
+  const notifier = newNotifier();
+  // Main menu: Notifications (2) -> Send sample notifications (0) -> Codex (1) -> Back -> Close
+  const run = await runWidget({ family: "medium", notifier, app: { menu: [2, 0, 1] } });
+  assert.equal(run.error, null);
+  assert.equal(notifier.log.length, 9);
+  assert.ok(notifier.log.every((n: any) => n.trigger === null), "right away");
+  assert.ok(notifier.log.slice(0, 7).every((n: any) => n.title.startsWith("Codex") && n.openURL === "scriptable:///run/Headroom?open=details&provider=codex"));
+  assert.ok(notifier.log.every((n: any) => /^headroom\.0{16}\.sample\.\d+$/.test(n.id)), "kept apart from real notifications");
+  assert.equal(run.requests.length, 0, "nothing is read");
+});
+
+test("The details page heads the chart with the providers' dots and lines up the history's times", () => {
+  const now = new Date("2026-11-19T12:00:00");
+  const demo = lib.demoResult("normal", now);
+  const events = [ev(1, "threshold", { threshold: 80, created_at: new Date("2026-11-19T09:05:00").toISOString() })];
+  const html: string = lib.detailHtml({ view: demo.view, events, trends: demo.trends, now, provider: null, note: "" });
+  assert.ok(html.includes(`<div class="chead"><h3>Weekly usage</h3><div class="plegend"><span><i class="dot" style="background:${lib.BRAND_COLORS.codex}"></i>Codex</span>`),
+    "Codex then Claude as colored dots, at the top as on the widget");
+  assert.ok(html.includes("<time>09:05 AM</time>"), "two-digit hours");
+  assert.ok(html.includes('<span class="pn"><h2'), "the name and the plan share a baseline");
+  const none = lib.detailHtml({ view: demo.view, events: [], trends: {}, now, provider: null, note: "" });
+  assert.ok(none.includes("<span>No weekly data yet</span>"));
+});
+
+test("The app menu: Details, Preview widget, Notifications and Settings, each coming back to the menu until Close", async () => {
+  // Details, then Close
+  const details = await runWidget({ family: "medium", app: { menu: [0] }, responder: (url) => (url.includes("/v2/events") ? { status: 200, body: { last_seq: 0, oldest_seq: null, events: [] } } : undefined) });
+  assert.equal(details.webPages.length, 1);
+  assert.deepEqual(details.presented, ["menu", "menu"], "back to the menu after the details");
+  // Preview widget -> Current values -> Medium, then Lock screen · Rectangular (the same values, read for each size)
+  const live = await runWidget({ family: "medium", app: { menu: [1, 0, 1, 3] } });
+  assert.deepEqual(live.shownSizes, ["medium", "accessoryRectangular"]);
+  assert.ok(live.requests.every((r: any) => r.url.includes("/v2/view")), "current values come from the server");
+  assert.ok(texts(live.widget.node).length > 0);
+  // Notifications -> Limit alerts: On becomes Off
+  const toggled = await runWidget({ family: "medium", app: { menu: [2, 1] } });
+  assert.deepEqual(plain(lib.notifyPrefs(savedSwitches(toggled.keychain))), { events: false, times: true, rev: 1, times_off_at: null, cancel_pending: false, cancelled: [], cancels: [] }, "each change moves the counter");
+  // Settings -> Reset saved data (confirmed): the saved files go, the server and token stay (under a new generation)
+  const files = new Map<string, string>([[`/docs/headroom-events-${TAG}-3`, ""], [`/docs/headroom-notify-${TAG}.json`, "{}"]]);
+  const reset = await runWidget({ family: "medium", files, app: { menu: [3, 1] } });
+  assert.equal(files.size, 0);
+  const kept = savedConfig(reset.keychain);
+  assert.deepEqual([kept.url, kept.token], ["https://headroom.example.com", "read-token-xyz"]);
+  // Without settings: the form first, then the menu
+  const first = await runWidget({ family: "medium", keychain: {}, app: { menu: [], form: ["https://headroom.example.com", "t"] } });
+  assert.deepEqual(first.presented, ["form", "menu"]);
+  assert.ok(savedConfig(first.keychain) !== null);
+});
+
+test("The parameter guide lists what the Parameter can say; every builder choice is a parameter the widget reads", () => {
+  assert.equal(lib.buildParameter("claude", true), "claude, notify");
+  assert.equal(lib.buildParameter("", true), "notify");
+  assert.equal(lib.buildParameter("", false), "", "empty means leave it empty");
+  const now = new Date("2026-11-19T12:00:00");
+  const view = lib.demoResult("normal", now).view;
+  // Lock screen choices pick limits of the right providers (one, or two side by side)
+  const picks = (p: string) => plain(lib.lockPicks(view, lib.splitNotify(lib.buildParameter(p, true)).display, now).map((x: any) => `${x.provider}.${x.window.id}`));
+  const lock = Object.fromEntries(plain(lib.PARAMETER_CHOICES.lock).map(([label, p]: [string, string]) => [label, picks(p)]));
+  assert.deepEqual(lock["Claude 5h"], ["claude.five_hour"]);
+  assert.deepEqual(lock["Codex weekly"], ["codex.seven_day"]);
+  assert.deepEqual(lock["5h of both, side by side"], ["codex.five_hour", "claude.five_hour"]);
+  assert.deepEqual(lock["Claude 5h and weekly"], ["claude.five_hour", "claude.seven_day"]);
+  assert.equal(lock["Tightest limit"].length, 1);
+  // Home screen choices show the right groups
+  const groups = (p: string) => plain(lib.groupsOf(view, lib.splitNotify(lib.buildParameter(p, true)).display, now).map((g: any) => g.provider));
+  const home = Object.fromEntries(plain(lib.PARAMETER_CHOICES.home).map(([label, p]: [string, string]) => [label, groups(p)]));
+  assert.deepEqual(home, { "Both providers": ["codex", "claude"], "Claude only": ["claude"], "Codex only": ["codex"], "Tightest limit of each": ["codex", "claude"] });
+  const html: string = lib.parameterGuideHtml();
+  for (const p of ["top", "claude 5h, codex 5h", "both weekly", "notify", "demo:runout", "claude.five_hour, codex.seven_day"]) assert.ok(html.includes(`<code>${p}</code>`), p);
+  assert.ok(html.includes("Edit Widget") && !/https?:\/\//.test(html));
+});
+
+test("The app menu's Widget > Make a parameter copies the parameter or previews it; the guide opens as a page", async () => {
+  // Widget -> Make a parameter -> Lock screen -> Claude 5h -> Yes (notifications) -> Copy
+  const copy = await runWidget({ family: "medium", app: { menu: [1, 2, 1, 1, 1, 0] } });
+  assert.deepEqual(copy.copied, ["claude 5h, notify"]);
+  assert.equal(copy.requests.length, 0, "nothing read just to copy");
+  // Widget -> Make a parameter -> Home screen -> Claude only -> No -> Preview -> Medium (home sizes only)
+  const preview = await runWidget({ family: "medium", app: { menu: [1, 2, 0, 1, 0, 1, 1] } });
+  assert.deepEqual(preview.shownSizes, ["medium"]);
+  const all = texts(preview.widget.node);
+  assert.ok(all.includes("Claude") && !all.includes("Codex"), "drawn with the parameter claude");
+  // An empty parameter has nothing to copy: Widget -> Make -> Home -> Both providers -> No -> Done
+  const empty = await runWidget({ family: "medium", app: { menu: [1, 2, 0, 0, 0, -1] } });
+  assert.deepEqual(empty.copied, []);
+  // Widget -> Parameter guide
+  const guide = await runWidget({ family: "medium", app: { menu: [1, 3] } });
+  assert.equal(guide.webPages.length, 1);
+  assert.ok(guide.webPages[0]!.includes("<h1>Widget parameter</h1>"));
+});
+
+test("a folder that can't be listed stops the notifying run instead of reading it as the first run", async () => {
+  const files = new Map<string, string>([[`/docs/headroom-events-${TAG}-40`, ""]]);
+  const notifier = newNotifier();
+  const events = { last_seq: 41, oldest_seq: 1, events: [ev(41, "limit", { window_id: "seven_day", label: "Weekly", resets_at: "2026-11-20T00:00:00Z" })] };
+  const run = await runWidget({ family: "medium", inApp: true, shortcut: "notify", files, notifier, now: NOTE_NOW, listFails: true,
+    response: { status: 200, body: demoBody("normal", NOTE_NOW) }, responder: (url) => (url.includes("/v2/events") ? { status: 200, body: events } : undefined) });
+  assert.equal(run.shortcutOutput, "Couldn't read this iPhone's files");
+  assert.ok(!run.requests.some((r: any) => r.url.includes("/v2/events")), "no events read");
+  assert.ok(files.has(`/docs/headroom-events-${TAG}-40`) && !files.has(`/docs/headroom-events-${TAG}-41`), "the cursor stays");
+  assert.equal(notifier.log.length, 0);
+  // Listed again: event 41 is told
+  const again = await runWidget({ family: "medium", inApp: true, shortcut: "notify", files, notifier, now: NOTE_NOW,
+    response: { status: 200, body: demoBody("normal", NOTE_NOW) }, responder: (url) => (url.includes("/v2/events") ? { status: 200, body: events } : undefined) });
+  assert.equal(again.shortcutOutput, "1 alert · 0 reminders scheduled");
+  assert.equal(notifier.log[0].title, "Claude · Weekly limit");
+});
+
+test("after an account switch, the new account's limit in the same cycle is told again and its reminders start afresh", () => {
+  const key = "claude.seven_day.2026-11-20T00:00:00Z";
+  const state = { reminders: [{ id: "headroom.0000000000000000.back.claude.all.1", kind: "back", provider: "claude", window_id: "seven_day", cycle: 1, fire_at: 1 },
+    { id: "headroom.0000000000000000.back.codex.all.1", kind: "back", provider: "codex", window_id: "seven_day", cycle: 1, fire_at: 1 }],
+    told: { limits: [{ key, at: 1 }, { key: "codex.seven_day.x", at: 1 }], warned: [] }, boundaries: { claude: "2026-11-19T00:00:00.000Z#1", codex: "#0" }, checked_at: null };
+  const same = plain(lib.forgetSwitched(state, { claude: "2026-11-19T00:00:00.000Z#1", codex: "#0" }));
+  assert.deepEqual(same.switched, []);
+  assert.equal(same.state.told.limits.length, 2);
+  const switched = plain(lib.forgetSwitched(state, { claude: "2026-11-20T09:00:00.000Z#2", codex: "#0" }));
+  assert.deepEqual(switched.switched, ["claude"]);
+  assert.deepEqual(switched.cancel, ["headroom.0000000000000000.back.claude.all.1"]);
+  assert.deepEqual(switched.state.told.limits.map((x: any) => x.key), ["codex.seven_day.x"], "only Claude's told cycles are forgotten");
+  assert.deepEqual(switched.state.reminders.map((r: any) => r.provider), ["codex"]);
+  assert.equal(switched.state.boundaries.claude, "2026-11-20T09:00:00.000Z#2");
+  const first = plain(lib.forgetSwitched({ ...state, boundaries: null }, { claude: "a#1", codex: "#0" }));
+  assert.deepEqual(first.switched, [], "the first stamps seen are only remembered");
+  assert.equal(plain(lib.forgetSwitched(state, null)).state.boundaries.claude, "2026-11-19T00:00:00.000Z#1", "a view not fetched now changes nothing");
+});
+
+test("the notifying widget tells the new account's limit although the old account's was told in the same cycle", async () => {
+  const cycle = "2026-11-20T00:00:00Z";
+  const state = { reminders: [], told: { limits: [{ key: `claude.seven_day.${cycle}`, at: NOTE_NOW.getTime() }], warned: [] },
+    boundaries: { claude: "2026-11-18T00:00:00.000Z#1", codex: "#0" }, checked_at: null };
+  const files = new Map<string, string>([[`/docs/headroom-events-${TAG}-5`, ""], [`/docs/headroom-notify-${TAG}.json`, JSON.stringify(state)]]);
+  const notifier = newNotifier();
+  const body = { ...demoBody("normal", NOTE_NOW), boundaries: { claude: "2026-11-19T12:00:00.000Z#2", codex: "#0" } };
+  const events = { last_seq: 6, oldest_seq: 1, events: [ev(6, "limit", { window_id: "seven_day", label: "Weekly", cycle, resets_at: cycle })] };
+  await runWidget({ family: "medium", parameter: "notify", files, notifier, now: NOTE_NOW, response: { status: 200, body },
+    responder: (url) => (url.includes("/v2/events") ? { status: 200, body: events } : undefined) });
+  assert.deepEqual(notifier.log.map((n: any) => n.title), ["Claude · Weekly limit"]);
+  assert.equal(JSON.parse(files.get(`/docs/headroom-notify-${TAG}.json`)!).boundaries.claude, "2026-11-19T12:00:00.000Z#2");
+});
+
+test("after the server's database is recreated, Reset saved data lets the new numbers 1, 2, ... show and be told", async () => {
+  const config = JSON.stringify({ url: "https://headroom.example.com", token: "t", id: "1111111111111111" });
+  const tag = lib.cacheTag({ id: "1111111111111111" }, "https://headroom.example.com");
+  const oldView = JSON.stringify({ saved_at: NOTE_NOW.toISOString(), origin: "https://headroom.example.com", view: lib.sanitizeView(sampleView(900)) });
+  const files = new Map<string, string>([[`/docs/${lib.cacheFileName(tag, 900)}`, oldView], [`/docs/${lib.seenFileName(tag, 900)}`, ""],
+    [`/docs/headroom-events-${tag}-800`, ""], [`/docs/headroom-notify-${tag}.json`, "{}"]]);
+  const notifier = newNotifier();
+  notifier.pending.set("headroom.1111111111111111.back.claude.all.1", { id: "headroom.1111111111111111.back.claude.all.1" });
+  const keychain = { [lib.KEYCHAIN_CONFIG]: config };
+  // Before the reset, the recreated server's number 1 is taken for an old response
+  const before = await runWidget({ family: "medium", keychain, files: new Map(files), response: { status: 200, body: sampleView(1) } });
+  assert.ok(texts(before.widget.node).includes("90%"), "the old view (number 900) is shown instead");
+  // Settings -> Reset saved data
+  const reset = await runWidget({ family: "medium", keychain, files, notifier, app: { menu: [3, 1] } });
+  const saved = savedConfig(reset.keychain);
+  assert.notEqual(saved.id, "1111111111111111", "a new generation");
+  assert.deepEqual([saved.url, saved.token], ["https://headroom.example.com", "t"]);
+  assert.deepEqual([...files.keys()], [], "saved views, seen numbers, the cursor and the state are gone");
+  assert.equal(notifier.pending.size, 0, "scheduled reminders are cancelled");
+  // A run that started before the reset and returns late writes under the old generation, which the new settings never read
+  const after = await runWidget({ family: "medium", keychain: { [lib.KEYCHAIN_CONFIG]: JSON.stringify(saved) }, files, response: { status: 200, body: { ...sampleView(1), claude: null } } });
+  assert.ok(!texts(after.widget.node).includes("Response is older than the last one"));
+  assert.ok(files.has(`/docs/${lib.seenFileName(lib.cacheTag(saved, "https://headroom.example.com"), 1)}`), "number 1 is the new generation's");
+});
+
+/** Events response for the notifying tests */
+const feed = (lastSeq: number, events: any[]) => ({ last_seq: lastSeq, oldest_seq: 1, events });
+const eventsAt = (body: any) => (url: string) => (url.includes("/v2/events") ? { status: 200, body } : undefined);
+
+test("a notification that went out is saved at once, so a later failure in the same run never sends it again", async () => {
+  const files = new Map<string, string>([[`/docs/headroom-events-${TAG}-3`, ""]]);
+  const notifier = newNotifier();
+  // Codex's and Claude's limits reached: two notifications; the second fails
+  const body = feed(5, [ev(4, "limit", { provider: "codex", window_id: "seven_day", label: "Weekly", resets_at: "2026-11-20T00:00:00Z" }),
+    ev(5, "limit", { window_id: "seven_day", label: "Weekly", resets_at: "2026-11-20T00:00:00Z" })]);
+  const run = (fails?: number) => runWidget({ family: "medium", inApp: true, shortcut: "notify", files, notifier, now: NOTE_NOW, scheduleFailsAfter: fails,
+    response: { status: 200, body: demoBody("normal", NOTE_NOW) }, responder: eventsAt(body) });
+  const first = await run(1);
+  assert.equal(first.shortcutOutput, "Couldn't notify");
+  assert.deepEqual(notifier.log.map((n: any) => n.title), ["Codex · Weekly limit"]);
+  assert.ok(files.has(`/docs/headroom-events-${TAG}-3`) && !files.has(`/docs/headroom-events-${TAG}-5`), "the cursor waits for the failed one");
+  const again = await run();
+  assert.deepEqual(notifier.log.map((n: any) => n.title), ["Codex · Weekly limit", "Claude · Weekly limit"], "only the one that failed is sent");
+  assert.equal(again.shortcutOutput, "1 alert · 0 reminders scheduled");
+  assert.ok(files.has(`/docs/headroom-events-${TAG}-5`));
+});
+
+test("a run whose lock was taken while it waited stops before notifying", async () => {
+  const files = new Map<string, string>([[`/docs/headroom-events-${TAG}-3`, ""]]);
+  const notifier = newNotifier();
+  const run = await runWidget({ family: "medium", inApp: true, shortcut: "notify", files, notifier, now: NOTE_NOW,
+    response: { status: 200, body: demoBody("reset", NOTE_NOW) }, responder: eventsAt(feed(5, [ev(5, "limit", { window_id: "seven_day", label: "Weekly", resets_at: "2026-11-20T00:00:00Z" })])),
+    onLoad: (_k, url) => { if (url.includes("/v2/events")) files.set(`/docs/headroom-lock-${TAG}`, `other ${NOTE_NOW.getTime() + 60_000}`); } });
+  assert.equal(run.shortcutOutput, "Another run is notifying");
+  assert.equal(notifier.delivered.size, 0, "the event isn't told by this run");
+  assert.equal(notifier.pending.size, 1, "its reminder is left to the run that took over (the same plan under the same identifier)");
+  assert.ok(!files.has(`/docs/headroom-events-${TAG}-5`));
+  assert.equal(files.get(`/docs/headroom-lock-${TAG}`), `other ${NOTE_NOW.getTime() + 60_000}`, "the other run's lock is left alone");
+});
+
+test("switching in the menu takes effect at once: reminders off cancels pending ones, alerts restart from then", async () => {
+  const files = new Map<string, string>();
+  const notifier = newNotifier();
+  await runWidget({ family: "medium", parameter: "notify", files, notifier, now: NOTE_NOW, response: { status: 200, body: demoBody("reset", NOTE_NOW) },
+    responder: eventsAt(feed(3, [])) });
+  assert.equal(notifier.pending.size, 1, "the reset reminder");
+  assert.ok(files.has(`/docs/headroom-events-${TAG}-3`));
+  // Notifications -> Time reminders: Off
+  const off = await runWidget({ family: "medium", files, notifier, now: NOTE_NOW, app: { menu: [2, 2] } });
+  assert.equal(notifier.pending.size, 0, "cancelled without waiting for the next run");
+  assert.deepEqual(JSON.parse(files.get(`/docs/headroom-notify-${TAG}.json`)!).reminders, [], "the menu (holding the runs' lock) drops what it cancelled");
+  await runWidget({ family: "medium", parameter: "notify", files, notifier, now: NOTE_NOW, keychain: Object.fromEntries(off.keychain),
+    response: { status: 200, body: demoBody("reset", NOTE_NOW) }, responder: eventsAt(feed(3, [])) });
+  assert.equal(notifier.pending.size, 0, "not scheduled again while off");
+  assert.deepEqual(JSON.parse(files.get(`/docs/headroom-notify-${TAG}.json`)!).reminders, [], "the next run drops it");
+  // Notifications -> Limit alerts: Off, then On: where they left off is forgotten
+  await runWidget({ family: "medium", files, notifier, now: NOTE_NOW, app: { menu: [2, 1, 1] } });
+  assert.ok(![...files.keys()].some((k) => k.includes("headroom-events-")), "the next run starts from then");
+});
+
+test("saving new settings cancels the old generation's reminders; an older run never removes the new generation's", async () => {
+  const notifier = newNotifier();
+  const keychain = { [lib.KEYCHAIN_CONFIG]: JSON.stringify({ url: "https://headroom.example.com", token: "t", id: "1111111111111111" }) };
+  notifier.pending.set("headroom.1111111111111111.back.claude.all.1", { id: "headroom.1111111111111111.back.claude.all.1" });
+  const saved = await runWidget({ family: "medium", keychain, notifier, app: { menu: [3, 0], form: ["https://other.example", "t2"] } });
+  assert.equal(notifier.pending.size, 0);
+  // A run of the older settings, whose pending list comes back after the settings changed
+  const newId = savedConfig(saved.keychain).id;
+  notifier.pending.set(`headroom.${newId}.back.codex.all.2`, { id: `headroom.${newId}.back.codex.all.2` });
+  const files = new Map<string, string>();
+  await runWidget({ family: "medium", inApp: true, shortcut: "notify", keychain, notifier, files, now: NOTE_NOW, response: { status: 200, body: demoBody("normal", NOTE_NOW) },
+    responder: eventsAt(feed(0, [])),
+    onLoad: (k, url) => { if (url.includes("/v2/view")) k.set(lib.KEYCHAIN_CONFIG, saved.keychain.get(lib.KEYCHAIN_CONFIG)!); } });
+  assert.ok(notifier.pending.has(`headroom.${newId}.back.codex.all.2`), "the new generation's reminder stays");
+});
+
+test("no reset reminder without every reset time; monthly cycles are kept; failed reads say so; 80% and collection rules", async () => {
+  // the weekly limit at 100% has no reset time
+  const view = plain(lib.demoResult("reset", NOTE_NOW).view);
+  view.codex.windows.seven_day.used_percent = 100;
+  view.codex.windows.seven_day.resets_at = null;
+  assert.deepEqual(plain(lib.reminderPlan(view, NOTE_NOW)).filter((x: any) => x.provider === "codex"), []);
+  // a monthly limit told on the 1st is still known on the 20th (its reset is later)
+  const monthly = ev(1, "limit", { window_id: "monthly", label: "Monthly", cycle: "2026-12-01T00:00:00Z", resets_at: "2026-12-01T00:00:00Z" });
+  const told = lib.selectAlerts([monthly], null, NOTE_NOW, { told: { limits: [], warned: [] } }).told;
+  const later = new Date("2026-11-30T12:00:00Z");
+  const reset = { ...monthly, seq: 2, kind: "reset", confirmed: true, created_at: "2026-11-30T11:59:00Z", resets_at: "2026-12-31T00:00:00Z" };
+  assert.equal(lib.selectAlerts([reset], null, later, { told: plain(told), times: false }).alerts.length, 1, "told after 29 days");
+  // 80% of a 90-minute limit is not told
+  assert.equal(lib.selectAlerts([ev(3, "threshold", { threshold: 80, window_id: "window_90m", label: "90m" })], null, NOTE_NOW, {}).alerts.length, 0);
+  // resumed then stopped in one read: neither
+  const pair = [ev(4, "collection_resumed", { provider: null, window_id: null }), ev(5, "collection_stopped", { provider: null, window_id: null })];
+  assert.equal(lib.selectAlerts(pair, null, NOTE_NOW, {}).alerts.length, 0);
+  // a failed read is not "No new alerts", and the last check stays
+  const files = new Map<string, string>([[`/docs/headroom-events-${TAG}-3`, ""]]);
+  const run = await runWidget({ family: "medium", inApp: true, shortcut: "notify", files, now: NOTE_NOW, response: { status: 200, body: demoBody("normal", NOTE_NOW) },
+    responder: (url) => (url.includes("/v2/events") ? { status: 401, body: {} } : undefined) });
+  assert.equal(run.shortcutOutput, "Couldn't check alerts · 0 reminders scheduled");
+  assert.equal(JSON.parse(files.get(`/docs/headroom-notify-${TAG}.json`)!).checked_at, null);
+});
+
+test("the details show nothing of settings changed while reading; demo works as one item of a parameter", async () => {
+  // Settings removed while the details read the events
+  const run = await runWidget({ family: "medium", inApp: true, query: { open: "details" }, now: NOTE_NOW,
+    responder: eventsAt(feed(0, [])), onLoad: (k, url) => { if (url.includes("/v2/events")) k.clear(); } });
+  const html = run.webPages[0]!;
+  assert.ok(html.includes("Settings changed") && !html.includes("<div class=\"tiles\">"), "no values of the removed settings");
+  // claude, demo:normal, notify: the sample (no network, no notifications), showing Claude only
+  const notifier = newNotifier();
+  const demo = await runWidget({ family: "medium", parameter: "claude, demo:normal, notify", notifier });
+  assert.equal(demo.requests.length, 0);
+  assert.equal(notifier.log.length, 0);
+  const all = texts(demo.widget.node);
+  assert.ok(all.includes("Claude") && !all.includes("Codex"));
+  assert.equal(lib.demoName("claude, demo:stale"), "stale");
+  assert.equal(lib.withoutDemo("claude, demo:stale, notify"), "claude, notify");
+});
+
+test("lock screen taps open the one provider shown; reset lines follow the cycle of now; saving survives a failed cleanup", async () => {
+  // A Codex without a 5h limit, named on the rectangle; the line naming only Codex
+  const no5h = { ...demoBody("no5h", NOTE_NOW) };
+  const rect = await runWidget({ family: "accessoryRectangular", parameter: "codex 5h", response: { status: 200, body: no5h } });
+  assert.equal(rect.widget.url, "scriptable:///run/Headroom?open=details&provider=codex");
+  const line = await runWidget({ family: "accessoryInline", parameter: "codex weekly", response: { status: 200, body: no5h } });
+  assert.equal(line.widget.url, "scriptable:///run/Headroom?open=details&provider=codex");
+  // A cached reset time three weeks old: the reset lines and the even pace mark the same cycle
+  const now = new Date("2026-11-20T12:00:00");
+  const range = lib.weekRange(now);
+  const old = { resets_at: new Date("2026-11-05T09:00:00").toISOString() };
+  const resets = plain(lib.resetTimes(old, range, now));
+  const guide = plain(lib.paceGuide(old, range, now));
+  assert.ok(resets.includes(lib.cycleEnd(old, now) - 7 * 86_400_000) || resets.includes(lib.cycleEnd(old, now)), String(resets));
+  assert.equal(guide[0][0], Math.max(range.start, lib.cycleEnd(old, now) - 7 * 86_400_000), "the guide starts where a reset line is");
+  // The new item is written but removing an older version's item fails: saved, no "Can't save"
+  const keychain = { "headroom.url": "https://old.example", "headroom.token": "old" };
+  const run = await runWidget({ family: "medium", keychain, app: { menu: [3, 0], form: ["https://new.example", "t"] }, removeKeychainFails: true } as any);
+  assert.equal(savedConfig(run.keychain).url, "https://new.example");
+  assert.ok(!run.presented.includes("notice"), "no failure shown");
+});
+
+test("a new account's limit in the same cycle is told even when the view can't be read or old events come first", async () => {
+  const cycle = "2026-11-20T00:00:00Z";
+  // The old account's limit was told; the view now fails, the events read works
+  const state = { reminders: [], told: { limits: [{ key: `claude.seven_day.${cycle}`, at: NOTE_NOW.getTime() }], warned: [] }, sent: [],
+    boundaries: { claude: "a#1", codex: "#0" }, checked_at: null };
+  const files = new Map<string, string>([[`/docs/headroom-events-${TAG}-5`, ""], [`/docs/headroom-notify-${TAG}.json`, JSON.stringify(state)]]);
+  const notifier = newNotifier();
+  // Seq 6 is the old account's limit read late, seq 7 the new account's in the same cycle
+  const events = feed(7, [ev(6, "limit", { window_id: "seven_day", label: "Weekly", cycle, resets_at: cycle }),
+    ev(7, "limit", { window_id: "seven_day", label: "Weekly", cycle, resets_at: cycle })]);
+  await runWidget({ family: "medium", inApp: true, shortcut: "notify", files, notifier, now: NOTE_NOW,
+    responder: (url) => (url.includes("/v2/events") ? { status: 200, body: events } : url.includes("/v2/view") ? { status: 503, body: {} } : undefined) });
+  assert.equal(notifier.log.length, 1, "one notification");
+  assert.equal(notifier.log[0].title, "Claude · 2 updates", "both limits told (the second is the new account's)");
+  assert.ok(files.has(`/docs/headroom-events-${TAG}-7`));
+});
+
+test("a view older than the one the stamps came from is not taken for an account switch", () => {
+  const state = { reminders: [{ id: "headroom.0000000000000000.back.claude.all.1", kind: "back", provider: "claude", window_id: "five_hour", cycle: 1, fire_at: 1 }],
+    told: { limits: [], warned: [] }, sent: [], boundaries: { claude: "b#2", codex: "#0" }, boundaries_version: 20, checked_at: null };
+  const older = plain(lib.forgetSwitched(state, { claude: "a#1", codex: "#0" }, 19));
+  assert.deepEqual(older.switched, []);
+  assert.equal(older.state.boundaries.claude, "b#2", "the stamps don't go back");
+  const newer = plain(lib.forgetSwitched(state, { claude: "c#3", codex: "#0" }, 21));
+  assert.deepEqual(newer.switched, ["claude"]);
+  assert.equal(newer.state.boundaries_version, 21);
+});
+
+test("Reset saved data works only on the generation it replaces, says what it couldn't remove, and stops if the settings changed", async () => {
+  const id = "1111111111111111";
+  const keychain = { [lib.KEYCHAIN_CONFIG]: JSON.stringify({ url: "https://headroom.example.com", token: "t", id }) };
+  const oldTag = lib.cacheTag({ id }, "https://headroom.example.com");
+  // A widget of the new generation schedules and writes while the reset lists the notifications
+  const notifier = newNotifier();
+  notifier.pending.set(`headroom.${id}.back.claude.all.1`, { id: `headroom.${id}.back.claude.all.1` });
+  const files = new Map<string, string>([[`/docs/headroom-events-${oldTag}-800`, ""]]);
+  const run = await runWidget({ family: "medium", keychain, files, notifier, app: { menu: [3, 1] },
+    onWrite: () => {} });
+  const newGen = savedConfig(run.keychain).id;
+  const newTag = lib.cacheTag({ id: newGen }, "https://headroom.example.com");
+  assert.ok(!notifier.pending.has(`headroom.${id}.back.claude.all.1`), "the old generation's reminder is cancelled");
+  assert.ok(!files.has(`/docs/headroom-events-${oldTag}-800`));
+  // The same reset with a new generation's reminder and files already there: they stay
+  notifier.pending.set(`headroom.${newGen}.back.codex.all.2`, { id: `headroom.${newGen}.back.codex.all.2` });
+  files.set(`/docs/headroom-events-${newTag}-3`, "");
+  const again = await runWidget({ family: "medium", keychain: Object.fromEntries(run.keychain), files, notifier, app: { menu: [3, 1] } });
+  const third = savedConfig(again.keychain).id;
+  assert.notEqual(third, newGen);
+  assert.ok(!notifier.pending.has(`headroom.${newGen}.back.codex.all.2`), "a generation it replaces is cleared");
+  // a removal that fails is reported
+  const failing = await runWidget({ family: "medium", keychain, files: new Map([[`/docs/headroom-events-${oldTag}-9`, ""]]), removeFails: true, app: { menu: [3, 1] } });
+  assert.ok(failing.alertTitles.includes("Partly reset"), "a removal that failed is reported");
+  // the settings changed while the confirmation was open: nothing is reset
+  const changed = await runWidget({ family: "medium", keychain, app: { menu: [3, 1] },
+    onLoad: () => {}, beforeConfirm: (k: Map<string, string>) => k.set(lib.KEYCHAIN_CONFIG, JSON.stringify({ url: "https://other.example", token: "x", id: "2222222222222222" })) } as any);
+  assert.equal(savedConfig(changed.keychain).url, "https://other.example", "the newer settings are kept");
+});
+
+test("a slow view response of older settings doesn't write its files back after a reset", async () => {
+  const files = new Map<string, string>();
+  const run = await runWidget({ family: "medium", files, response: { status: 200, body: sampleView(5) },
+    onLoad: (k, url) => { if (url.includes("/v2/view")) k.set(lib.KEYCHAIN_CONFIG, JSON.stringify({ url: "https://headroom.example.com", token: "t", id: "3333333333333333" })); } });
+  assert.deepEqual([...files.keys()], [], "nothing written for the replaced settings");
+  assert.deepEqual(texts(run.widget.node), ["Settings changed. Updates on next refresh"]);
+});
+
+test("Notification state keeps every told event above the cursor and the view version it used", () => {
+  const sent = Array.from({ length: 300 }, (_, i) => i + 1);
+  const state = plain(lib.readNotifyState(JSON.stringify({ sent, view_version: 42 })));
+  assert.equal(state.sent.length, 300, "not cut at 200");
+  assert.equal(state.view_version, 42);
+});
+
+test("an account switch seen late keeps what was told after the new account was accepted", () => {
+  const accepted = Date.parse("2026-11-19T10:00:00Z");
+  const state = { reminders: [], told: { limits: [{ key: "claude.seven_day.2026-11-20T00:00:00Z", at: accepted - 60_000, event_at: accepted - 60_000 },
+    { key: "claude.five_hour.2026-11-19T15:00:00Z", at: accepted + 60_000, event_at: accepted + 60_000 },
+    { key: "claude.five_hour.2026-11-19T20:00:00Z", at: accepted + 60_000 }], warned: [] }, sent: [], boundaries: { claude: "a#1", codex: "#0" },
+    boundaries_version: 5, checked_at: null };
+  const r = plain(lib.forgetSwitched(state, { claude: "2026-11-19T10:00:00.000Z#2", codex: "#0" }, 6));
+  assert.deepEqual(r.switched, ["claude"]);
+  assert.deepEqual(r.state.told.limits.map((x: any) => x.key), ["claude.five_hour.2026-11-19T15:00:00Z"], "the old account's cycle is forgotten, the new one's stays");
+});
+
+test("a run-out warning is not told when the shown limit no longer runs out", () => {
+  const view = plain(lib.demoResult("normal", NOTE_NOW).view);
+  const w = view.claude.windows.five_hour;
+  assert.ok(!lib.projectionOf(lib.atDisplayTime(w, NOTE_NOW), NOTE_NOW)?.runsOut, "the demo's 5h limit lasts");
+  const told = { limits: [], warned: [] };
+  assert.deepEqual(titles(lib.selectAlerts([ev(1, "soon", { threshold: 30, eta_minutes: 30 })], view, NOTE_NOW, { told, times: false })), []);
+  assert.equal(titles(lib.selectAlerts([ev(1, "soon", { threshold: 30, eta_minutes: 30 })], null, NOTE_NOW, { told, times: false })).length, 1, "without the view, the event's time decides");
+});
+
+test("the red dot stays while any overall limit of the provider is still at 100%", () => {
+  const now = new Date("2026-11-19T12:00:00Z");
+  const p = { main_window_ids: ["five_hour", "seven_day"], windows: {
+    five_hour: { used_percent: 100, resets_at: "2026-11-19T11:00:00Z" },
+    seven_day: { used_percent: 100, resets_at: "2026-11-21T00:00:00Z" } } };
+  assert.equal(lib.limitLifted(p, ["five_hour"], now), false, "the weekly limit (not listed) still blocks");
+  p.windows.seven_day.used_percent = 80;
+  assert.equal(lib.limitLifted(p, ["five_hour"], now), true);
+});
+
+test("a notifying run stops when the preferences change meanwhile, even back to the same values", async () => {
+  const files = new Map<string, string>([[`/docs/headroom-events-${TAG}-3`, ""]]);
+  const notifier = newNotifier();
+  const run = await runWidget({ family: "medium", inApp: true, shortcut: "notify", files, notifier, now: NOTE_NOW,
+    response: { status: 200, body: demoBody("reset", NOTE_NOW) }, responder: eventsAt(feed(5, [ev(5, "limit", { window_id: "seven_day", label: "Weekly", resets_at: "2026-11-20T00:00:00Z" })])),
+    onLoad: (k, url) => { if (url.includes("/v2/events")) k.set(lib.KEYCHAIN_NOTIFY, JSON.stringify({ events: true, times: true, rev: 2 })); } });
+  assert.equal(run.shortcutOutput, "Settings changed");
+  assert.equal(notifier.pending.size + notifier.delivered.size, 0, "what it scheduled is taken back");
+  assert.ok(!files.has(`/docs/headroom-events-${TAG}-5`));
+});
+
+test("a view older than the last run's changes no reminder", async () => {
+  const files = new Map<string, string>([[`/docs/headroom-notify-${TAG}.json`, JSON.stringify({ reminders: [], view_version: 9 })]]);
+  const notifier = newNotifier();
+  await runWidget({ family: "medium", inApp: true, shortcut: "notify", files, notifier, now: NOTE_NOW,
+    response: { status: 200, body: { ...demoBody("reset", NOTE_NOW), data_version: 8 } }, responder: eventsAt(feed(3, [])) });
+  assert.equal(notifier.pending.size, 0, "older than version 9: nothing scheduled");
+  assert.equal(JSON.parse(files.get(`/docs/headroom-notify-${TAG}.json`)!).view_version, 9, "the version doesn't go back");
+  await runWidget({ family: "medium", inApp: true, shortcut: "notify", files, notifier, now: NOTE_NOW,
+    response: { status: 200, body: { ...demoBody("reset", NOTE_NOW), data_version: 10 } }, responder: eventsAt(feed(3, [])) });
+  assert.equal(notifier.pending.size, 1, "a newer view schedules it");
+});
+
+test("settings saved or removed meanwhile by another run are neither overwritten nor removed", async () => {
+  const other = JSON.stringify({ url: "https://other.example", token: "x", id: "2222222222222222" });
+  const keychain = { [lib.KEYCHAIN_CONFIG]: JSON.stringify({ url: "https://headroom.example.com", token: "t", id: "1111111111111111" }) };
+  // Server and token: another run saved new settings while the form was open
+  const edit = await runWidget({ family: "medium", keychain, app: { menu: [3, 0], form: ["https://mine.example", "t2"] },
+    beforeConfirm: (k: Map<string, string>) => { if (k.get(lib.KEYCHAIN_CONFIG) !== other) k.set(lib.KEYCHAIN_CONFIG, other); } } as any);
+  assert.equal(edit.keychain.get(lib.KEYCHAIN_CONFIG), other);
+  assert.ok(edit.alertTitles.includes("Not saved"));
+  // Remove all settings: the same
+  const removed = await runWidget({ family: "medium", keychain, app: { menu: [3, 2] },
+    beforeConfirm: (k: Map<string, string>) => { if (k.get(lib.KEYCHAIN_CONFIG) !== other) k.set(lib.KEYCHAIN_CONFIG, other); } } as any);
+  assert.equal(removed.keychain.get(lib.KEYCHAIN_CONFIG), other);
+  assert.ok(removed.alertTitles.includes("Not removed"));
+});
+
+test("the details page shows none of the old settings' values if they change while it loads", async () => {
+  const run = await runWidget({ family: "medium", app: { menu: [0] },
+    responder: (url: string) => (url.includes("/v2/events") ? { status: 200, body: { last_seq: 0, oldest_seq: null, events: [] } } : undefined),
+    onLoadHTML: (k: Map<string, string>) => k.set(lib.KEYCHAIN_CONFIG, JSON.stringify({ url: "https://other.example", token: "x", id: "2222222222222222" })) } as any);
+  assert.equal(run.webPages.length, 2);
+  assert.ok(run.webPages[1]!.includes("Settings changed"));
+  assert.ok(!run.webPages[1]!.includes("<em>Confidence</em>"), "no limits of the old settings");
+});
+
+test("a reminder of this generation on the device that the plan doesn't keep is cancelled", async () => {
+  const gen = lib.DEFAULT_CONFIG_ID;
+  const notifier = newNotifier();
+  const stray = `headroom.${gen}.runout.claude.five_hour.29918280`;
+  notifier.pending.set(stray, { id: stray });
+  await runWidget({ family: "medium", inApp: true, shortcut: "notify", notifier, now: NOTE_NOW,
+    response: { status: 200, body: demoBody("normal", NOTE_NOW) }, responder: eventsAt(feed(3, [])) });
+  assert.ok(!notifier.pending.has(stray));
+});
+
+test("a state from before the view version was kept still refuses an older view", async () => {
+  const files = new Map<string, string>([[`/docs/headroom-notify-${TAG}.json`, JSON.stringify({ reminders: [], boundaries: { claude: "#0", codex: "#0" }, boundaries_version: 9 })]]);
+  const notifier = newNotifier();
+  await runWidget({ family: "medium", inApp: true, shortcut: "notify", files, notifier, now: NOTE_NOW,
+    response: { status: 200, body: { ...demoBody("reset", NOTE_NOW), data_version: 8 } }, responder: eventsAt(feed(3, [])) });
+  assert.equal(notifier.pending.size, 0);
+  assert.equal(lib.readNotifyState(JSON.stringify({ boundaries_version: 9 })).view_version, 9);
+});
+
+test("a reminder cancelled by turning time reminders off is not taken for one that rang", () => {
+  const offAt = NOTE_NOW.getTime() - 10 * 60_000;
+  const r = { id: "headroom.0000000000000000.back.claude.all.1", kind: "back", provider: "claude", window_id: "five_hour", cycle: NOTE_NOW.getTime(),
+    fire_at: NOTE_NOW.getTime() - 60_000, set_at: offAt - 3_600_000 };
+  const prefs = { times_off_at: offAt, cancelled: [{ id: r.id, at: offAt }] };
+  assert.deepEqual(plain(lib.withoutCancelled([r], prefs)), [], "removed by the menu: cancelled");
+  assert.equal(lib.withoutCancelled([r], { times_off_at: offAt, cancelled: [] }).length, 1, "not removed (it rang, or couldn't be removed)");
+  assert.equal(lib.withoutCancelled([{ ...r, set_at: offAt + 1 }], prefs).length, 1, "scheduled again after it was turned on");
+  // Turned off, on and off again before a notifying run: both cancellations count, each against its own time
+  const twice = { cancelled: [{ id: r.id, at: offAt }, { id: "headroom.0000000000000000.runout.codex.five_hour.2", at: offAt + 120_000 }] };
+  assert.equal(lib.withoutCancelled([r, { ...r, id: "headroom.0000000000000000.runout.codex.five_hour.2", kind: "runout", set_at: offAt + 60_000 }], twice).length, 0);
+  // The limit was told; its reset comes after the cancelled reminder's time: told
+  const cycle = "2026-11-19T11:59:00.000Z";
+  const told = { limits: [{ key: `claude.five_hour.${cycle}`, at: 1, until: NOTE_NOW.getTime() + 86_400_000 }], warned: [] };
+  const reset = ev(9, "reset", { cycle, resets_at: cycle });
+  const reminders = [{ ...r, cycle: Date.parse(cycle) }];
+  assert.equal(titles(lib.selectAlerts([reset], null, NOTE_NOW, { told, reminders, times: false })).length, 0, "taken for one that rang");
+  assert.equal(titles(lib.selectAlerts([reset], null, NOTE_NOW, { told, reminders: lib.withoutCancelled(reminders, prefs), times: false })).length, 1);
+});
+
+test("a cycle told for the account before the switch doesn't hold back the new account's alerts", () => {
+  const cycle = "2026-11-19T15:00:00.000Z";
+  const since = { claude: Date.parse("2026-11-19T11:00:00Z"), codex: Number.NaN };
+  // the old account's warning, made at 10:59 but read at 11:01 (after the switch)
+  const old = { key: `claude.five_hour.${cycle}`, at: Date.parse("2026-11-19T11:01:00Z"), event_at: Date.parse("2026-11-19T10:59:00Z"), until: NOTE_NOW.getTime() + 86_400_000 };
+  const warn = ev(5, "threshold", { threshold: 95 });
+  assert.equal(titles(lib.selectAlerts([warn], null, NOTE_NOW, { told: { limits: [], warned: [old] }, times: false })).length, 0, "without the switch time, taken as told");
+  assert.equal(titles(lib.selectAlerts([warn], null, NOTE_NOW, { told: { limits: [], warned: [old] }, times: false, since })).length, 1);
+  const picked = lib.selectAlerts([warn], null, NOTE_NOW, { told: { limits: [], warned: [] }, times: false, since });
+  assert.equal(picked.alerts[0].mark.event_at, Date.parse(warn.created_at), "the mark keeps the event's server time");
+  // A switch seen late keeps what an event of the new account told, by the event's time (not the iPhone's)
+  const state = { reminders: [], told: { limits: [], warned: [{ ...old, at: since.claude - 30_000, event_at: since.claude + 10_000 }] }, sent: [],
+    boundaries: { claude: "a#1", codex: "#0" }, boundaries_version: 1, checked_at: null };
+  const r = plain(lib.forgetSwitched(state, { claude: "2026-11-19T11:00:00.000Z#2", codex: "#0" }, 2));
+  assert.equal(r.state.told.warned.length, 1);
+});
+
+test("the notification switches are shown again when another run changed them meanwhile; failures are told", async () => {
+  // Notifications -> (another run turns limit alerts off) -> Time reminders
+  const moved = await runWidget({ family: "medium", app: { menu: [2, 2] },
+    onSheet: (k: Map<string, string>, n: number) => { if (n === 2) k.set(lib.KEYCHAIN_NOTIFY, JSON.stringify({ events: false, times: true, rev: 4 })); } } as any);
+  assert.ok(moved.alertTitles.includes("Changed meanwhile"));
+  assert.deepEqual(plain(lib.notifyPrefs(savedSwitches(moved.keychain))), { events: false, times: true, rev: 4, times_off_at: null, cancel_pending: false, cancelled: [], cancels: [] }, "not changed by the old menu");
+  // Time reminders off while the pending list can't be read
+  const failing = await runWidget({ family: "medium", app: { menu: [2, 2] }, pendingFails: true } as any);
+  assert.ok(failing.alertTitles.includes("Partly changed"));
+  const off = lib.notifyPrefs(savedSwitches(failing.keychain));
+  assert.equal(off.times, false);
+  assert.ok(Number.isFinite(off.times_off_at), "when they were turned off");
+});
+
+test("Remove all settings offers to try the Keychain again at once", async () => {
+  // The first try fails, the second works
+  let fails = 1;
+  const notifier = newNotifier();
+  const gen = lib.DEFAULT_CONFIG_ID;
+  notifier.pending.set(`headroom.${gen}.back.claude.all.1`, { id: `headroom.${gen}.back.claude.all.1` });
+  let pendingAtRetry = -1;
+  const ok = await runWidget({ family: "medium", app: { menu: [3, 2] }, notifier,
+    keychainRemove: () => { if (fails-- > 0) throw new Error("keychain"); },
+    // at the retry question (the first try has failed)
+    beforeConfirm: () => { if (pendingAtRetry < 0 && fails <= 0) pendingAtRetry = notifier.pending.size; } } as any);
+  assert.equal(ok.error, null);
+  assert.ok(ok.alertTitles.includes("Not fully removed"), "offered to try again");
+  assert.equal(pendingAtRetry, 0, "the reminders are gone before the question (closing the app there leaves none)");
+  assert.ok(!ok.keychain.has(lib.KEYCHAIN_CONFIG) && !ok.keychain.has("headroom.url"), "removed on the second try");
+});
+
+test("a run that lost the lock leaves its reminders to the new owner even when a switch changed meanwhile", async () => {
+  const files = new Map<string, string>([[`/docs/headroom-events-${TAG}-3`, ""]]);
+  const notifier = newNotifier();
+  const run = await runWidget({ family: "medium", inApp: true, shortcut: "notify", files, notifier, now: NOTE_NOW,
+    response: { status: 200, body: demoBody("reset", NOTE_NOW) }, responder: eventsAt(feed(3, [])),
+    onLoad: (k, url) => {
+      if (!url.includes("/v2/events")) return;
+      files.set(`/docs/headroom-lock-${TAG}`, `other ${NOTE_NOW.getTime() + 60_000}`);
+      k.set(lib.KEYCHAIN_NOTIFY, JSON.stringify({ events: false, times: true, rev: 1 }));
+    } });
+  assert.equal(run.shortcutOutput, "Another run is notifying");
+  assert.equal(notifier.pending.size, 1, "the reminder the new owner plans too stays");
+});
+
+test("turning time reminders off records which reminders it removed; one delivered meanwhile is not among them", async () => {
+  const gen = lib.DEFAULT_CONFIG_ID;
+  const notifier = newNotifier();
+  const waiting = `headroom.${gen}.back.claude.all.29918280`;
+  const rang = `headroom.${gen}.runout.codex.five_hour.29918280`;
+  notifier.pending.set(waiting, { id: waiting });
+  notifier.pending.set(rang, { id: rang });
+  // the second one rings while the menu removes the first
+  const run = await runWidget({ family: "medium", app: { menu: [2, 2] }, notifier,
+    onAllPending: (_k: Map<string, string>, n: any) => { const x = n.pending.get(rang); n.pending.delete(rang); n.delivered.set(rang, x); } } as any);
+  const prefs = lib.notifyPrefs(savedSwitches(run.keychain));
+  assert.equal(prefs.times, false);
+  assert.deepEqual(plain(prefs.cancelled.map((c: any) => c.id)), [waiting]);
+  assert.equal(notifier.pending.size, 0);
+});
+
+test("a notification already on the device with the same words is not sent again (its state couldn't be saved last time)", async () => {
+  const files = new Map<string, string>([[`/docs/headroom-events-${TAG}-3`, ""]]);
+  const notifier = newNotifier();
+  const events = feed(5, [ev(5, "limit", { window_id: "seven_day", label: "Weekly", resets_at: "2026-11-20T00:00:00Z" })]);
+  // the first run tells it, but its state isn't saved
+  await runWidget({ family: "medium", inApp: true, shortcut: "notify", files, notifier, now: NOTE_NOW, responder: eventsAt(events) });
+  assert.equal(notifier.log.length, 1);
+  files.delete(`/docs/headroom-notify-${TAG}.json`);
+  files.delete(`/docs/headroom-events-${TAG}-5`);
+  await runWidget({ family: "medium", inApp: true, shortcut: "notify", files, notifier, now: NOTE_NOW, responder: eventsAt(events) });
+  assert.equal(notifier.log.length, 1, "not told twice");
+  assert.ok(files.has(`/docs/headroom-events-${TAG}-5`), "and the cursor moves on");
+});
+
+test("the notifying run removes files of other settings, and told numbers the server no longer holds", async () => {
+  const files = new Map<string, string>([[`/docs/headroom-events-${TAG}-3`, ""], ["/docs/headroom-events-abcdef12-9", ""], ["/docs/headroom-notify-abcdef12.json", "{}"],
+    ["/docs/headroom-view.json", "{}"], ["/docs/other-script.json", "{}"],
+    [`/docs/headroom-notify-${TAG}.json`, JSON.stringify({ reminders: [], sent: [1, 2, 4, 7] })]]);
+  await runWidget({ family: "medium", inApp: true, shortcut: "notify", files, now: NOTE_NOW,
+    responder: eventsAt({ ...feed(3, []), oldest_seq: 5 }) });
+  assert.ok(!files.has("/docs/headroom-events-abcdef12-9") && !files.has("/docs/headroom-notify-abcdef12.json") && !files.has("/docs/headroom-view.json"));
+  assert.ok(files.has("/docs/other-script.json"), "not Headroom's");
+  assert.deepEqual(JSON.parse(files.get(`/docs/headroom-notify-${TAG}.json`)!).sent, [7], "below the oldest held (5) can't come back");
+  assert.deepEqual(plain(lib.orphanFiles([`headroom-lock-${TAG}`, "headroom-lock-abcdef12"], TAG)), ["headroom-lock-abcdef12"]);
+});
+
+test("events tell one account from the next by the boundary stamp they were judged under", () => {
+  const old = "2026-11-18T00:00:00.000Z#1";
+  const now = "2026-11-19T11:00:00.000Z#2";
+  // the old account's limit and the new account's 95% (same reset time) in one batch: the warning is told
+  const batch = [ev(4, "limit", { boundary: old }), ev(5, "threshold", { threshold: 95, boundary: now })];
+  const picked = titles(lib.selectAlerts(batch, null, NOTE_NOW, { told: { limits: [], warned: [] }, times: false }));
+  assert.equal(picked.length, 2, picked.join(" / "));
+  // the same account: the limit takes the warning's place
+  assert.equal(titles(lib.selectAlerts([ev(4, "limit", { boundary: now }), ev(5, "threshold", { threshold: 95, boundary: now })], null, NOTE_NOW,
+    { told: { limits: [], warned: [] }, times: false })).length, 1);
+  // a mark keeps the stamp of the event it told
+  const told = lib.selectAlerts([ev(6, "threshold", { threshold: 95, boundary: now })], null, NOTE_NOW, { told: { limits: [], warned: [] }, times: false });
+  assert.equal(told.alerts[0].mark.boundary, now);
+  assert.equal(plain(lib.sanitizeEvents({ last_seq: 1, events: [{ ...ev(1, "limit"), boundary: "<x>#1" }] })).events[0].boundary, null, "only a stamp's shape");
+});
+
+test("Remove all keeps the notifications of settings saved while it lists them", async () => {
+  const notifier = newNotifier();
+  const old = lib.DEFAULT_CONFIG_ID;
+  notifier.pending.set(`headroom.${old}.back.claude.all.1`, { id: `headroom.${old}.back.claude.all.1` });
+  const newer = "2222222222222222";
+  const run = await runWidget({ family: "medium", app: { menu: [3, 2] }, notifier,
+    onAllPending: (k: Map<string, string>, n: any) => {
+      if (n.pending.has(`headroom.${newer}.back.codex.all.2`)) return;
+      k.set(lib.KEYCHAIN_CONFIG, JSON.stringify({ url: "https://other.example", token: "x", id: newer }));
+      n.pending.set(`headroom.${newer}.back.codex.all.2`, { id: `headroom.${newer}.back.codex.all.2` });
+    } } as any);
+  assert.equal(run.error, null);
+  assert.ok(!notifier.pending.has(`headroom.${old}.back.claude.all.1`), "the removed settings' reminder goes");
+  assert.ok(notifier.pending.has(`headroom.${newer}.back.codex.all.2`), "the new settings' reminder stays");
+});
+
+test("a run whose lock only expired takes it again to take back what the new switches don't want", async () => {
+  const files = new Map<string, string>([[`/docs/headroom-events-${TAG}-3`, ""]]);
+  const notifier = newNotifier();
+  const run = await runWidget({ family: "medium", inApp: true, shortcut: "notify", files, notifier, now: NOTE_NOW,
+    response: { status: 200, body: demoBody("reset", NOTE_NOW) }, responder: eventsAt(feed(3, [])),
+    onLoad: (k, url) => {
+      if (!url.includes("/v2/events")) return;
+      files.set(`/docs/headroom-lock-${TAG}`, `other ${NOTE_NOW.getTime() - 1000}`);
+      k.set(lib.KEYCHAIN_NOTIFY, JSON.stringify({ events: true, times: false, rev: 1 }));
+    } });
+  assert.equal(run.shortcutOutput, "Settings changed");
+  assert.equal(notifier.pending.size, 0, "time reminders are off now: taken back");
+});
+
+test("G5-e: a notification whose told record couldn't be saved is told again only when the device shows no trace of it and its run is gone", async () => {
+  const files = new Map<string, string>([[`/docs/headroom-events-${TAG}-3`, ""]]);
+  const notifier = newNotifier();
+  const keychain = { "headroom.url": "https://headroom.example.com", "headroom.token": "read-token-xyz" };
+  const events = feed(5, [ev(5, "limit", { window_id: "seven_day", label: "Weekly", resets_at: "2026-11-20T00:00:00Z" })]);
+  // handed to iOS, but its told record can't be saved afterwards (the intent was saved before)
+  await runWidget({ family: "medium", inApp: true, shortcut: "notify", files, notifier, keychain, now: NOTE_NOW, responder: eventsAt(events),
+    writeFailsWhen: (p: string) => p.includes("headroom-told-") } as any);
+  assert.equal(notifier.log.length, 1);
+  assert.ok(!files.has(`/docs/headroom-events-${TAG}-5`), "the cursor stays before it");
+  // still on the device: not told again
+  const later = new Date(NOTE_NOW.getTime() + 60_000);
+  const files2 = new Map(files);
+  const kept = await runWidget({ family: "medium", inApp: true, shortcut: "notify", files: files2, notifier, keychain, now: later, responder: eventsAt(events) });
+  assert.equal(notifier.log.length, 1, "on the device: not told twice");
+  assert.ok(String(kept.shortcutOutput).startsWith("No new alerts"), String(kept.shortcutOutput));
+  // dismissed from the device meanwhile: while the run that handed it over may still be going, it waits; once that run is gone, nothing
+  // tells it was told, so it is told again (a duplicate is allowed only here)
+  notifier.delivered.clear();
+  await runWidget({ family: "medium", inApp: true, shortcut: "notify", files, notifier, keychain, now: later, responder: eventsAt(events) });
+  assert.equal(notifier.log.length, 1, "its run may still be going: held");
+  assert.ok(!files.has(`/docs/headroom-events-${TAG}-5`));
+  await runWidget({ family: "medium", inApp: true, shortcut: "notify", files, notifier, keychain, now: new Date(NOTE_NOW.getTime() + 5 * 60_000), responder: eventsAt(events) });
+  assert.equal(notifier.log.length, 2, "told again");
+  // the control: a told record that was saved says it was told, also once dismissed (no duplicate)
+  const files3 = new Map<string, string>([[`/docs/headroom-events-${TAG}-3`, ""]]);
+  const notifier3 = newNotifier();
+  await runWidget({ family: "medium", inApp: true, shortcut: "notify", files: files3, notifier: notifier3, keychain, now: NOTE_NOW, responder: eventsAt(events),
+    writeFailsWhen: (p: string) => p.includes("headroom-notify-") } as any);
+  notifier3.delivered.clear();
+  await runWidget({ family: "medium", inApp: true, shortcut: "notify", files: files3, notifier: notifier3, keychain, now: new Date(NOTE_NOW.getTime() + 5 * 60_000), responder: eventsAt(events) });
+  assert.equal(notifier3.log.length, 1);
+});
+
+test("a notification another run already put on the device (by its event numbers) is not told again", async () => {
+  const files = new Map<string, string>([[`/docs/headroom-events-${TAG}-3`, ""]]);
+  const notifier = newNotifier();
+  notifier.delivered.set("x", { id: `headroom.${lib.DEFAULT_CONFIG_ID}.events.5.claude`, title: "t", body: "b", userInfo: { seqs: [5] } } as any);
+  await runWidget({ family: "medium", inApp: true, shortcut: "notify", files, notifier, now: NOTE_NOW,
+    responder: eventsAt(feed(5, [ev(5, "limit", { window_id: "seven_day", label: "Weekly", resets_at: "2026-11-20T00:00:00Z" })])) });
+  assert.equal(notifier.log.length, 0);
+  assert.ok(files.has(`/docs/headroom-events-${TAG}-5`));
+});
+
+test("a reminder due now whose state couldn't be saved afterwards rings once", async () => {
+  const files = new Map<string, string>();
+  const notifier = newNotifier();
+  const body = demoBody("runout", NOTE_NOW);
+  let fails = 1;
+  await runWidget({ family: "medium", inApp: true, shortcut: "notify", files, notifier, now: NOTE_NOW, response: { status: 200, body }, responder: eventsAt(feed(3, [])),
+    writeFailsWhen: (p: string) => p.includes("headroom-notify-") && notifier.log.length > 0 && fails-- > 0 } as any);
+  assert.ok(notifier.log.length >= 1);
+  await runWidget({ family: "medium", inApp: true, shortcut: "notify", files, notifier, now: new Date(NOTE_NOW.getTime() + 60_000), response: { status: 200, body }, responder: eventsAt(feed(3, [])) });
+  const ids = notifier.log.map((n: any) => n.id);
+  assert.equal(new Set(ids).size, ids.length, `no reminder scheduled twice: ${ids.join(", ")}`);
+});
+
+test("told numbers below the server's oldest are dropped also when a later notification fails", async () => {
+  const files = new Map<string, string>([[`/docs/headroom-events-${TAG}-3`, ""], [`/docs/headroom-notify-${TAG}.json`, JSON.stringify({ reminders: [], sent: [2, 3, 10] })]]);
+  const notifier = newNotifier();
+  const events = { last_seq: 12, oldest_seq: 9, events: [ev(11, "limit", { provider: "claude", window_id: "seven_day", label: "Weekly", resets_at: "2026-11-20T00:00:00Z" }),
+    ev(12, "limit", { provider: "codex", window_id: "seven_day", label: "Weekly", resets_at: "2026-11-20T00:00:00Z" })] };
+  await runWidget({ family: "medium", inApp: true, shortcut: "notify", files, notifier, now: NOTE_NOW, responder: eventsAt(events), scheduleFailsAfter: 1 });
+  const sent = JSON.parse(files.get(`/docs/headroom-notify-${TAG}.json`)!).sent;
+  assert.ok(!sent.includes(2) && !sent.includes(3), JSON.stringify(sent));
+  assert.ok(sent.includes(10));
+});
+
+test("files are told apart by their exact settings tag (one tag can start another)", () => {
+  const short = lib.cacheTag({ id: lib.DEFAULT_CONFIG_ID }, "https://quota.example");
+  const long = lib.cacheTag({ id: lib.DEFAULT_CONFIG_ID }, "https://quota.example:8443");
+  assert.ok(long.startsWith(short));
+  assert.equal(lib.fileTag(`headroom-notify-${long}.json`), long);
+  assert.deepEqual(plain(lib.orphanFiles([`headroom-notify-${long}.json`, `headroom-events-${short}-4`, "headroom-view-12.json"], short)),
+    [`headroom-notify-${long}.json`, "headroom-view-12.json"]);
+});
+
+test("the stamp from before any switch is a known stamp; the view counts only for events of its own account", () => {
+  assert.equal(lib.sanitizeEvents({ last_seq: 1, events: [{ ...ev(1, "limit"), boundary: "" }] }).events[0].boundary, "");
+  // the old account's limit (stamp "") and the new account's 95% (after the first switch)
+  const batch = [ev(4, "limit", { boundary: "" }), ev(5, "threshold", { threshold: 95, boundary: "2026-11-19T11:00:00.000Z#1" })];
+  assert.equal(titles(lib.selectAlerts(batch, null, NOTE_NOW, { told: { limits: [], warned: [] }, times: false })).length, 2);
+  // a soon event of the new account with a view still of the old one: the view's forecast (it lasts) doesn't drop it
+  const view = plain(lib.demoResult("normal", NOTE_NOW).view);
+  view.boundaries = { claude: "", codex: "" };
+  const soon = ev(6, "soon", { threshold: 30, eta_minutes: 30, boundary: "2026-11-19T11:00:00.000Z#1" });
+  assert.equal(titles(lib.selectAlerts([soon], view, NOTE_NOW, { told: { limits: [], warned: [] }, times: false })).length, 1);
+  assert.equal(titles(lib.selectAlerts([{ ...soon, boundary: "" }], view, NOTE_NOW, { told: { limits: [], warned: [] }, times: false })).length, 0, "same account: the view decides");
+});
+
+test("a mark of an earlier version (no stamp, no server time) doesn't hold back alerts after a switch", () => {
+  const legacy = { key: "claude.five_hour.2026-11-19T15:00:00.000Z", at: NOTE_NOW.getTime() - 60_000, until: NOTE_NOW.getTime() + 86_400_000 };
+  const since = { claude: Date.parse("2026-11-19T11:00:00Z") };
+  const warn = ev(5, "threshold", { threshold: 95 });
+  assert.equal(titles(lib.selectAlerts([warn], null, NOTE_NOW, { told: { limits: [], warned: [legacy] }, times: false })).length, 0, "no switch: it counts");
+  assert.equal(titles(lib.selectAlerts([warn], null, NOTE_NOW, { told: { limits: [], warned: [legacy] }, times: false, since })).length, 1);
+});
+
+test("notification switches that can't be read are not taken for on", async () => {
+  const files = new Map<string, string>([[`/docs/headroom-events-${TAG}-3`, ""]]);
+  const notifier = newNotifier();
+  const run = await runWidget({ family: "medium", inApp: true, shortcut: "notify", files, notifier, now: NOTE_NOW, keychainGetFailsFor: lib.KEYCHAIN_NOTIFY,
+    keychain: { "headroom.url": "https://headroom.example.com", "headroom.token": "read-token-xyz", [lib.KEYCHAIN_NOTIFY]: JSON.stringify({ times: false, events: false }) },
+    response: { status: 200, body: demoBody("reset", NOTE_NOW) }, responder: eventsAt(feed(5, [ev(5, "limit")])) } as any);
+  assert.equal(run.shortcutOutput, "Couldn't read the notification settings");
+  assert.equal(notifier.log.length, 0);
+});
+
+test("Remove all retries only the values it found, and never keeps the settings it removes", async () => {
+  const gen = "1111111111111111";
+  const keychain = { [lib.KEYCHAIN_CONFIG]: JSON.stringify({ url: "https://headroom.example.com", token: "t", id: gen }) };
+  const notifier = newNotifier();
+  notifier.pending.set(`headroom.${gen}.back.claude.all.1`, { id: `headroom.${gen}.back.claude.all.1` });
+  const other = JSON.stringify({ url: "https://other.example", token: "x", id: "2222222222222222" });
+  let fails = 1;
+  let questions = 0;
+  const run = await runWidget({ family: "medium", app: { menu: [3, 2] }, keychain, notifier,
+    keychainRemove: () => { if (fails-- > 0) throw new Error("keychain"); },
+    // another run saves new settings while the retry question is open (the second question)
+    beforeConfirm: (k: Map<string, string>) => { if (++questions === 2) saveAs(k, other); } } as any);
+  assert.equal(run.error, null);
+  assert.ok(!notifier.pending.has(`headroom.${gen}.back.claude.all.1`), "the removed settings' reminder goes although its item was still there");
+  assert.equal(JSON.stringify(savedConfig(run.keychain)), other, "the settings saved meanwhile stay");
+});
+
+test("turning time reminders off waits for a notifying run's lock", async () => {
+  const files = new Map<string, string>([[`/docs/headroom-lock-${TAG}`, `other ${Date.now() + 600_000}`]]);
+  const run = await runWidget({ family: "medium", app: { menu: [2, 2] }, files });
+  assert.ok(run.alertTitles.includes("Busy"));
+  assert.equal(lib.notifyPrefs(savedSwitches(run.keychain))!.times, true, "unchanged");
+});
+
+test("a reminder still waiting on the device hasn't rung, whatever its time", () => {
+  const gen = "0123456789abcdef";
+  const t = NOTE_NOW.getTime();
+  const r = { id: `headroom.${gen}.back.claude.all.1`, kind: "back", provider: "claude", window_id: "five_hour", cycle: t + 30_000, fire_at: t + 30_000 };
+  const off = plain(lib.reconcileReminders([r], [], NOTE_NOW, gen, new Set([r.id]), null, true));
+  assert.deepEqual(off.cancel, [r.id], "withdrawn 30 seconds before: cancelled");
+  const kept = plain(lib.reconcileReminders([r], [], NOTE_NOW, gen, new Set([r.id])));
+  assert.deepEqual([kept.cancel.length, kept.reminders.length], [0, 1], "no longer planned but due: kept, so its delivery is matched when its reset is told");
+  const gone = plain(lib.reconcileReminders([r], [], NOTE_NOW, gen, new Set()));
+  assert.deepEqual([gone.cancel.length, gone.reminders.length], [0, 1], "no longer waiting: it rang");
+});
+
+test("a run whose lock expired leaves what a run that held it meanwhile saved as its own", async () => {
+  const files = new Map<string, string>([[`/docs/headroom-events-${TAG}-3`, ""]]);
+  const notifier = newNotifier();
+  await runWidget({ family: "medium", inApp: true, shortcut: "notify", files, notifier, now: NOTE_NOW,
+    response: { status: 200, body: demoBody("reset", NOTE_NOW) }, responder: eventsAt(feed(3, [])),
+    onLoad: (k, url) => {
+      if (!url.includes("/v2/events")) return;
+      // B took the lock, kept the same reminder and finished; then the switches changed (limit alerts only)
+      const id = [...notifier.pending.keys()][0]!;
+      files.set(`/docs/headroom-notify-${TAG}.json`, JSON.stringify({ reminders: [{ id, kind: "back", provider: "claude", window_id: "five_hour", cycle: 1, fire_at: NOTE_NOW.getTime() + 3_600_000 }] }));
+      files.delete(`/docs/headroom-lock-${TAG}`);
+      k.set(lib.KEYCHAIN_NOTIFY, JSON.stringify({ events: false, times: true, rev: 1 }));
+    } });
+  assert.equal(notifier.pending.size, 1, "B's reminder stays");
+});
+
+test("Remove all removes nothing it can't tell apart when the Keychain can't be read", async () => {
+  const gen = "1111111111111111";
+  const keychain = { [lib.KEYCHAIN_CONFIG]: JSON.stringify({ url: "https://headroom.example.com", token: "t", id: gen }) };
+  const notifier = newNotifier();
+  const newer = "2222222222222222";
+  notifier.pending.set(`headroom.${newer}.back.claude.all.1`, { id: `headroom.${newer}.back.claude.all.1` });
+  // while the reminders are listed, another run saves new settings, and then the Keychain can't be read
+  let failing = false;
+  await runWidget({ family: "medium", app: { menu: [3, 2] }, keychain, notifier,
+    onAllPending: (k: Map<string, string>) => {
+      k.set(lib.KEYCHAIN_CONFIG, JSON.stringify({ url: "https://other.example", token: "x", id: newer }));
+      failing = true;
+    },
+    keychainGetFailsWhen: (k: string) => failing && k === lib.KEYCHAIN_CONFIG } as any);
+  assert.ok(notifier.pending.has(`headroom.${newer}.back.claude.all.1`), "not removed on settings it couldn't read");
+});
+
+test("the wait after taking the lock is given to Scriptable's timer in milliseconds", async () => {
+  const intervals: number[] = [];
+  const timer = { schedule: (ms: number, _repeats: boolean, done: () => void) => { intervals.push(ms); done(); } };
+  await runWidget({ family: "medium", inApp: true, shortcut: "notify", now: NOTE_NOW, responder: eventsAt(feed(3, [])), globals: { Timer: timer } } as any);
+  assert.deepEqual(intervals, [lib.LOCK_SETTLE_MS]);
+  assert.equal(lib.LOCK_SETTLE_MS, 1500);
+});
+
+test("of two alerts, the one another run told just before is only remembered; the other is still told", async () => {
+  const files = new Map<string, string>([[`/docs/headroom-events-${TAG}-3`, ""]]);
+  const notifier = newNotifier();
+  const gen = lib.DEFAULT_CONFIG_ID;
+  const limit = ev(5, "limit", { window_id: "seven_day", label: "Weekly", resets_at: "2026-11-20T00:00:00Z" });
+  const warn = ev(6, "threshold", { threshold: 80, window_id: "seven_day", label: "Weekly", resets_at: "2026-11-20T00:00:00Z" });
+  await runWidget({ family: "medium", inApp: true, shortcut: "notify", files, notifier, now: NOTE_NOW, responder: eventsAt(feed(6, [limit, warn])),
+    // another run tells 5 right before this one's notification
+    onAllDelivered: (n: any, call: number) => {
+      if (call === 2) n.delivered.set("other", { id: `headroom.${gen}.events.5.claude`, title: "t", body: "b", userInfo: { seqs: [5] } });
+    } } as any);
+  assert.equal(notifier.log.length, 1, "6 is told");
+  assert.ok(String(notifier.log[0].body).includes("left"), String(notifier.log[0].body));
+  const state = JSON.parse(files.get(`/docs/headroom-notify-${TAG}.json`)!);
+  assert.ok(state.told.limits.some((m: any) => m.key.startsWith("claude.seven_day.")), "the limit 5 told is remembered");
+});
+
+test("when the device's list can't be read before a notification, nothing more is told and the cursor stays", async () => {
+  const files = new Map<string, string>([[`/docs/headroom-events-${TAG}-3`, ""]]);
+  const notifier = newNotifier();
+  const run = await runWidget({ family: "medium", inApp: true, shortcut: "notify", files, notifier, now: NOTE_NOW, deliveredFailsOnCall: 2,
+    responder: eventsAt(feed(5, [ev(5, "limit", { window_id: "seven_day", label: "Weekly", resets_at: "2026-11-20T00:00:00Z" })])) } as any);
+  assert.equal(notifier.log.length, 0);
+  assert.ok(!files.has(`/docs/headroom-events-${TAG}-5`), "the cursor stays");
+  assert.ok(String(run.shortcutOutput).startsWith("Couldn't check alerts"), String(run.shortcutOutput));
+});
+
+test("with time reminders off, one still waiting on the device is cancelled also when the view can't be read", async () => {
+  const gen = lib.DEFAULT_CONFIG_ID;
+  const files = new Map<string, string>([[`/docs/headroom-events-${TAG}-3`, ""]]);
+  const notifier = newNotifier();
+  const id = `headroom.${gen}.back.claude.all.29918280`;
+  notifier.pending.set(id, { id });
+  const keychain = { "headroom.url": "https://headroom.example.com", "headroom.token": "read-token-xyz", [lib.KEYCHAIN_NOTIFY]: JSON.stringify({ times: false }) };
+  await runWidget({ family: "medium", inApp: true, shortcut: "notify", files, notifier, keychain, now: NOTE_NOW,
+    responder: (url: string) => (url.includes("/v2/events") ? { status: 200, body: feed(3, []) } : url.includes("/v2/view") ? { status: 503, body: {} } : undefined) });
+  assert.equal(notifier.pending.size, 0);
+  // and the reset of an alert isn't held back by a reminder still waiting
+  const cycle = "2026-11-19T11:59:00.000Z";
+  const told = { limits: [{ key: `claude.five_hour.${cycle}`, at: 1, until: NOTE_NOW.getTime() + 86_400_000 }], warned: [] };
+  const waiting = [{ id, kind: "back", provider: "claude", window_id: "five_hour", cycle: Date.parse(cycle), fire_at: NOTE_NOW.getTime() - 60_000 }];
+  const reset = ev(9, "reset", { cycle, resets_at: cycle });
+  assert.equal(titles(lib.selectAlerts([reset], null, NOTE_NOW, { told, reminders: waiting, times: false, pending: new Set([id]) })).length, 1);
+});
+
+test("without a stamp on one side, accounts are told apart by the server's times", () => {
+  // the view's account was accepted at 11:50; an event without a stamp made at 11:45 is the previous account's
+  const view = plain(lib.demoResult("normal", NOTE_NOW).view);
+  view.boundaries = { claude: "2026-11-19T11:50:00.000Z#1", codex: "" };
+  const soon = ev(6, "soon", { threshold: 30, eta_minutes: 30, created_at: "2026-11-19T11:45:00.000Z" });
+  assert.equal(titles(lib.selectAlerts([soon], view, new Date("2026-11-19T11:46:00Z"), { told: { limits: [], warned: [] }, times: false })).length, 1,
+    "the new account's view (its forecast lasts) doesn't drop it");
+  // the view hasn't seen a switch yet, but the event's stamp names one: a mark of an earlier version doesn't hold it back
+  const legacy = { key: "claude.five_hour.2026-11-19T15:00:00.000Z", at: NOTE_NOW.getTime() - 60_000, until: NOTE_NOW.getTime() + 86_400_000 };
+  const warn = ev(5, "threshold", { threshold: 95, boundary: "2026-11-19T11:00:00.000Z#1" });
+  assert.equal(titles(lib.selectAlerts([warn], null, NOTE_NOW, { told: { limits: [], warned: [legacy] }, times: false })).length, 1);
+});
+
+test("a corrupt notification setting stops the notifying run instead of turning both on", async () => {
+  const files = new Map<string, string>([[`/docs/headroom-events-${TAG}-3`, ""]]);
+  const notifier = newNotifier();
+  const run = await runWidget({ family: "medium", inApp: true, shortcut: "notify", files, notifier, now: NOTE_NOW,
+    keychain: { "headroom.url": "https://headroom.example.com", "headroom.token": "read-token-xyz", [lib.KEYCHAIN_NOTIFY]: "{not json" },
+    response: { status: 200, body: demoBody("reset", NOTE_NOW) }, responder: eventsAt(feed(5, [ev(5, "limit")])) });
+  assert.equal(run.shortcutOutput, "Couldn't read the notification settings");
+  assert.equal(notifier.log.length, 0);
+});
+
+test("the notification menu checks again once it holds the lock, and an item Remove all can't remove isn't counted as removed", async () => {
+  // the lock is held at first; while the menu waits, another menu changes the switches and lets the lock go
+  const files = new Map<string, string>([[`/docs/headroom-lock-${TAG}`, `other ${Date.now() + 600_000}`]]);
+  let keychainRef: Map<string, string> | null = null;
+  const timer = { schedule: (_ms: number, _r: boolean, done: () => void) => {
+    files.delete(`/docs/headroom-lock-${TAG}`);
+    keychainRef?.set(lib.KEYCHAIN_NOTIFY, JSON.stringify({ events: false, times: true, rev: 7 }));
+    done();
+  } };
+  const run = await runWidget({ family: "medium", app: { menu: [2, 2] }, files, globals: { Timer: timer },
+    onSheet: (k: Map<string, string>) => { keychainRef = k; } } as any);
+  assert.ok(run.alertTitles.includes("Changed meanwhile"));
+  assert.equal(lib.notifyPrefs(savedSwitches(run.keychain))!.rev, 7, "the other menu's change stays");
+  // Remove all: the settings item can't be removed the first time
+  let fails = 1;
+  const removed = await runWidget({ family: "medium", app: { menu: [3, 2] },
+    keychain: { [lib.KEYCHAIN_CONFIG]: JSON.stringify({ url: "https://headroom.example.com", token: "t", id: "1111111111111111" }) },
+    keychainRemove: (k: string) => { if (k === lib.KEYCHAIN_CONFIG && fails-- > 0) throw new Error("keychain"); } } as any);
+  assert.ok(removed.alertTitles.includes("Not fully removed"), "offered to try again");
+  assert.equal(savedConfig(removed.keychain), null, "removed on the retry");
+});
+
+// ---- Guarantees G2 on the iPhone
+const emptyView = (dataVersion: number) => ({ view_version: 1, data_version: dataVersion, claude: null, codex: null, boundaries: { claude: "#0", codex: "#0" } });
+const notifyWith = (files: Map<string, string>, notifier: Notifier, response: { status: number; body: unknown }) =>
+  runWidget({ family: "medium", inApp: true, shortcut: "notify", files, notifier, now: NOTE_NOW, response, responder: eventsAt(feed(3, [])) });
+
+test("G2-a: a withdrawn value reaches the iPhone; a late old response or a failure after it plans nothing from the old value", async () => {
+  const files = new Map<string, string>([[`/docs/headroom-events-${TAG}-3`, ""]]);
+  const notifier = newNotifier();
+  const withValues = { ...demoBody("reset", NOTE_NOW), data_version: 5 };
+  await notifyWith(files, notifier, { status: 200, body: withValues });
+  assert.equal(notifier.pending.size, 1, "the value plans a reset reminder");
+  await notifyWith(files, notifier, { status: 200, body: emptyView(6) });
+  assert.equal(notifier.pending.size, 0, "withdrawn: its reminder is cancelled");
+  await notifyWith(files, notifier, { status: 200, body: withValues });
+  assert.equal(notifier.pending.size, 0, "the late old response plans nothing");
+  await notifyWith(files, notifier, { status: 503, body: {} });
+  assert.equal(notifier.pending.size, 0, "nor does a failure after it");
+});
+
+test("G2-b: a newer response with new boundaries, then a late older one: the newer boundaries stay", async () => {
+  const files = new Map<string, string>([[`/docs/headroom-events-${TAG}-3`, ""]]);
+  const notifier = newNotifier();
+  const newer = { ...demoBody("normal", NOTE_NOW), data_version: 8, boundaries: { claude: "2026-11-19T11:00:00.000Z#1", codex: "#0" } };
+  const older = { ...demoBody("normal", NOTE_NOW), data_version: 7, boundaries: { claude: "#0", codex: "#0" } };
+  await notifyWith(files, notifier, { status: 200, body: newer });
+  await notifyWith(files, notifier, { status: 200, body: older });
+  const state = JSON.parse(files.get(`/docs/headroom-notify-${TAG}.json`)!);
+  assert.equal(state.boundaries.claude, "2026-11-19T11:00:00.000Z#1");
+  assert.ok([...files.keys()].some((k) => k.includes(`headroom-view-${TAG}-8`)), "the newer view is the saved one");
+});
+
+test("G2-c: an ordinary network failure keeps the previous value (shown as old) and its version", async () => {
+  const files = new Map<string, string>();
+  const ok = await runWidget({ family: "medium", files, response: { status: 200, body: sampleView(5) } });
+  assert.equal(ok.error, null);
+  const failed = await runWidget({ family: "medium", files, response: { status: 503, body: {} } });
+  assert.ok(texts(failed.widget.node).length > 1, "the previous value is still drawn");
+  assert.ok([...files.keys()].some((k) => k.includes(`headroom-view-${TAG}-5`)), "and kept");
+});
+
+test("G2-d: values after a withdrawal show; a late empty response doesn't take them away", async () => {
+  const files = new Map<string, string>();
+  await runWidget({ family: "medium", files, response: { status: 200, body: emptyView(6) } });
+  await runWidget({ family: "medium", files, response: { status: 200, body: sampleView(7) } });
+  const late = await runWidget({ family: "medium", files, response: { status: 200, body: emptyView(6) } });
+  assert.ok([...files.keys()].some((k) => k.includes(`headroom-view-${TAG}-7`)));
+  assert.ok(texts(late.widget.node).some((x) => /%/.test(x)), "the values are drawn");
+});
+
+// ---- Guarantees G4 and G5: each counterexample with its control
+const CONFIG_A = JSON.stringify({ url: "https://headroom.example.com", token: "t", id: "1111111111111111" });
+const CONFIG_B = JSON.stringify({ url: "https://headroom.example.com", token: "t2", id: "2222222222222222" });
+
+test("G4-a: new settings saved at any moment of Remove all (right before each item is removed, also on a retry) keep their settings and switches", async () => {
+  const keyed = (k: Map<string, string>) => saveAs(k, CONFIG_A, JSON.stringify({ times: false }));
+  // another run of the script under test saves B its own way (an earlier version wrote the single items)
+  const saveB = (k: Map<string, string>) => {
+    if (lib.KEYCHAIN_CURRENT) saveAs(k, CONFIG_B, JSON.stringify({ events: false }));
+    else { k.set(lib.KEYCHAIN_CONFIG, CONFIG_B); k.set(lib.KEYCHAIN_NOTIFY, JSON.stringify({ events: false })); }
+  };
+  for (const start of ["this version", "an earlier version"]) {
+    // the removing run reaches Keychain.remove for each of its items in turn; another run saves B right before the n-th
+    for (let n = 1; n <= 6; n++) {
+      const keychain = new Map<string, string>();
+      if (start === "this version") keyed(keychain);
+      else { keychain.set(lib.KEYCHAIN_CONFIG, CONFIG_A); keychain.set(lib.KEYCHAIN_NOTIFY, JSON.stringify({ times: false })); }
+      let calls = 0;
+      let fails = 1;
+      const run = await runWidget({ family: "medium", app: { menu: [3, 2] }, keychain: Object.fromEntries(keychain),
+        keychainRemove: (k: string) => {
+          if (++calls === n) saveB(runKeychain!);
+          // the first removal fails once: a retry goes over the items again
+          if (fails-- > 0) throw new Error("keychain");
+        },
+        onKeychainContains: (k: Map<string, string>) => { runKeychain = k; } } as any);
+      const label = `${start}, saved before removal ${n}`;
+      if (calls < n) continue;
+      assert.equal(JSON.stringify(savedConfig(run.keychain)), CONFIG_B, label);
+      assert.equal(savedSwitches(run.keychain), JSON.stringify({ events: false }), `${label}: the new switches stay`);
+      assert.ok(![...run.keychain.values()].includes(CONFIG_A), `${label}: nothing of A is left`);
+    }
+  }
+});
+let runKeychain: Map<string, string> | null = null;
+
+test("G4-b: a switches item that can't be removed leaves Remove all unfinished and asks to retry; quitting there, a new setup starts with its own switches", async () => {
+  // can't be read: nothing needs reading to remove it (each generation's items are its own), so it goes
+  const keychain = new Map<string, string>();
+  saveAs(keychain, CONFIG_A, JSON.stringify({ times: false }));
+  const unreadable = await runWidget({ family: "medium", app: { menu: [3, 2] }, keychain: Object.fromEntries(keychain),
+    keychainGetFailsWhen: (k: string) => k.startsWith("headroom.notify.") } as any);
+  assert.ok(!unreadable.alertTitles.includes("Not fully removed"));
+  assert.ok(![...unreadable.keychain.keys()].some((k) => k.startsWith("headroom.notify.") || k.startsWith("headroom.config.")), "removed");
+  // can't be removed: unfinished, and the retry clears it once the fault is gone
+  let failing = true;
+  let questions = 0;
+  const run = await runWidget({ family: "medium", app: { menu: [3, 2] }, keychain: Object.fromEntries(keychain),
+    keychainRemove: (k: string) => { if (failing && k.startsWith("headroom.notify.")) throw new Error("keychain"); },
+    // the fault goes away when the retry is offered (the second question)
+    beforeConfirm: () => { if (++questions === 2) failing = false; } } as any);
+  assert.ok(run.alertTitles.includes("Not fully removed"));
+  assert.equal(savedConfig(run.keychain), null);
+  assert.ok(![...run.keychain.keys()].some((k) => k.startsWith("headroom.notify.")), "cleared on the retry");
+  // quitting at the retry question: the old switches are left, but a new setup doesn't take them
+  const quit = await runWidget({ family: "medium", app: { menu: [3, 2] }, keychain: Object.fromEntries(keychain), answers: [0, -1],
+    keychainRemove: (k: string) => { if (k.startsWith("headroom.notify.")) throw new Error("keychain"); } } as any);
+  assert.equal(savedConfig(quit.keychain), null);
+  assert.ok(quit.keychain.has("headroom.notify.1111111111111111"), "left by the quit");
+  const setup = await runWidget({ family: "medium", keychain: Object.fromEntries(quit.keychain), app: { menu: [], form: ["https://headroom.example.com", "t3"] } });
+  assert.equal(savedConfig(setup.keychain).token, "t3");
+  const fresh = lib.notifyPrefs(savedSwitches(setup.keychain))!;
+  assert.deepEqual([fresh.events, fresh.times, fresh.cancels.length], [true, true, 0], "both on: nothing carried over from the removed settings");
+  // control: editing the server or the token keeps the switches
+  const edit = await runWidget({ family: "medium", keychain: Object.fromEntries(keychain), app: { menu: [3, 0], form: ["https://headroom.example.com", "t4"] } });
+  const carried = JSON.parse(savedSwitches(edit.keychain)!);
+  assert.deepEqual([carried.events, carried.times], [true, false]);
+  assert.ok(carried.cancels.some((c: any) => c.gen === "1111111111111111"), "the replaced generation's reminders are owed a cancel");
+});
+let run0 = 0;
+
+test("G4-c: a stored switch value of the wrong shape stops the run; a re-read failing just before cancelling keeps the reminders", async () => {
+  for (const stored of ["", "[]", JSON.stringify({ times: "false" })]) {
+    assert.equal(lib.notifyPrefs(stored), null, JSON.stringify(stored));
+    const notifier = newNotifier();
+    const run = await runWidget({ family: "medium", inApp: true, shortcut: "notify", notifier, now: NOTE_NOW,
+      keychain: { "headroom.url": "https://headroom.example.com", "headroom.token": "read-token-xyz", [lib.KEYCHAIN_NOTIFY]: stored },
+      response: { status: 200, body: demoBody("reset", NOTE_NOW) }, responder: eventsAt(feed(5, [ev(5, "limit")])) });
+    assert.equal(run.shortcutOutput, "Couldn't read the notification settings", JSON.stringify(stored));
+    assert.equal(notifier.log.length, 0);
+  }
+  // the controls: no item yet is both on; a saved false is off
+  assert.equal(lib.notifyPrefs(null)!.times, true);
+  assert.equal(lib.notifyPrefs(JSON.stringify({ times: false }))!.times, false);
+  // the first read works, the re-read just before cancelling fails: the reminder stays
+  const files = new Map<string, string>([[`/docs/headroom-events-${TAG}-3`, ""]]);
+  const notifier = newNotifier();
+  await notifyWith(files, notifier, { status: 200, body: demoBody("reset", NOTE_NOW) });
+  assert.equal(notifier.pending.size, 1);
+  let reads = 0;
+  await runWidget({ family: "medium", inApp: true, shortcut: "notify", files, notifier, now: NOTE_NOW,
+    keychain: { "headroom.url": "https://headroom.example.com", "headroom.token": "read-token-xyz", [lib.KEYCHAIN_NOTIFY]: JSON.stringify({ times: true }) },
+    keychainGetFailsWhen: (k: string) => k === lib.KEYCHAIN_NOTIFY && ++reads >= 3,
+    response: { status: 200, body: demoBody("normal", NOTE_NOW) }, responder: eventsAt(feed(3, [])) } as any);
+  assert.equal(notifier.pending.size, 1, "not cancelled on a read that failed");
+});
+
+test("G4-d: with nothing in the way, Remove all removes the settings, switches, saved data and notifications", async () => {
+  const gen = "1111111111111111";
+  const tag = lib.cacheTag({ id: gen }, "https://headroom.example.com");
+  const notifier = newNotifier();
+  notifier.pending.set(`headroom.${gen}.back.claude.all.1`, { id: `headroom.${gen}.back.claude.all.1` });
+  notifier.delivered.set(`headroom.${gen}.events.5.claude`, { id: `headroom.${gen}.events.5.claude` });
+  const files = new Map<string, string>([[`/docs/headroom-notify-${tag}.json`, "{}"], [`/docs/headroom-events-${tag}-5`, ""]]);
+  const run = await runWidget({ family: "medium", app: { menu: [3, 2] }, files, notifier,
+    keychain: { [lib.KEYCHAIN_CONFIG]: CONFIG_A, [lib.KEYCHAIN_NOTIFY]: JSON.stringify({ times: false }) } });
+  assert.equal(run.keychain.size, 0);
+  assert.equal(notifier.pending.size + notifier.delivered.size, 0);
+  assert.ok(![...files.keys()].some((k) => k.includes(tag)));
+});
+
+test("G4-e: turning time reminders off cancels at once; unconfirmed, it shows cancel pending until a notifying run confirms", async () => {
+  const gen = lib.DEFAULT_CONFIG_ID;
+  const id = `headroom.${gen}.back.claude.all.29918280`;
+  // confirmed: nothing left on the device
+  const ok = newNotifier();
+  ok.pending.set(id, { id });
+  const done = await runWidget({ family: "medium", app: { menu: [2, 2] }, notifier: ok });
+  assert.equal(ok.pending.size, 0);
+  assert.equal(lib.notifyPrefs(savedSwitches(done.keychain))!.cancel_pending, false);
+  // the list can't be read: off, shown as cancel pending
+  const bad = newNotifier();
+  bad.pending.set(id, { id });
+  const pendingRun = await runWidget({ family: "medium", app: { menu: [2, 2] }, notifier: bad, pendingFails: true } as any);
+  const prefs = lib.notifyPrefs(savedSwitches(pendingRun.keychain))!;
+  assert.equal(prefs.times, false);
+  assert.equal(prefs.cancel_pending, true);
+  // the next notifying run cancels it (with no view) and clears the note
+  const after = await runWidget({ family: "medium", inApp: true, shortcut: "notify", notifier: bad, now: NOTE_NOW,
+    keychain: Object.fromEntries(pendingRun.keychain), files: new Map([[`/docs/headroom-events-${TAG}-3`, ""]]),
+    responder: (url: string) => (url.includes("/v2/events") ? { status: 200, body: feed(3, []) } : url.includes("/v2/view") ? { status: 503, body: {} } : undefined) });
+  assert.equal(bad.pending.size, 0);
+  assert.equal(lib.notifyPrefs(savedSwitches(after.keychain))!.cancel_pending, false);
+});
+
+test("G5-a: a stopped already on the device and a resumed not yet: the resumed is told, then the cursor passes it", async () => {
+  const gen = lib.DEFAULT_CONFIG_ID;
+  const files = new Map<string, string>([[`/docs/headroom-events-${TAG}-4`, ""]]);
+  const notifier = newNotifier();
+  notifier.delivered.set("s", { id: `headroom.${gen}.events.5.all`, title: "t", body: "b", userInfo: { seqs: [5] } } as any);
+  const events = feed(6, [ev(5, "collection_stopped", { provider: null, window_id: null }), ev(6, "collection_resumed", { provider: null, window_id: null })]);
+  await runWidget({ family: "medium", inApp: true, shortcut: "notify", files, notifier, now: NOTE_NOW, responder: eventsAt(events) });
+  assert.equal(notifier.log.length, 1);
+  assert.ok(String(notifier.log[0].body).includes("again"), String(notifier.log[0].body));
+  assert.ok(files.has(`/docs/headroom-events-${TAG}-6`));
+  // telling it fails: the cursor stays before 6
+  const files2 = new Map<string, string>([[`/docs/headroom-events-${TAG}-4`, ""]]);
+  const notifier2 = newNotifier();
+  notifier2.delivered.set("s", { id: `headroom.${gen}.events.5.all`, title: "t", body: "b", userInfo: { seqs: [5] } } as any);
+  await runWidget({ family: "medium", inApp: true, shortcut: "notify", files: files2, notifier: notifier2, now: NOTE_NOW, responder: eventsAt(events), scheduleFails: true });
+  assert.ok(!files2.has(`/docs/headroom-events-${TAG}-6`));
+});
+
+test("G5-b: limits of two providers both on the device just before: none told again, both cycles remembered (also past their reset)", async () => {
+  const gen = lib.DEFAULT_CONFIG_ID;
+  const files = new Map<string, string>([[`/docs/headroom-events-${TAG}-3`, ""]]);
+  const notifier = newNotifier();
+  const claude = ev(4, "limit", { window_id: "seven_day", label: "Weekly", resets_at: "2026-11-20T00:00:00Z", cycle: "2026-11-20T00:00:00Z" });
+  const codex = ev(5, "limit", { provider: "codex", window_id: "seven_day", label: "Weekly", resets_at: "2026-11-21T00:00:00Z", cycle: "2026-11-21T00:00:00Z" });
+  await runWidget({ family: "medium", inApp: true, shortcut: "notify", files, notifier, now: NOTE_NOW, responder: eventsAt(feed(5, [claude, codex])),
+    onAllDelivered: (n: any, call: number) => {
+      if (call !== 2) return;
+      n.delivered.set("a", { id: `headroom.${gen}.events.4.claude`, title: "t", body: "b", userInfo: { seqs: [4] } });
+      n.delivered.set("b", { id: `headroom.${gen}.events.5.codex`, title: "t", body: "b", userInfo: { seqs: [5] } });
+    } } as any);
+  assert.equal(notifier.log.length, 0);
+  const told = JSON.parse(files.get(`/docs/headroom-notify-${TAG}.json`)!).told.limits.map((m: any) => m.key);
+  assert.ok(told.some((k: string) => k.startsWith("claude.seven_day")) && told.some((k: string) => k.startsWith("codex.seven_day")), told.join(", "));
+  // one already on the device whose reset has passed is still remembered; one not on the device gets no mark
+  const passed = { ...codex, resets_at: "2026-11-19T11:00:00Z", cycle: "2026-11-19T11:00:00Z" };
+  assert.equal(lib.selectAlerts([passed], null, NOTE_NOW, { told: { limits: [], warned: [] }, times: true, delivered: new Set([5]) }).told.limits.length, 1);
+  assert.equal(lib.selectAlerts([passed], null, NOTE_NOW, { told: { limits: [], warned: [] }, times: true }).told.limits.length, 0);
+});
+
+test("G5-c: a reset whose reminder can't be checked is held; the next run tells it only if the reminder was cancelled before ringing", async () => {
+  const gen = lib.DEFAULT_CONFIG_ID;
+  const cycle = "2026-11-19T11:59:00.000Z";
+  const id = `headroom.${gen}.back.claude.all.${Math.round(Date.parse(cycle) / 60000)}.0123abcd`;
+  const state = { reminders: [{ id, kind: "back", provider: "claude", window_id: "five_hour", cycle: Date.parse(cycle), fire_at: Date.parse(cycle), set_at: 1, confirmed: true }],
+    told: { limits: [{ key: `claude.five_hour.${cycle}`, at: 1, event_at: 1, until: NOTE_NOW.getTime() + 86_400_000 }], warned: [] }, sent: [] };
+  const reset = ev(5, "reset", { cycle, resets_at: cycle });
+  const make = () => new Map<string, string>([[`/docs/headroom-events-${TAG}-4`, ""], [`/docs/headroom-notify-${TAG}.json`, JSON.stringify(state)]]);
+  const files = make();
+  const notifier = newNotifier();
+  await runWidget({ family: "medium", inApp: true, shortcut: "notify", files, notifier, now: NOTE_NOW, responder: eventsAt(feed(5, [reset])), pendingFails: true } as any);
+  assert.equal(notifier.log.length, 0);
+  assert.ok(!files.has(`/docs/headroom-events-${TAG}-5`), "held: the cursor waits before it");
+  // the reminder rang (on the device): nothing more
+  notifier.delivered.set("r", { id, title: "t", body: "b" });
+  await runWidget({ family: "medium", inApp: true, shortcut: "notify", files, notifier, now: NOTE_NOW, responder: eventsAt(feed(5, [reset])) });
+  assert.equal(notifier.log.length, 0);
+  // cancelled before it rang (recorded by the menu): the reset is told once
+  const files2 = make();
+  const notifier2 = newNotifier();
+  await runWidget({ family: "medium", inApp: true, shortcut: "notify", files: files2, notifier: notifier2, now: NOTE_NOW, responder: eventsAt(feed(5, [reset])),
+    keychain: { "headroom.url": "https://headroom.example.com", "headroom.token": "read-token-xyz",
+      [lib.KEYCHAIN_NOTIFY]: JSON.stringify({ times: true, cancelled: [{ id, at: 2 }] }) } });
+  assert.equal(notifier2.log.length, 1);
+});
+
+test("G5-d: an old view without a stamp, or an earlier switch's mark, doesn't hold back the new account's warning", () => {
+  // 701: time reminders off; a view without stamps forecasts "lasts"; the new account's soon is told
+  const view = plain(lib.demoResult("normal", NOTE_NOW).view);
+  delete view.boundaries;
+  const soon = ev(6, "soon", { threshold: 30, eta_minutes: 30, boundary: "2026-11-19T11:40:00.000Z#2" });
+  assert.equal(titles(lib.selectAlerts([soon], view, NOTE_NOW, { told: { limits: [], warned: [] }, times: false })).length, 1);
+  assert.equal(titles(lib.selectAlerts([{ ...soon, boundary: "" }], view, NOTE_NOW, { told: { limits: [], warned: [] }, times: false })).length, 0, "\"\" is the first account: the view counts");
+  // 702: saved switch 11:00, a mark without a stamp at 11:30 (server time), the event's own switch 11:40, the new 95% at 11:45
+  const since = { claude: Date.parse("2026-11-19T11:00:00Z") };
+  const old = { key: "claude.five_hour.2026-11-19T15:00:00.000Z", at: 1, event_at: Date.parse("2026-11-19T11:30:00Z"), until: NOTE_NOW.getTime() + 86_400_000 };
+  const warn = ev(7, "threshold", { threshold: 95, boundary: "2026-11-19T11:40:00.000Z#2", created_at: "2026-11-19T11:45:00.000Z" });
+  assert.equal(titles(lib.selectAlerts([warn], null, NOTE_NOW, { told: { limits: [], warned: [old] }, times: false, since })).length, 1);
+  // the control: the same account's mark (after 11:40) holds it back
+  const same = { ...old, event_at: Date.parse("2026-11-19T11:42:00Z") };
+  assert.equal(titles(lib.selectAlerts([warn], null, NOTE_NOW, { told: { limits: [], warned: [same] }, times: false, since })).length, 0);
+});
+
+test("G5-f: an unshown stopped and resumed cancel out in either order; a single alert is told once over runs", async () => {
+  const a = ev(5, "collection_stopped", { provider: null, window_id: null });
+  const b = ev(6, "collection_resumed", { provider: null, window_id: null });
+  assert.equal(titles(lib.selectAlerts([a, b], null, NOTE_NOW, {})).length, 0);
+  assert.equal(titles(lib.selectAlerts([b, a], null, NOTE_NOW, {})).length, 0);
+  const files = new Map<string, string>([[`/docs/headroom-events-${TAG}-4`, ""]]);
+  const notifier = newNotifier();
+  const events = feed(5, [ev(5, "limit", { window_id: "seven_day", label: "Weekly", resets_at: "2026-11-20T00:00:00Z" })]);
+  await runWidget({ family: "medium", inApp: true, shortcut: "notify", files, notifier, now: NOTE_NOW, responder: eventsAt(events) });
+  await runWidget({ family: "medium", inApp: true, shortcut: "notify", files, notifier, now: NOTE_NOW, responder: eventsAt(events) });
+  assert.equal(notifier.log.length, 1);
+});
+
+test("G5-g: a reset reminder that couldn't be scheduled is made up by the event's reset; one that was delivered isn't", () => {
+  const cycle = "2026-11-19T11:59:00.000Z";
+  const told = { limits: [{ key: `claude.five_hour.${cycle}`, at: 1, event_at: 1, until: NOTE_NOW.getTime() + 86_400_000 }], warned: [] };
+  const reset = ev(9, "reset", { cycle, resets_at: cycle });
+  // the reminder failed to schedule: no entry was kept
+  assert.equal(titles(lib.selectAlerts([reset], null, NOTE_NOW, { told, reminders: [], times: true, pending: new Set() })).length, 1);
+  // the reminder rang (no longer waiting on the device): nothing more from the event
+  const rang = [{ id: "headroom.0000000000000000.back.claude.all.1.0123abcd", kind: "back", provider: "claude", window_id: "five_hour", cycle: Date.parse(cycle), fire_at: Date.parse(cycle), confirmed: true }];
+  assert.equal(titles(lib.selectAlerts([reset], null, NOTE_NOW, { told, reminders: rang, times: true, pending: new Set() })).length, 0);
+});
+
+test("G4-c (the order): a run whose lock expired after it scheduled keeps its reminder whichever read of the switches fails", async () => {
+  const LEGACY = { "headroom.url": "https://headroom.example.com", "headroom.token": "read-token-xyz", [lib.KEYCHAIN_NOTIFY]: JSON.stringify({ times: true }) };
+  for (let k = 1; k <= 4; k++) {
+    const files = new Map<string, string>([[`/docs/headroom-events-${TAG}-3`, ""]]);
+    const notifier = newNotifier();
+    let expired = false;
+    let reads = 0;
+    await runWidget({ family: "medium", inApp: true, shortcut: "notify", files, notifier, now: NOTE_NOW, keychain: LEGACY,
+      // right as its reminder is scheduled, the run's lock expires (nobody else holds it)
+      onSchedule: () => { expired = true; files.set(`/docs/headroom-lock-${TAG}`, `other ${NOTE_NOW.getTime() - 1}`); },
+      keychainGetFailsWhen: (key: string) => expired && key === lib.KEYCHAIN_NOTIFY && ++reads === k,
+      response: { status: 200, body: demoBody("reset", NOTE_NOW) }, responder: eventsAt(feed(3, [])) } as any);
+    assert.equal(notifier.pending.size, 1, `read ${k} after the lock expired failed: the reminder stays`);
+  }
+});
+
+test("G4-e (stopping right after turning off): Off is saved together with cancel pending, and the menu shows it until confirmed", async () => {
+  const id = `headroom.${lib.DEFAULT_CONFIG_ID}.back.claude.all.29918280`;
+  const notifier = newNotifier();
+  notifier.pending.set(id, { id });
+  const writes: string[] = [];
+  await runWidget({ family: "medium", app: { menu: [2, 2] }, notifier,
+    onKeychainSet: (k: string, v: string) => { if (k === lib.KEYCHAIN_NOTIFY) writes.push(v); } } as any);
+  const first = lib.notifyPrefs(writes[0])!;
+  assert.deepEqual([first.times, first.cancel_pending], [false, true], "the first write already says pending");
+  const menuWith = (stored: string) => runWidget({ family: "medium", app: { menu: [2] },
+    keychain: { "headroom.url": "https://headroom.example.com", "headroom.token": "read-token-xyz", [lib.KEYCHAIN_NOTIFY]: stored } });
+  // the app stopped right after that write: the menu says so
+  const stopped = await menuWith(writes[0]!);
+  assert.ok(stopped.actionLabels.includes("Time reminders: Off · cancel pending"), stopped.actionLabels.join(" | "));
+  // control: confirmed, it is plain Off
+  assert.equal(lib.notifyPrefs(writes[writes.length - 1])!.cancel_pending, false);
+  const done = await menuWith(writes[writes.length - 1]!);
+  assert.ok(done.actionLabels.includes("Time reminders: Off"), done.actionLabels.join(" | "));
+});
+
+test("G5-e (per number): an intent for 5 and 6 with only 5 on the device (told by another run) tells 6 again", async () => {
+  const gen = lib.DEFAULT_CONFIG_ID;
+  const weekly = { window_id: "seven_day", label: "Weekly", resets_at: "2026-11-21T00:00:00.000Z", cycle: "2026-11-21T00:00:00.000Z" };
+  const events = feed(6, [ev(5, "limit"), ev(6, "threshold", { threshold: 80, ...weekly })]);
+  const state = { reminders: [], told: { limits: [], warned: [] }, sent: [],
+    sending: { id: `headroom.${gen}.events.5.claude`, seqs: [5, 6], marks: [{ list: "limits", key: "claude.five_hour.2026-11-19T15:00:00.000Z", at: 1, event_at: 1, until: NOTE_NOW.getTime() + 86_400_000, seq: 5 }] } };
+  const files = new Map<string, string>([[`/docs/headroom-events-${TAG}-4`, ""], [`/docs/headroom-notify-${TAG}.json`, JSON.stringify(state)]]);
+  const notifier = newNotifier();
+  notifier.delivered.set("other", { id: `headroom.${gen}.events.5.claude`, title: "t", body: "b", userInfo: { seqs: [5] } } as any);
+  await runWidget({ family: "medium", inApp: true, shortcut: "notify", files, notifier, now: NOTE_NOW, responder: eventsAt(events) });
+  assert.equal(notifier.log.length, 1, "6 is told");
+  assert.deepEqual(plain(notifier.log[0].userInfo.seqs), [6]);
+  assert.ok(files.has(`/docs/headroom-events-${TAG}-6`));
+  const saved = JSON.parse(files.get(`/docs/headroom-notify-${TAG}.json`)!);
+  assert.ok(saved.told.limits.some((m: any) => m.key === "claude.five_hour.2026-11-19T15:00:00.000Z" && m.seq === undefined), "5's cycle is remembered");
+  // control: both on the device, nothing more
+  const files2 = new Map<string, string>([[`/docs/headroom-events-${TAG}-4`, ""], [`/docs/headroom-notify-${TAG}.json`, JSON.stringify(state)]]);
+  const notifier2 = newNotifier();
+  notifier2.delivered.set("mine", { id: `headroom.${gen}.events.5.claude`, title: "t", body: "b", userInfo: { seqs: [5, 6] } } as any);
+  await runWidget({ family: "medium", inApp: true, shortcut: "notify", files: files2, notifier: notifier2, now: NOTE_NOW, responder: eventsAt(events) });
+  assert.equal(notifier2.log.length, 0);
+});
+
+test("G5-a (late evidence): a stopped another run tells while this one is about to tell a later limit: its resumed is told too", async () => {
+  const gen = lib.DEFAULT_CONFIG_ID;
+  const files = new Map<string, string>([[`/docs/headroom-events-${TAG}-4`, ""]]);
+  const notifier = newNotifier();
+  const events = feed(7, [ev(5, "collection_stopped", { provider: null, window_id: null }), ev(6, "collection_resumed", { provider: null, window_id: null }),
+    ev(7, "limit", { window_id: "seven_day", label: "Weekly", resets_at: "2026-11-21T00:00:00.000Z", cycle: "2026-11-21T00:00:00.000Z" })]);
+  await runWidget({ family: "medium", inApp: true, shortcut: "notify", files, notifier, now: NOTE_NOW, responder: eventsAt(events),
+    onAllDelivered: (n: any, call: number) => {
+      if (call === 2) n.delivered.set("s", { id: `headroom.${gen}.events.5.all`, title: "t", body: "b", userInfo: { seqs: [5] } });
+    } } as any);
+  const told = notifier.log.flatMap((n: any) => plain(n.userInfo.seqs));
+  assert.deepEqual(told.sort(), [6, 7], JSON.stringify(told));
+  assert.ok(files.has(`/docs/headroom-events-${TAG}-7`));
+  // control: neither on the device, the pair cancels out and only the limit is told; the cursor passes the pair
+  const files2 = new Map<string, string>([[`/docs/headroom-events-${TAG}-4`, ""]]);
+  const notifier2 = newNotifier();
+  await runWidget({ family: "medium", inApp: true, shortcut: "notify", files: files2, notifier: notifier2, now: NOTE_NOW, responder: eventsAt(events) });
+  assert.deepEqual(notifier2.log.flatMap((n: any) => plain(n.userInfo.seqs)), [7]);
+  assert.ok(files2.has(`/docs/headroom-events-${TAG}-7`));
+});
+
+test("G5-b (late evidence): limits shown by another run only at the re-read, one already past its reset: both cycles remembered", async () => {
+  const gen = lib.DEFAULT_CONFIG_ID;
+  const files = new Map<string, string>([[`/docs/headroom-events-${TAG}-3`, ""]]);
+  const notifier = newNotifier();
+  const claude = ev(4, "limit", { window_id: "seven_day", label: "Weekly", resets_at: "2026-11-20T00:00:00Z", cycle: "2026-11-20T00:00:00Z" });
+  const codex = ev(5, "limit", { provider: "codex", window_id: "seven_day", label: "Weekly", resets_at: "2026-11-19T11:00:00Z", cycle: "2026-11-19T11:00:00Z" });
+  await runWidget({ family: "medium", inApp: true, shortcut: "notify", files, notifier, now: NOTE_NOW, responder: eventsAt(feed(5, [claude, codex])),
+    onAllDelivered: (n: any, call: number) => {
+      if (call !== 2) return;
+      n.delivered.set("a", { id: `headroom.${gen}.events.4.claude`, title: "t", body: "b", userInfo: { seqs: [4] } });
+      n.delivered.set("b", { id: `headroom.${gen}.events.5.codex`, title: "t", body: "b", userInfo: { seqs: [5] } });
+    } } as any);
+  assert.equal(notifier.log.length, 0);
+  const told = JSON.parse(files.get(`/docs/headroom-notify-${TAG}.json`)!).told.limits.map((m: any) => m.key);
+  assert.ok(told.some((k: string) => k.startsWith("claude.seven_day")) && told.some((k: string) => k.startsWith("codex.seven_day")), told.join(", "));
+});
+
+test("G5-c (unconfirmed): a reset reminder saved but never known to be scheduled doesn't count as rung, unless the device shows it delivered", () => {
+  const cycle = "2026-11-19T11:59:00.000Z";
+  const told = { limits: [{ key: `claude.five_hour.${cycle}`, at: 1, event_at: 1, until: NOTE_NOW.getTime() + 86_400_000 }], warned: [] };
+  const reset = ev(9, "reset", { cycle, resets_at: cycle });
+  const id = "headroom.0000000000000000.back.claude.all.1.0123456789abcdef.0a0a0a0a";
+  const reminder = { id, kind: "back", provider: "claude", window_id: "five_hour", cycle: Date.parse(cycle), fire_at: Date.parse(cycle) };
+  const pick = (r: any, deliveredIds = new Set<string>()) => titles(lib.selectAlerts([reset], null, NOTE_NOW, { told, reminders: [r], times: true, pending: new Set(), deliveredIds })).length;
+  assert.equal(pick({ ...reminder, confirmed: false }), 1, "stopped before scheduling: the event tells it");
+  assert.equal(pick({ ...reminder, confirmed: false }, new Set([id])), 0, "delivered after all");
+  assert.equal(pick({ ...reminder, confirmed: true }), 0);
+  assert.equal(pick(reminder), 1, "an earlier version's entry isn't known to be scheduled: the event tells it");
+  // an identifier of an earlier version names no account: its delivery proves nothing for this one
+  const legacy = { ...reminder, id: "headroom.0000000000000000.back.claude.all.1", confirmed: false };
+  assert.equal(pick(legacy, new Set([legacy.id])), 1);
+  // delivery wins over a pending list read before it
+  assert.equal(titles(lib.selectAlerts([reset], null, NOTE_NOW, { told, reminders: [{ ...reminder, confirmed: true }], times: true, pending: new Set([id]), deliveredIds: new Set([id]) })).length, 0);
+});
+
+test("G5-d (a later switch known): a switch between an old mark and a new warning makes them different accounts, whichever switch it is", () => {
+  // a mark without a stamp at 11:30, the event's own switch 11:40, the warning 11:45, a later switch the device knows at 11:50
+  const since = { claude: Date.parse("2026-11-19T11:50:00Z") };
+  const old = { key: "claude.five_hour.2026-11-19T15:00:00.000Z", at: 1, event_at: Date.parse("2026-11-19T11:30:00Z"), until: NOTE_NOW.getTime() + 86_400_000 };
+  const warn = ev(7, "threshold", { threshold: 95, boundary: "2026-11-19T11:40:00.000Z#2", created_at: "2026-11-19T11:45:00.000Z" });
+  assert.equal(titles(lib.selectAlerts([warn], null, NOTE_NOW, { told: { limits: [], warned: [old] }, times: false, since })).length, 1);
+  // control: a mark after 11:40 (and before 11:50, like the warning) is the same account's
+  const same = { ...old, event_at: Date.parse("2026-11-19T11:42:00Z") };
+  assert.equal(titles(lib.selectAlerts([warn], null, NOTE_NOW, { told: { limits: [], warned: [same] }, times: false, since })).length, 0);
+});
+
+test("G5-g (a real failure): the reset reminder's scheduling fails, and the event's reset tells it; one that rang isn't told again", async () => {
+  const cycle = "2026-11-19T14:00:00.000Z";
+  const at = new Date("2026-11-19T14:01:00Z");
+  const state = JSON.stringify({ reminders: [], told: { limits: [{ key: `codex.five_hour.${cycle}`, at: 1, event_at: NOTE_NOW.getTime() - 120_000, boundary: "#0", until: at.getTime() + 86_400_000 }], warned: [] }, sent: [] });
+  const reset = ev(5, "reset", { provider: "codex", cycle, resets_at: cycle, boundary: "#0", created_at: "2026-11-19T14:00:30.000Z" });
+  for (const fails of [true, false]) {
+    const files = new Map<string, string>([[`/docs/headroom-events-${TAG}-4`, ""], [`/docs/headroom-notify-${TAG}.json`, state]]);
+    const notifier = newNotifier();
+    // the reminder for the codex 5h reset at 14:00 is scheduled now; it fails, or works
+    const first = await runWidget({ family: "medium", inApp: true, shortcut: "notify", files, notifier, now: NOTE_NOW,
+      response: { status: 200, body: demoBody("reset", NOTE_NOW) }, responder: eventsAt(feed(4, [])),
+      onSchedule: (id: string) => { if (fails && id.includes(".back.")) throw new Error("failed"); } } as any);
+    assert.equal(notifier.pending.size, fails ? 0 : 1, String(first.shortcutOutput));
+    // it rang at 14:00 (iOS moves it to delivered)
+    for (const [id, n] of notifier.pending) {
+      notifier.delivered.set(id, n);
+      notifier.pending.delete(id);
+    }
+    await runWidget({ family: "medium", inApp: true, shortcut: "notify", files, notifier, now: at, response: null, responder: eventsAt(feed(5, [reset])) });
+    const usable = notifier.log.filter((n: any) => n.trigger === null && String(n.body).includes("usable again"));
+    assert.equal(usable.length, fails ? 1 : 0, fails ? "made up by the event" : "the reminder said it");
+  }
+});
+
+test("G4-f: a replacement publishes only what it replaces as read: a removal or a switch change meanwhile stops it; one after the check is carried over", async () => {
+  const A = "1111111111111111";
+  const start = () => {
+    const k = new Map<string, string>();
+    saveAs(k, CONFIG_A, JSON.stringify({ events: true, times: true, rev: 1 }));
+    return Object.fromEntries(k);
+  };
+  // Remove all (another run) takes A away while Reset saved data reads it
+  let removed = false;
+  const gone = await runWidget({ family: "medium", app: { menu: [3, 1] }, keychain: start(),
+    onKeychainContains: (k: Map<string, string>, key: string) => {
+      if (!removed && key === `headroom.notify.${A}`) {
+        removed = true;
+        k.delete(`headroom.config.${A}`);
+        k.delete(`headroom.notify.${A}`);
+      }
+    } } as any);
+  assert.equal(savedConfig(gone.keychain), null, "no new generation with the defaults");
+  assert.ok(gone.alertTitles.includes("Not reset"));
+  // time reminders turned off on A (another menu) after the switches were copied: not published
+  let keychainRef: Map<string, string> | null = null;
+  const changed = await runWidget({ family: "medium", app: { menu: [3, 1] }, keychain: start(),
+    onKeychainContains: (k: Map<string, string>) => { keychainRef = k; },
+    onKeychainSet: (key: string) => {
+      if (key.startsWith("headroom.notify.") && key !== `headroom.notify.${A}`) keychainRef!.set(`headroom.notify.${A}`, JSON.stringify({ events: true, times: false, rev: 2 }));
+    } } as any);
+  assert.equal(JSON.stringify(savedConfig(changed.keychain)), CONFIG_A, "A stays current");
+  assert.equal(lib.notifyPrefs(savedSwitches(changed.keychain))!.times, false, "with the change");
+  // turned off right after the check, before the new generation is named: carried over to it
+  const late = await runWidget({ family: "medium", app: { menu: [3, 1] }, keychain: start(),
+    onKeychainContains: (k: Map<string, string>) => { keychainRef = k; },
+    onKeychainSet: (key: string) => {
+      if (key === lib.KEYCHAIN_CURRENT) keychainRef!.set(`headroom.notify.${A}`, JSON.stringify({ events: true, times: false, rev: 2 }));
+    } } as any);
+  assert.notEqual(currentId(late.keychain), A);
+  assert.equal(lib.notifyPrefs(savedSwitches(late.keychain))!.times, false, "the change carried over");
+  // the control: a plain reset keeps the switches
+  const plainReset = await runWidget({ family: "medium", app: { menu: [3, 1] }, keychain: start() });
+  assert.notEqual(currentId(plainReset.keychain), A);
+  assert.equal(lib.notifyPrefs(savedSwitches(plainReset.keychain))!.times, true);
+});
+
+test("G4-g: a cancel owed when time reminders were turned off follows each replacement, and goes only once nothing of it waits", async () => {
+  const A = "1111111111111111";
+  const id = `headroom.${A}.back.claude.all.29918280.0123abcd`;
+  const k = new Map<string, string>();
+  saveAs(k, CONFIG_A, JSON.stringify({ events: true, times: false, rev: 1, cancel_pending: true, cancels: [{ op: "0a0a0a0a", gen: A, before: NOTE_NOW.getTime() }] }));
+  const notifier = newNotifier();
+  notifier.pending.set(id, { id });
+  // replaced twice while the list of pending reminders can't be read (A to B, B to C)
+  let keychain = Object.fromEntries(k);
+  for (let i = 0; i < 2; i++) {
+    const reset = await runWidget({ family: "medium", app: { menu: [3, 1] }, keychain, notifier, pendingFails: true } as any);
+    keychain = Object.fromEntries(reset.keychain);
+  }
+  const menu = await runWidget({ family: "medium", app: { menu: [2] }, keychain, notifier });
+  assert.ok(menu.actionLabels.includes("Time reminders: Off · cancel pending"), menu.actionLabels.join(" | "));
+  assert.equal(notifier.pending.size, 1, "still waiting");
+  // a notifying run of C that can read the list cancels it; what is owed for A is settled only once A's runs can't hand anything more
+  // to iOS (its lock's time after the cancel was owed)
+  const notify = (now: Date, kc: Record<string, string>) => runWidget({ family: "medium", inApp: true, shortcut: "notify", keychain: kc, notifier, now,
+    responder: (url: string) => (url.includes("/v2/view") ? { status: 503, body: {} } : undefined) } as any);
+  const early = await notify(new Date(NOTE_NOW.getTime() + 30_000), keychain);
+  assert.equal(notifier.pending.size, 0);
+  assert.equal(lib.notifyPrefs(savedSwitches(early.keychain))!.cancel_pending, true, "A's runs may still be going");
+  const run = await notify(new Date(NOTE_NOW.getTime() + 3 * 60_000), Object.fromEntries(early.keychain));
+  const after = await runWidget({ family: "medium", app: { menu: [2] }, keychain: Object.fromEntries(run.keychain), notifier });
+  assert.ok(after.actionLabels.includes("Time reminders: Off"), after.actionLabels.join(" | "));
+});
+
+// ---- Records of the notifying runs (a file per operation)
+const stoppedEv = (n: number) => ev(n, "collection_stopped", { provider: null, window_id: null });
+const resumedEv = (n: number) => ev(n, "collection_resumed", { provider: null, window_id: null });
+
+test("G5-h: a stopped another run is handing to iOS is neither cancelled out nor passed; once it is delivered, its resumed is told", async () => {
+  const gen = lib.DEFAULT_CONFIG_ID;
+  const files = new Map<string, string>([[`/docs/headroom-events-${TAG}-4`, ""],
+    [`/docs/${lib.recordName("intent", TAG, 5, "aaaaaaaa")}`, JSON.stringify({ seqs: [5], at: NOTE_NOW.getTime() - 30_000 })]]);
+  const notifier = newNotifier();
+  const events = feed(6, [stoppedEv(5), resumedEv(6)]);
+  await runWidget({ family: "medium", inApp: true, shortcut: "notify", files, notifier, now: NOTE_NOW, responder: eventsAt(events) });
+  assert.equal(notifier.log.length, 0, "neither told nor cancelled out");
+  assert.ok(!files.has(`/docs/headroom-events-${TAG}-5`) && !files.has(`/docs/headroom-events-${TAG}-6`), "the cursor stays before 5");
+  // the other run's stopped arrives: the resumed is told
+  notifier.delivered.set("s", { id: `headroom.${gen}.events.5.all`, title: "t", body: "b", userInfo: { seqs: [5] } } as any);
+  await runWidget({ family: "medium", inApp: true, shortcut: "notify", files, notifier, now: NOTE_NOW, responder: eventsAt(events) });
+  assert.deepEqual(notifier.log.flatMap((n: any) => plain(n.userInfo.seqs)), [6]);
+  assert.ok(files.has(`/docs/headroom-events-${TAG}-6`));
+  // the other order: a pair another run is cancelling out was recorded first; this run's intent for the stopped is dropped before iOS
+  const files2 = new Map<string, string>([[`/docs/headroom-events-${TAG}-4`, ""],
+    [`/docs/${lib.recordName("pair", TAG, 5, 6, "bbbbbbbb")}`, JSON.stringify({ at: NOTE_NOW.getTime() })]]);
+  const notifier2 = newNotifier();
+  await runWidget({ family: "medium", inApp: true, shortcut: "notify", files: files2, notifier: notifier2, now: NOTE_NOW, responder: eventsAt(feed(5, [stoppedEv(5)])) });
+  assert.equal(notifier2.log.length, 0, "not handed to iOS");
+  assert.ok([...files2.keys()].some((k) => k.includes("headroom-abort-")), "dropped, and recorded so");
+  // the control: neither on its way, both settle without a notification and the cursor passes them
+  const files3 = new Map<string, string>([[`/docs/headroom-events-${TAG}-4`, ""]]);
+  const notifier3 = newNotifier();
+  await runWidget({ family: "medium", inApp: true, shortcut: "notify", files: files3, notifier: notifier3, now: NOTE_NOW, responder: eventsAt(events) });
+  assert.equal(notifier3.log.length, 0);
+  assert.ok(files3.has(`/docs/headroom-events-${TAG}-6`));
+});
+
+test("G5-i: the told records outlive a cursor that couldn't be written and a slower run's older state: nothing told twice, both cycles kept", async () => {
+  const files = new Map<string, string>([[`/docs/headroom-events-${TAG}-3`, ""]]);
+  const notifier = newNotifier();
+  const limits = feed(5, [ev(4, "limit", { provider: "codex", window_id: "five_hour", cycle: "2026-11-19T14:00:00.000Z", resets_at: "2026-11-19T14:00:00.000Z" }),
+    ev(5, "limit", { window_id: "five_hour" })]);
+  await runWidget({ family: "medium", inApp: true, shortcut: "notify", files, notifier, now: NOTE_NOW, responder: eventsAt(limits),
+    writeFailsWhen: (p: string) => p.includes("headroom-events-") } as any);
+  assert.equal(notifier.log.length, 2);
+  // a slower run writes back the state from before (no told numbers, no cycles)
+  files.set(`/docs/headroom-notify-${TAG}.json`, JSON.stringify({ reminders: [], told: { limits: [], warned: [] }, sent: [] }));
+  await runWidget({ family: "medium", inApp: true, shortcut: "notify", files, notifier, now: NOTE_NOW, responder: eventsAt(limits) });
+  assert.equal(notifier.log.length, 2, "not told twice");
+  // both resets come: each cycle is still known, so each is told
+  const resets = feed(7, [...limits.events, ev(6, "reset", { provider: "codex", window_id: "five_hour", cycle: "2026-11-19T14:00:00.000Z", resets_at: "2026-11-19T14:00:00.000Z" }),
+    ev(7, "reset", { window_id: "five_hour" })]);
+  await runWidget({ family: "medium", inApp: true, shortcut: "notify", files, notifier, now: NOTE_NOW, responder: eventsAt(resets) });
+  assert.equal(notifier.log.filter((n: any) => String(n.body).includes("usable again")).length, 2);
+});
+
+test("G5-j: version 64's notification about to be told (5 and 6), with only 5 on the device: 5's cycle is kept, 6 and the reset 7 are told", async () => {
+  const gen = lib.DEFAULT_CONFIG_ID;
+  const weekly = { window_id: "seven_day", label: "Weekly", resets_at: "2026-11-21T00:00:00.000Z", cycle: "2026-11-21T00:00:00.000Z" };
+  const state = { reminders: [], told: { limits: [], warned: [] }, sent: [],
+    sending: { id: `headroom.${gen}.events.5.claude`, seqs: [5, 6], marks: [{ list: "limits", key: "claude.five_hour.2026-11-19T15:00:00.000Z", at: 1, event_at: 1, until: NOTE_NOW.getTime() + 86_400_000 }] } };
+  const files = new Map<string, string>([[`/docs/headroom-events-${TAG}-4`, ""], [`/docs/headroom-notify-${TAG}.json`, JSON.stringify(state)]]);
+  const notifier = newNotifier();
+  notifier.delivered.set("five", { id: `headroom.${gen}.events.5.claude`, title: "t", body: "b", userInfo: { seqs: [5] } } as any);
+  const events = feed(7, [ev(5, "limit"), ev(6, "threshold", { threshold: 80, ...weekly }), ev(7, "reset")]);
+  await runWidget({ family: "medium", inApp: true, shortcut: "notify", files, notifier, now: NOTE_NOW, responder: eventsAt(events) });
+  const told = notifier.log.flatMap((n: any) => plain(n.userInfo.seqs)).sort();
+  assert.deepEqual(told, [6, 7]);
+});
+
+// ---- Newer saved views and withdrawals on the iPhone
+const saveViewFile = (files: Map<string, string>, body: unknown) => {
+  const v = (body as { data_version: number }).data_version;
+  files.set(`/docs/${lib.cacheFileName(TAG, v)}`, JSON.stringify({ origin: "https://headroom.example.com", view: body }));
+  files.set(`/docs/headroom-seen-${TAG}-${v}`, "");
+};
+
+test("G2-b (the iPhone): a widget saved a newer view with new boundaries; the notifying run that read an older one takes the newer", async () => {
+  const files = new Map<string, string>([[`/docs/headroom-events-${TAG}-3`, ""]]);
+  const notifier = newNotifier();
+  const older = { ...demoBody("reset", NOTE_NOW), data_version: 7, boundaries: { claude: "#0", codex: "#0" } };
+  await notifyWith(files, notifier, { status: 200, body: older });
+  const newer = { ...demoBody("reset", NOTE_NOW), data_version: 8, boundaries: { claude: "2026-11-19T11:00:00.000Z#1", codex: "#0" } };
+  // the notifying run gets the older response; a widget that only shows saves the newer one while it waits for the lock
+  await runWidget({ family: "medium", inApp: true, shortcut: "notify", files, notifier, now: NOTE_NOW, response: { status: 200, body: older },
+    responder: eventsAt(feed(3, [])),
+    onWrite: (p: string) => { if (p.includes("headroom-lock-") && !files.has(`/docs/headroom-seen-${TAG}-8`)) saveViewFile(files, newer); } } as any);
+  const state = JSON.parse(files.get(`/docs/headroom-notify-${TAG}.json`)!);
+  assert.equal(state.boundaries.claude, "2026-11-19T11:00:00.000Z#1");
+  assert.equal(state.view_version, 8);
+});
+
+test("a withdrawal saved by another widget while the notifying run waited plans nothing from the older value", async () => {
+  const files = new Map<string, string>([[`/docs/headroom-events-${TAG}-3`, ""]]);
+  const notifier = newNotifier();
+  await runWidget({ family: "medium", inApp: true, shortcut: "notify", files, notifier, now: NOTE_NOW, response: { status: 200, body: { ...demoBody("reset", NOTE_NOW), data_version: 5 } },
+    responder: eventsAt(feed(3, [])),
+    onWrite: (p: string) => { if (p.includes("headroom-lock-") && !files.has(`/docs/headroom-seen-${TAG}-6`)) saveViewFile(files, emptyView(6)); } } as any);
+  assert.equal(notifier.pending.size, 0);
+});
+
+test("when the saved files can't be listed, a late older response is neither shown nor saved", async () => {
+  const files = new Map<string, string>();
+  await runWidget({ family: "medium", files, response: { status: 200, body: emptyView(6) } });
+  const late = await runWidget({ family: "medium", files, response: { status: 200, body: sampleView(5) }, listFails: true });
+  assert.ok(![...files.keys()].some((k) => k.includes(`headroom-view-${TAG}-5`)), "not saved");
+  assert.ok(!texts(late.widget.node).some((x) => /%/.test(x)), "the older values aren't drawn");
+});
+
+// ---- The device's floor and its withdrawals (the newest version seen here)
+const withdrawnMarker = (files: Map<string, string>, v: number) => files.set(`/docs/headroom-seen-${TAG}-${v}`, "withdrawn");
+
+test("G2-g: a withdrawal recorded in its seen marker holds without its body: no older value shown, saved or planned from", async () => {
+  const files = new Map<string, string>([[`/docs/headroom-events-${TAG}-3`, ""]]);
+  saveViewFile(files, { ...demoBody("reset", NOTE_NOW), data_version: 5 });
+  // the empty 6 was received (its marker says so) but its body couldn't be kept
+  withdrawnMarker(files, 6);
+  const late = await runWidget({ family: "medium", files, response: { status: 200, body: { ...demoBody("reset", NOTE_NOW), data_version: 5 } } });
+  assert.ok(!texts(late.widget.node).some((x) => /%/.test(x)), "the late 5 isn't drawn");
+  const offline = await runWidget({ family: "medium", files, response: null });
+  assert.ok(!texts(offline.widget.node).some((x) => /%/.test(x)), "nor the saved 5 when the server can't be reached");
+  // the notifying run reads 5 late: plans nothing from it, and cancels what was planned before
+  const notifier = newNotifier();
+  const id = `headroom.${lib.DEFAULT_CONFIG_ID}.back.codex.all.29918280.07c87886`;
+  notifier.pending.set(id, { id });
+  await runWidget({ family: "medium", inApp: true, shortcut: "notify", files, notifier, now: NOTE_NOW,
+    response: { status: 200, body: { ...demoBody("reset", NOTE_NOW), data_version: 5 } }, responder: eventsAt(feed(3, [])) });
+  assert.equal(notifier.pending.size, 0);
+  // the control: a marker that isn't a withdrawal, with its body unreadable, plans nothing but shows no older value either
+  const files2 = new Map<string, string>([[`/docs/headroom-events-${TAG}-3`, ""]]);
+  saveViewFile(files2, { ...demoBody("reset", NOTE_NOW), data_version: 5 });
+  files2.set(`/docs/headroom-seen-${TAG}-6`, "");
+  const notifier2 = newNotifier();
+  await runWidget({ family: "medium", inApp: true, shortcut: "notify", files: files2, notifier: notifier2, now: NOTE_NOW,
+    response: { status: 200, body: { ...demoBody("reset", NOTE_NOW), data_version: 5 } }, responder: eventsAt(feed(3, [])) });
+  assert.equal(notifier2.log.length, 0, "held");
+});
+
+test("G2-h: a withdrawal seen before a reminder is handed to iOS stops it; one landing after it is cancelled by the next run", async () => {
+  const body = { ...demoBody("reset", NOTE_NOW), data_version: 5 };
+  // seen before: no schedule call at all
+  const files = new Map<string, string>([[`/docs/headroom-events-${TAG}-3`, ""]]);
+  const notifier = newNotifier();
+  let listed = 0;
+  await runWidget({ family: "medium", inApp: true, shortcut: "notify", files, notifier, now: NOTE_NOW, response: { status: 200, body },
+    responder: eventsAt(feed(3, [])),
+    onAllPending: () => { if (++listed === 1) withdrawnMarker(files, 6); } } as any);
+  assert.equal(notifier.log.length, 0, "nothing scheduled from 5");
+  // landing right after iOS took it: the next run (with the empty 6) cancels it
+  const files2 = new Map<string, string>([[`/docs/headroom-events-${TAG}-3`, ""]]);
+  const notifier2 = newNotifier();
+  await runWidget({ family: "medium", inApp: true, shortcut: "notify", files: files2, notifier: notifier2, now: NOTE_NOW, response: { status: 200, body },
+    responder: eventsAt(feed(3, [])), onSchedule: () => withdrawnMarker(files2, 6) } as any);
+  assert.equal(notifier2.pending.size, 1);
+  await runWidget({ family: "medium", inApp: true, shortcut: "notify", files: files2, notifier: notifier2, now: NOTE_NOW, response: { status: 200, body: emptyView(6) },
+    responder: eventsAt(feed(3, [])) });
+  assert.equal(notifier2.pending.size, 0);
+  // the control: nothing newer, one reminder
+  const files3 = new Map<string, string>([[`/docs/headroom-events-${TAG}-3`, ""]]);
+  const notifier3 = newNotifier();
+  await runWidget({ family: "medium", inApp: true, shortcut: "notify", files: files3, notifier: notifier3, now: NOTE_NOW, response: { status: 200, body },
+    responder: eventsAt(feed(3, [])) });
+  assert.equal(notifier3.pending.size, 1);
+});
+
+test("a run with an older view never cancels a reminder planned from a newer one", () => {
+  const gen = "0123456789abcdef";
+  const t = NOTE_NOW.getTime();
+  const newer = { id: `headroom.${gen}.back.codex.all.1.0123abcd`, kind: "back", provider: "codex", window_id: "five_hour", cycle: t + 3_600_000, fire_at: t + 3_600_000, from: 8 };
+  const slow = plain(lib.reconcileReminders([newer], [], NOTE_NOW, gen, new Set([newer.id]), 7));
+  assert.deepEqual(slow.cancel, [], "planned from 8, not 7's to cancel");
+  const current = plain(lib.reconcileReminders([newer], [], NOTE_NOW, gen, new Set([newer.id]), 9));
+  assert.deepEqual(current.cancel, [newer.id], "the control: a newer view cancels what it doesn't plan");
+});
+
+test("G5-k: two accounts' reset reminders of the same minute have their own identifiers; one's delivery never stands for the other's", () => {
+  const gen = lib.DEFAULT_CONFIG_ID;
+  const cycle = "2026-11-19T11:59:00.000Z";
+  const item = (boundary: string | null) => ({ kind: "back", provider: "claude", window_id: "five_hour", cycle: Date.parse(cycle), fire_at: Date.parse(cycle), boundary });
+  const a = lib.reminderId(gen, item("2026-11-19T10:00:00.000Z#1"));
+  const b = lib.reminderId(gen, item("2026-11-19T12:00:00.000Z#2"));
+  assert.notEqual(a, b);
+  assert.notEqual(lib.reminderId(gen, item("")), lib.reminderId(gen, item(null)), "the first account's stamp is a mark of its own");
+  // B's reminder was saved, never known to be scheduled; A's is delivered: B's recovery is told
+  const told = { limits: [{ key: `claude.five_hour.${cycle}`, at: 1, event_at: 1, boundary: "2026-11-19T12:00:00.000Z#2", until: NOTE_NOW.getTime() + 86_400_000 }], warned: [] };
+  const reset = ev(9, "reset", { cycle, resets_at: cycle, boundary: "2026-11-19T12:00:00.000Z#2" });
+  const reminders = [{ id: b, ...item("2026-11-19T12:00:00.000Z#2"), confirmed: false }];
+  const pick = (delivered: string[]) => titles(lib.selectAlerts([reset], null, NOTE_NOW, { told, reminders, times: true, pending: new Set(), deliveredIds: new Set(delivered) })).length;
+  assert.equal(pick([a]), 1);
+  assert.equal(pick([b]), 0, "the control: its own delivery");
+});
+
+// ---- Settings that can't be read, and items shared with earlier versions
+test("the settings form changes nothing when the saved settings can't be read, when it opens or when it saves", async () => {
+  const keychain = new Map<string, string>();
+  saveAs(keychain, CONFIG_A, JSON.stringify({ events: true, times: true }));
+  // from the Settings menu on, the item naming the settings can't be read
+  let failing = false;
+  const open = await runWidget({ family: "medium", keychain: Object.fromEntries(keychain), app: { menu: [3, 0], form: ["https://mine.example", "t2"] },
+    onSheet: (_k: Map<string, string>, n: number) => { if (n === 2) failing = true; },
+    keychainGetFailsWhen: (k: string) => failing && k === lib.KEYCHAIN_CURRENT } as any);
+  assert.ok(open.alertTitles.includes("Can't read"), open.alertTitles.join(" | "));
+  assert.equal(savedConfig(open.keychain).token, "t", "kept");
+  // the read at saving fails (after the form was filled)
+  let failing2 = false;
+  const save = await runWidget({ family: "medium", keychain: Object.fromEntries(keychain), app: { menu: [3, 0], form: ["https://mine.example", "t2"] },
+    beforeConfirm: () => { failing2 = true; },
+    keychainGetFailsWhen: (k: string) => failing2 && k === lib.KEYCHAIN_CURRENT } as any);
+  assert.ok(save.alertTitles.includes("Can't read"), save.alertTitles.join(" | "));
+  failing2 = false;
+  assert.equal(savedConfig(save.keychain).token, "t", "kept");
+  // the control: readable, it saves
+  const ok = await runWidget({ family: "medium", keychain: Object.fromEntries(keychain), app: { menu: [3, 0], form: ["https://mine.example", "t2"] } });
+  assert.equal(savedConfig(ok.keychain).token, "t2", ok.alertTitles.join(" | "));
+});
+
+test("G4-b (shared items): Remove all reads an item shared with earlier versions before removing it; one it can't read stays and it asks to retry", async () => {
+  const keychain = { [lib.KEYCHAIN_CONFIG]: CONFIG_A, [lib.KEYCHAIN_NOTIFY]: JSON.stringify({ events: true, times: false }) };
+  // the shared switches can't be read once Remove all is confirmed; the fault goes when the retry is offered
+  let questions = 0;
+  let failing = false;
+  const run = await runWidget({ family: "medium", app: { menu: [3, 2] }, keychain,
+    beforeConfirm: () => { questions++; failing = questions === 1; },
+    keychainGetFailsWhen: (k: string) => failing && k === lib.KEYCHAIN_NOTIFY } as any);
+  assert.ok(run.alertTitles.includes("Not fully removed"), run.alertTitles.join(" | "));
+  assert.ok(!run.keychain.has(lib.KEYCHAIN_NOTIFY), "removed on the retry, once read");
+  // quitting at the retry: the item it couldn't read stays
+  const quit = await runWidget({ family: "medium", app: { menu: [3, 2] }, keychain, answers: [0, -1],
+    beforeConfirm: () => { failing = true; },
+    keychainGetFailsWhen: (k: string) => failing && k === lib.KEYCHAIN_NOTIFY } as any);
+  assert.ok(quit.keychain.has(lib.KEYCHAIN_NOTIFY), "not removed unread");
+});
+
+// ---- Turning time reminders off and on again
+test("G4-e (on again): turning time reminders on again keeps the cancel still owed; the next notifying run cancels the old reminder", async () => {
+  const gen = lib.DEFAULT_CONFIG_ID;
+  const old = `headroom.${gen}.back.claude.five_hour.29918280.0123456789abcdef.0a0a0a0a`;
+  const notifier = newNotifier();
+  notifier.pending.set(old, { id: old });
+  // off while the device's list can't be read: owed
+  const off = await runWidget({ family: "medium", app: { menu: [2, 2] }, notifier, now: NOTE_NOW, pendingFails: true } as any);
+  assert.equal(lib.notifyPrefs(savedSwitches(off.keychain))!.cancels.length, 1);
+  // on again before any notifying run
+  const on = await runWidget({ family: "medium", app: { menu: [2, 2] }, notifier, now: NOTE_NOW, keychain: Object.fromEntries(off.keychain) });
+  const prefs = lib.notifyPrefs(savedSwitches(on.keychain))!;
+  assert.deepEqual([prefs.times, prefs.cancels.length], [true, 1], "on, and still owed");
+  // the next notifying run cancels it and settles what was owed
+  const run = await runWidget({ family: "medium", inApp: true, shortcut: "notify", notifier, now: new Date(NOTE_NOW.getTime() + 60_000),
+    keychain: Object.fromEntries(on.keychain), files: new Map([[`/docs/headroom-events-${TAG}-3`, ""]]),
+    responder: (url: string) => (url.includes("/v2/events") ? { status: 200, body: feed(3, []) } : url.includes("/v2/view") ? { status: 503, body: {} } : undefined) });
+  assert.ok(!notifier.pending.has(old), "the old reminder is cancelled");
+  assert.equal(lib.notifyPrefs(savedSwitches(run.keychain))!.cancels.length, 0, "settled");
+});
+
+test("G4-e (on its way): turning off isn't confirmed while a reminder saved as about to be scheduled may still reach iOS", async () => {
+  const gen = lib.DEFAULT_CONFIG_ID;
+  const t = NOTE_NOW.getTime() + 3_600_000;
+  const id = `headroom.${gen}.back.claude.five_hour.${Math.round(t / 60_000)}.0123456789abcdef.0a0a0a0a`;
+  const state = (confirmed: boolean) => JSON.stringify({ reminders: [{ id, kind: "back", provider: "claude", window_id: "five_hour", cycle: t, fire_at: t, confirmed }],
+    told: { limits: [], warned: [] }, sent: [] });
+  const files = new Map([[`/docs/headroom-notify-${TAG}.json`, state(false)]]);
+  const off = await runWidget({ family: "medium", app: { menu: [2, 2] }, notifier: newNotifier(), files, now: NOTE_NOW });
+  assert.equal(lib.notifyPrefs(savedSwitches(off.keychain))!.cancel_pending, true, "not on the device yet, but it may land");
+  // the control: one known scheduled and no longer waiting (it rang or was cancelled) doesn't hold it
+  const files2 = new Map([[`/docs/headroom-notify-${TAG}.json`, state(true)]]);
+  const off2 = await runWidget({ family: "medium", app: { menu: [2, 2] }, notifier: newNotifier(), files: files2, now: NOTE_NOW });
+  assert.equal(lib.notifyPrefs(savedSwitches(off2.keychain))!.cancel_pending, false);
+});
+
+// ---- Reminders being cancelled, and deliveries of the same identifier under another stamp
+test("G5-l: a reminder saved as being cancelled doesn't count as rung unless the device shows it delivered; a delivery counts only with its own stamp", () => {
+  const gen = lib.DEFAULT_CONFIG_ID;
+  const cycle = "2026-11-19T11:59:00.000Z";
+  const stamp = "2026-11-19T10:00:00.000Z#1";
+  const item = { kind: "back", provider: "claude", window_id: "five_hour", cycle: Date.parse(cycle), fire_at: Date.parse(cycle), boundary: stamp };
+  const id = lib.reminderId(gen, item);
+  const told = { limits: [{ key: `claude.five_hour.${cycle}`, at: 1, event_at: 1, boundary: stamp, until: NOTE_NOW.getTime() + 86_400_000 }], warned: [] };
+  const reset = ev(9, "reset", { cycle, resets_at: cycle, boundary: stamp });
+  const pick = (r: any, delivered: Map<string, string | null>) => titles(lib.selectAlerts([reset], null, NOTE_NOW,
+    { told, reminders: [r], times: true, pending: new Set(), deliveredIds: new Set(delivered.keys()), deliveredStamps: delivered })).length;
+  // removed from the device, then the run stopped: it never rang, so the reset is told
+  assert.equal(pick({ id, ...item, confirmed: true, cancelling: true }, new Map()), 1);
+  // it rang before it was removed (delivered, with its stamp): not told again
+  assert.equal(pick({ id, ...item, confirmed: true, cancelling: true }, new Map([[id, stamp]])), 0);
+  // the control: known scheduled, no longer waiting, not being cancelled: it rang
+  assert.equal(pick({ id, ...item, confirmed: true }, new Map()), 0);
+  // the same identifier delivered under another account's stamp proves nothing for this one
+  assert.equal(pick({ id, ...item, confirmed: false }, new Map([[id, "2026-11-19T12:00:00.000Z#2"]])), 1);
+  assert.equal(pick({ id, ...item, confirmed: false }, new Map([[id, stamp]])), 0, "under its own stamp, it rang");
+});
+
+// ---- The seen marker and the list of files on the iPhone
+test("G2-g (the marker): a view whose seen marker can't be saved is shown, but neither saved nor planned from", async () => {
+  const files = new Map<string, string>([[`/docs/headroom-events-${TAG}-3`, ""]]);
+  const notifier = newNotifier();
+  const run = await runWidget({ family: "medium", parameter: "notify", files, notifier, now: NOTE_NOW,
+    response: { status: 200, body: { ...demoBody("reset", NOTE_NOW), data_version: 5 } }, responder: eventsAt(feed(3, [])),
+    writeFailsWhen: (p: string) => p.includes("headroom-seen-") } as any);
+  assert.ok(texts(run.widget.node).some((x) => /%/.test(x)), "shown");
+  assert.ok(![...files.keys()].some((k) => k.includes(`headroom-view-${TAG}-5`)), "not saved");
+  assert.equal(notifier.log.length, 0, "nothing scheduled");
+  // the control: received, its reset reminder is scheduled
+  const files2 = new Map<string, string>([[`/docs/headroom-events-${TAG}-3`, ""]]);
+  const notifier2 = newNotifier();
+  await runWidget({ family: "medium", parameter: "notify", files: files2, notifier: notifier2, now: NOTE_NOW,
+    response: { status: 200, body: { ...demoBody("reset", NOTE_NOW), data_version: 5 } }, responder: eventsAt(feed(3, [])) });
+  assert.equal(notifier2.pending.size, 1);
+});
+
+test("G2-g (the list): when the files can't be listed after the response is saved, a withdrawal saved meanwhile isn't hidden by older values", async () => {
+  const files = new Map<string, string>();
+  // another run saves the empty 6 while this one saves 5; then the list fails
+  let failing = false;
+  const run = await runWidget({ family: "medium", files, response: { status: 200, body: sampleView(5) },
+    onWrite: (p: string) => { if (p.includes(`headroom-view-${TAG}-5`) && !failing) { withdrawnMarker(files, 6); failing = true; } },
+    listFailsWhen: () => failing } as any);
+  assert.ok(!texts(run.widget.node).some((x) => /%/.test(x)), "the older values aren't drawn");
+  // the list works: the withdrawal is shown
+  const run2 = await runWidget({ family: "medium", files, response: { status: 200, body: sampleView(5) } });
+  assert.ok(!texts(run2.widget.node).some((x) => /%/.test(x)));
+});
+
+test("G2-g (no response): a withdrawal whose marker lands while the notifying run waits for the lock cancels what was planned", async () => {
+  const files = new Map<string, string>([[`/docs/headroom-events-${TAG}-3`, ""]]);
+  const notifier = newNotifier();
+  await notifyWith(files, notifier, { status: 200, body: { ...demoBody("reset", NOTE_NOW), data_version: 5 } });
+  assert.equal(notifier.pending.size, 1);
+  // no view at all this time: the saved body is gone (only its marker is left)
+  files.delete(`/docs/${lib.cacheFileName(TAG, 5)}`);
+  // the server can't be reached; another widget records the withdrawal 6 (its marker only) while this run waits for the lock
+  await runWidget({ family: "medium", inApp: true, shortcut: "notify", files, notifier, now: NOTE_NOW, response: { status: 503, body: {} },
+    responder: eventsAt(feed(3, [])),
+    onWrite: (p: string) => { if (p.includes("headroom-lock-") && !files.has(`/docs/headroom-seen-${TAG}-6`)) withdrawnMarker(files, 6); } } as any);
+  assert.equal(notifier.pending.size, 0, "cancelled");
+});
+
+// ---- Records of the notifying runs: pairs, intents and told records
+test("G5-f (one record): a stopped and resumed that cancel out are settled by one record, or neither when it can't be written", async () => {
+  const events = feed(6, [stoppedEv(5), resumedEv(6)]);
+  const files = new Map<string, string>([[`/docs/headroom-events-${TAG}-4`, ""]]);
+  const notifier = newNotifier();
+  await runWidget({ family: "medium", inApp: true, shortcut: "notify", files, notifier, now: NOTE_NOW, responder: eventsAt(events),
+    writeFailsWhen: (p: string) => p.includes("headroom-told-") } as any);
+  assert.equal(notifier.log.length, 0);
+  assert.ok(!files.has(`/docs/headroom-events-${TAG}-5`) && !files.has(`/docs/headroom-events-${TAG}-6`), "neither settled: the cursor stays before 5");
+  // settled, but the cursor can't be written: the one record names both (read back, both are settled)
+  const later = new Date(NOTE_NOW.getTime() + 5 * 60_000);
+  await runWidget({ family: "medium", inApp: true, shortcut: "notify", files, notifier, now: later, responder: eventsAt(events),
+    writeFailsWhen: (p: string) => p.includes("headroom-events-") } as any);
+  const told5 = JSON.parse(files.get(`/docs/${lib.recordName("told", TAG, 5)}`) ?? "null");
+  assert.equal(told5?.pair, 6);
+  assert.ok(!files.has(`/docs/${lib.recordName("told", TAG, 6)}`));
+  const fm = { documentsDirectory: () => "/docs", joinPath: (a: string, b: string) => `${a}/${b}`, readString: (p: string) => files.get(p) };
+  const records = lib.readRecords(fm, [lib.recordName("told", TAG, 5)], TAG);
+  assert.deepEqual([...records.told.keys()].sort(), [5, 6]);
+  // the next run tells neither and passes both
+  await runWidget({ family: "medium", inApp: true, shortcut: "notify", files, notifier, now: later, responder: eventsAt(events) });
+  assert.equal(notifier.log.length, 0, "the resumed is never told alone");
+  assert.ok(files.has(`/docs/headroom-events-${TAG}-6`));
+});
+
+test("G5-h (a gone run's pair): a pair left by a run long gone doesn't stop a sender; a fresh one does", async () => {
+  const pairAt = (at: number) => new Map<string, string>([[`/docs/headroom-events-${TAG}-4`, ""],
+    [`/docs/${lib.recordName("pair", TAG, 5, 6, "bbbbbbbb")}`, JSON.stringify({ at })]]);
+  const stale = pairAt(NOTE_NOW.getTime() - 10 * 60_000);
+  const notifier = newNotifier();
+  await runWidget({ family: "medium", inApp: true, shortcut: "notify", files: stale, notifier, now: NOTE_NOW, responder: eventsAt(feed(5, [stoppedEv(5)])) });
+  assert.equal(notifier.log.length, 1, "told");
+  const fresh = pairAt(NOTE_NOW.getTime());
+  const notifier2 = newNotifier();
+  await runWidget({ family: "medium", inApp: true, shortcut: "notify", files: fresh, notifier: notifier2, now: NOTE_NOW, responder: eventsAt(feed(5, [stoppedEv(5)])) });
+  assert.equal(notifier2.log.length, 0, "held while that run may be cancelling them out");
+});
+
+test("G5-h (an intent after the pair): a stopped another run starts handing over is neither taken as told nor cancelled out; both wait", async () => {
+  const gen = lib.DEFAULT_CONFIG_ID;
+  const events = feed(6, [stoppedEv(5), resumedEv(6)]);
+  const files = new Map<string, string>([[`/docs/headroom-events-${TAG}-4`, ""]]);
+  const notifier = newNotifier();
+  const intent = `/docs/${lib.recordName("intent", TAG, 5, "cccccccc")}`;
+  await runWidget({ family: "medium", inApp: true, shortcut: "notify", files, notifier, now: NOTE_NOW, responder: eventsAt(events),
+    onWrite: (p: string, f: Map<string, string>) => { if (p.includes("headroom-pair-") && !f.has(intent)) f.set(intent, JSON.stringify({ seqs: [5], at: NOTE_NOW.getTime() })); } } as any);
+  assert.equal(notifier.log.length, 0);
+  assert.ok(!files.has(`/docs/${lib.recordName("told", TAG, 5)}`), "not taken as told");
+  assert.ok(!files.has(`/docs/headroom-events-${TAG}-5`) && !files.has(`/docs/headroom-events-${TAG}-6`), "the cursor stays before 5");
+  assert.ok(![...files.keys()].some((k) => k.includes("headroom-pair-")), "its pair is taken back");
+  // the other run's stopped shows on the device: the resumed is told
+  notifier.delivered.set("s", { id: `headroom.${gen}.events.5.all`, title: "t", body: "b", userInfo: { seqs: [5] } } as any);
+  await runWidget({ family: "medium", inApp: true, shortcut: "notify", files, notifier, now: NOTE_NOW, responder: eventsAt(events) });
+  assert.deepEqual(notifier.log.flatMap((n: any) => plain(n.userInfo.seqs)), [6]);
+});
+
+test("G5-e (settled meanwhile): a notification another run settles after this one chose it isn't handed to iOS", async () => {
+  const events = feed(5, [ev(5, "limit", { window_id: "seven_day", label: "Weekly", resets_at: "2026-11-20T00:00:00Z" })]);
+  for (const [what, settle] of [
+    ["the cursor passed it", (f: Map<string, string>) => f.set(`/docs/headroom-events-${TAG}-5`, "")],
+    ["its told record", (f: Map<string, string>) => f.set(`/docs/${lib.recordName("told", TAG, 5)}`, JSON.stringify({ mark: null }))],
+  ] as const) {
+    const files = new Map<string, string>([[`/docs/headroom-events-${TAG}-4`, ""]]);
+    const notifier = newNotifier();
+    let done = false;
+    await runWidget({ family: "medium", inApp: true, shortcut: "notify", files, notifier, now: NOTE_NOW, responder: eventsAt(events),
+      onWrite: (p: string, f: Map<string, string>) => { if (p.includes("headroom-intent-") && !done) { done = true; settle(f); } } } as any);
+    assert.equal(notifier.log.length, 0, what);
+    assert.ok([...files.keys()].some((k) => k.includes("headroom-abort-")), `${what}: dropped, and recorded so`);
+  }
+});
+
+test("G5-e (in one run): a notification iOS took whose told record can't be written isn't sent again in the same run", async () => {
+  const files = new Map<string, string>([[`/docs/headroom-events-${TAG}-4`, ""]]);
+  const notifier = newNotifier();
+  const events = feed(5, [ev(5, "limit", { window_id: "seven_day", label: "Weekly", resets_at: "2026-11-20T00:00:00Z" })]);
+  // the device's list doesn't show it yet
+  await runWidget({ family: "medium", inApp: true, shortcut: "notify", files, notifier, now: NOTE_NOW, responder: eventsAt(events),
+    writeFailsWhen: (p: string) => p.includes("headroom-told-"), onAllDelivered: (n: Notifier) => n.delivered.clear() } as any);
+  assert.equal(notifier.log.length, 1);
+  assert.ok(!files.has(`/docs/headroom-events-${TAG}-5`), "the cursor stays before it");
+});
+
+test("G5-j (kept by the intent): a notification found delivered after its event left the feed still remembers its cycle", async () => {
+  const gen = lib.DEFAULT_CONFIG_ID;
+  const limit = ev(5, "limit");
+  const mark = lib.eventMark(limit);
+  const reset = ev(7, "reset");
+  const run = async (marks: unknown) => {
+    const files = new Map<string, string>([[`/docs/headroom-events-${TAG}-4`, ""],
+      [`/docs/${lib.recordName("intent", TAG, 5, "aaaaaaaa")}`, JSON.stringify({ seqs: [5], ...(marks ? { marks } : {}), at: NOTE_NOW.getTime() - 10 * 60_000 })]]);
+    const notifier = newNotifier();
+    notifier.delivered.set("five", { id: `headroom.${gen}.events.5.claude`, title: "t", body: "b", userInfo: { seqs: [5] } } as any);
+    // the server no longer holds 5 (the oldest is 6)
+    await runWidget({ family: "medium", inApp: true, shortcut: "notify", files, notifier, now: NOTE_NOW,
+      responder: eventsAt({ last_seq: 7, oldest_seq: 6, events: [ev(6, "threshold", { threshold: 80, provider: "codex" }), reset] }) });
+    return { files, notifier };
+  };
+  const kept = await run({ 5: mark });
+  assert.deepEqual(JSON.parse(kept.files.get(`/docs/${lib.recordName("told", TAG, 5)}`) ?? "null")?.mark?.key, mark.key, "its cycle, from the intent");
+  assert.ok(kept.notifier.log.some((n: any) => plain(n.userInfo.seqs).includes(7)), "so its reset is told");
+  // the control: an intent without the cycles (an earlier version's) can't tell the reset belongs to a told limit
+  const plainIntent = await run(null);
+  assert.ok(!plainIntent.notifier.log.some((n: any) => plain(n.userInfo?.seqs ?? []).includes(7)));
+});
+
+test("G5-i (cleanup): an intent stays until all its numbers are passed; a told record that can't be read stays; a corrupt one goes", async () => {
+  const gen = lib.DEFAULT_CONFIG_ID;
+  // an intent for 5 and 7 whose run may still be going; 5 is on the device
+  const intent = `/docs/${lib.recordName("intent", TAG, 5, "aaaaaaaa")}`;
+  const files = new Map<string, string>([[`/docs/headroom-events-${TAG}-4`, ""], [intent, JSON.stringify({ seqs: [5, 7], at: NOTE_NOW.getTime() - 30_000 })]]);
+  const notifier = newNotifier();
+  notifier.delivered.set("five", { id: `headroom.${gen}.events.5.claude`, title: "t", body: "b", userInfo: { seqs: [5] } } as any);
+  await runWidget({ family: "medium", inApp: true, shortcut: "notify", files, notifier, now: NOTE_NOW,
+    responder: eventsAt(feed(7, [ev(5, "limit"), ev(6, "threshold", { threshold: 80, provider: "codex" }), ev(7, "limit", { provider: "codex" })])) });
+  assert.ok(files.has(`/docs/headroom-events-${TAG}-6`) && !files.has(`/docs/headroom-events-${TAG}-7`), "the cursor waits before 7");
+  assert.ok(files.has(intent), "kept: 7 isn't passed");
+  // a told record passed by the cursor, with a cycle that still matters, whose read fails at the cleanup
+  const told5 = `/docs/${lib.recordName("told", TAG, 5)}`;
+  const mark = { ...lib.eventMark(ev(5, "limit")), until: NOTE_NOW.getTime() + 86_400_000 };
+  const files2 = new Map<string, string>([[`/docs/headroom-events-${TAG}-5`, ""], [told5, JSON.stringify({ mark })]]);
+  let reads = 0;
+  await runWidget({ family: "medium", inApp: true, shortcut: "notify", files: files2, notifier: newNotifier(), now: NOTE_NOW, responder: eventsAt(feed(5, [])),
+    readFailsWhen: (p: string) => p === told5 && ++reads > 1 } as any);
+  assert.ok(files2.has(told5), "kept");
+  // a corrupt one passed by the cursor holds nothing: it goes (and doesn't stop the run)
+  const files3 = new Map<string, string>([[`/docs/headroom-events-${TAG}-5`, ""], [told5, "{"]]);
+  const corrupt = await runWidget({ family: "medium", inApp: true, shortcut: "notify", files: files3, notifier: newNotifier(), now: NOTE_NOW, responder: eventsAt(feed(5, [])) });
+  assert.ok(!files3.has(told5));
+  assert.ok(!String(corrupt.shortcutOutput).startsWith("Couldn't"), String(corrupt.shortcutOutput));
+});
+
+// ---- Fixes after the second check (realistic ones)
+test("G4-b (a shared item read last): Remove all removes none of the shared items unless it read them all; settings keep their switches", async () => {
+  const keychain = { [lib.KEYCHAIN_CONFIG]: CONFIG_A, [lib.KEYCHAIN_NOTIFY]: JSON.stringify({ events: false, times: false }) };
+  // after the confirmation, the second read of the shared settings (the one Remove all makes before removing) fails once
+  let armed = false;
+  let gets = 0;
+  const quit = await runWidget({ family: "medium", app: { menu: [3, 2] }, keychain, answers: [0, -1],
+    beforeConfirm: () => { armed = true; },
+    keychainGetFailsWhen: (k: string) => armed && k === lib.KEYCHAIN_CONFIG && ++gets === 2 } as any);
+  assert.ok(quit.alertTitles.includes("Not fully removed"), quit.alertTitles.join(" | "));
+  assert.ok(quit.keychain.has(lib.KEYCHAIN_CONFIG) && quit.keychain.has(lib.KEYCHAIN_NOTIFY), "both kept");
+  const prefs = lib.notifyPrefs(quit.keychain.get(lib.KEYCHAIN_NOTIFY))!;
+  assert.deepEqual([prefs.events, prefs.times], [false, false], "still both off");
+  // the control: read, all go
+  const done = await runWidget({ family: "medium", app: { menu: [3, 2] }, keychain });
+  assert.ok(!done.keychain.has(lib.KEYCHAIN_CONFIG) && !done.keychain.has(lib.KEYCHAIN_NOTIFY));
+});
+
+test("G5-f (a record cut short): a told record whose content is corrupt settles nothing; the pair is decided again", async () => {
+  const files = new Map<string, string>([[`/docs/headroom-events-${TAG}-4`, ""], [`/docs/${lib.recordName("told", TAG, 5)}`, "{"]]);
+  const notifier = newNotifier();
+  await runWidget({ family: "medium", inApp: true, shortcut: "notify", files, notifier, now: NOTE_NOW, responder: eventsAt(feed(6, [stoppedEv(5), resumedEv(6)])) });
+  assert.equal(notifier.log.length, 0, "the resumed isn't told alone");
+  assert.ok(files.has(`/docs/headroom-events-${TAG}-6`), "both settled");
+});
+
+test("G5-i (a record cut short): a corrupt told record doesn't take the cycle an intent kept; the reset is told", async () => {
+  const gen = lib.DEFAULT_CONFIG_ID;
+  const mark = lib.eventMark(ev(5, "limit"));
+  const files = new Map<string, string>([[`/docs/headroom-events-${TAG}-4`, ""], [`/docs/${lib.recordName("told", TAG, 5)}`, "{"],
+    [`/docs/${lib.recordName("intent", TAG, 5, "aaaaaaaa")}`, JSON.stringify({ seqs: [5], marks: { 5: mark }, at: NOTE_NOW.getTime() - 10 * 60_000 })]]);
+  const notifier = newNotifier();
+  notifier.delivered.set("five", { id: `headroom.${gen}.events.5.claude`, title: "t", body: "b", userInfo: { seqs: [5] } } as any);
+  await runWidget({ family: "medium", inApp: true, shortcut: "notify", files, notifier, now: NOTE_NOW,
+    responder: eventsAt({ last_seq: 7, oldest_seq: 6, events: [ev(6, "threshold", { threshold: 80, provider: "codex" }), ev(7, "reset")] }) });
+  assert.ok(notifier.log.some((n: any) => plain(n.userInfo.seqs).includes(7)));
+});
+
+test("G5-e (seen at the re-read): an intent's number that shows on the device only at the last check still gives its cycle", async () => {
+  const gen = lib.DEFAULT_CONFIG_ID;
+  const mark = lib.eventMark(ev(5, "limit"));
+  const files = new Map<string, string>([[`/docs/headroom-events-${TAG}-4`, ""],
+    [`/docs/${lib.recordName("intent", TAG, 5, "aaaaaaaa")}`, JSON.stringify({ seqs: [5], marks: { 5: mark }, at: NOTE_NOW.getTime() - 10 * 60_000 })]]);
+  const notifier = newNotifier();
+  await runWidget({ family: "medium", inApp: true, shortcut: "notify", files, notifier, now: NOTE_NOW,
+    responder: eventsAt({ last_seq: 7, oldest_seq: 6, events: [ev(6, "threshold", { threshold: 80, provider: "codex" }), ev(7, "reset")] }),
+    onAllDelivered: (n: Notifier, call: number) => {
+      if (call === 2) n.delivered.set("five", { id: `headroom.${gen}.events.5.claude`, title: "t", body: "b", userInfo: { seqs: [5] } });
+    } } as any);
+  assert.ok(notifier.log.some((n: any) => plain(n.userInfo.seqs).includes(7)), "the reset is told");
+  assert.equal(JSON.parse(files.get(`/docs/${lib.recordName("told", TAG, 5)}`) ?? "null")?.mark?.key, mark.key);
+});
+
+test("G5-g (still waiting): a reset whose reminder is due but still waiting on the device is held; long past its time, it is told", () => {
+  const gen = lib.DEFAULT_CONFIG_ID;
+  const cycle = "2026-11-19T11:59:00.000Z";
+  const stamp = "2026-11-19T10:00:00.000Z#1";
+  const told = { limits: [{ key: `claude.five_hour.${cycle}`, at: 1, event_at: 1, boundary: stamp, until: NOTE_NOW.getTime() + 86_400_000 }], warned: [] };
+  const reset = ev(9, "reset", { cycle, resets_at: cycle, boundary: stamp });
+  const row = (fireAt: number) => {
+    const item = { kind: "back", provider: "claude", window_id: "five_hour", cycle: Date.parse(cycle), fire_at: fireAt, boundary: stamp };
+    return { id: lib.reminderId(gen, item), ...item, confirmed: true };
+  };
+  const pick = (r: any, times = true) => lib.selectAlerts([reset], null, NOTE_NOW, { told, reminders: [r], times, pending: new Set([r.id]), deliveredIds: new Set(), deliveredStamps: new Map() });
+  const soon = pick(row(NOTE_NOW.getTime() - 30_000));
+  assert.deepEqual([soon.alerts.length, plain(soon.held)], [0, [9]], "it rings in a moment: held");
+  assert.equal(pick(row(NOTE_NOW.getTime() - 20 * 60_000)).alerts.length, 1, "iOS kept it waiting: the event tells it");
+  assert.equal(pick(row(NOTE_NOW.getTime() - 30_000), false).alerts.length, 1, "with time reminders off it is being cancelled");
+});
+
+test("G4-e (a stop before iOS): a reminder saved as about to be scheduled no longer holds a cancel once its run is gone", async () => {
+  const gen = lib.DEFAULT_CONFIG_ID;
+  const t = NOTE_NOW.getTime() + 3_600_000;
+  const id = `headroom.${gen}.back.claude.five_hour.${Math.round(t / 60_000)}.0123456789abcdef.0a0a0a0a`;
+  const run = async (setAt: number) => {
+    const files = new Map<string, string>([[`/docs/headroom-events-${TAG}-3`, ""], [`/docs/headroom-notify-${TAG}.json`, JSON.stringify({
+      reminders: [{ id, kind: "back", provider: "claude", window_id: "five_hour", cycle: t, fire_at: t, set_at: setAt, confirmed: false }],
+      told: { limits: [], warned: [] }, sent: [] })]]);
+    const keychain = { "headroom.url": "https://headroom.example.com", "headroom.token": "read-token-xyz",
+      [lib.KEYCHAIN_NOTIFY]: JSON.stringify({ events: true, times: false, rev: 1, cancel_pending: true, cancels: [{ op: "0a0a0a0a", gen, before: NOTE_NOW.getTime() }] }) };
+    const r = await runWidget({ family: "medium", inApp: true, shortcut: "notify", files, notifier: newNotifier(), keychain, now: NOTE_NOW,
+      responder: (url: string) => (url.includes("/v2/events") ? { status: 200, body: feed(3, []) } : url.includes("/v2/view") ? { status: 503, body: {} } : undefined) });
+    return lib.notifyPrefs(savedSwitches(r.keychain))!;
+  };
+  assert.equal((await run(NOTE_NOW.getTime() - 10 * 60_000)).cancel_pending, false, "its run is long gone: it never reached iOS");
+  assert.equal((await run(NOTE_NOW.getTime() - 30_000)).cancel_pending, true, "its run may still be handing it over");
+});
+
+test("G5-l (the menu): turning time reminders off marks a reminder as being cancelled before removing it; a stop there leaves the reset to be told", async () => {
+  const gen = lib.DEFAULT_CONFIG_ID;
+  const cycle = "2026-11-19T11:59:00.000Z";
+  const item = { kind: "back", provider: "claude", window_id: "five_hour", cycle: Date.parse(cycle), fire_at: NOTE_NOW.getTime() - 60_000, boundary: null };
+  const id = lib.reminderId(gen, item);
+  const files = new Map<string, string>([[`/docs/headroom-events-${TAG}-4`, ""], [`/docs/headroom-notify-${TAG}.json`, JSON.stringify({
+    reminders: [{ id, ...item, set_at: NOTE_NOW.getTime() - 3_600_000, confirmed: true }],
+    told: { limits: [{ key: `claude.five_hour.${cycle}`, at: 1, event_at: 1, until: NOTE_NOW.getTime() + 86_400_000 }], warned: [] }, sent: [] })]]);
+  const notifier = newNotifier();
+  notifier.pending.set(id, { id });
+  // removed from the device, then the menu stops (iOS took the cancel, nothing after it ran)
+  const off = await runWidget({ family: "medium", app: { menu: [2, 2] }, notifier, files, now: NOTE_NOW, removePendingThenFails: true } as any);
+  const state = JSON.parse(files.get(`/docs/headroom-notify-${TAG}.json`)!);
+  assert.equal(state.reminders.find((r: any) => r.id === id)?.cancelling, true, "marked before it was removed");
+  // the reset comes: the reminder never rang, so the event tells it
+  await runWidget({ family: "medium", inApp: true, shortcut: "notify", files, notifier, keychain: Object.fromEntries(off.keychain), now: NOTE_NOW,
+    responder: (url: string) => (url.includes("/v2/events") ? { status: 200, body: feed(5, [ev(5, "reset", { cycle, resets_at: cycle })]) } : url.includes("/v2/view") ? { status: 503, body: {} } : undefined) });
+  assert.ok(notifier.log.some((n: any) => String(n.body).includes("usable again")), "told");
+});
+
+test("G5-g (taking over): a reminder being cancelled, or one of another account's stamp, is planned again under a new identifier", () => {
+  const gen = lib.DEFAULT_CONFIG_ID;
+  const c = NOTE_NOW.getTime() + 3_600_000;
+  const item = { kind: "back", provider: "claude", window_id: "five_hour", cycle: c, fire_at: c, boundary: "2026-11-19T12:00:00.000Z#2", title: "t", body: "b" };
+  const prev = (o: Record<string, unknown>) => ({ id: `headroom.${gen}.back.claude.five_hour.${Math.round(c / 60_000)}.0123456789abcdef.0a0a0a0a`,
+    kind: "back", provider: "claude", window_id: "five_hour", cycle: c, fire_at: c, set_at: 1, confirmed: true, boundary: item.boundary, ...o });
+  const plan = (p: any) => plain(lib.reconcileReminders([p], [item], NOTE_NOW, gen, new Set([p.id])));
+  for (const [what, o] of [["being cancelled", { cancelling: true }], ["an old one without a stamp", { boundary: null }],
+    ["another account's", { boundary: "2026-11-19T10:00:00.000Z#1" }]] as const) {
+    const p = prev(o);
+    const r = plan(p);
+    assert.equal(r.schedule.length, 1, what);
+    assert.notEqual(r.schedule[0].id, p.id, `${what}: a new identifier`);
+    assert.deepEqual(r.cancel, [p.id], `${what}: the old one cancelled`);
+    assert.equal(r.reminders[0].confirmed, undefined, `${what}: not taken as known scheduled`);
+  }
+  // the control: the same account's, not being cancelled, is kept as it is
+  const same = plan(prev({}));
+  assert.deepEqual([same.schedule.length, same.cancel.length, same.reminders[0].id], [0, 0, prev({}).id]);
+});
+
+test("G2-g (what the marker says): a received withdrawal's seen marker says so; a view with values says nothing", async () => {
+  const files = new Map<string, string>();
+  await runWidget({ family: "medium", files, response: { status: 200, body: sampleView(5) } });
+  assert.equal(files.get(`/docs/headroom-seen-${TAG}-5`), "");
+  await runWidget({ family: "medium", files, response: { status: 200, body: emptyView(6) } });
+  assert.equal(files.get(`/docs/headroom-seen-${TAG}-6`), "withdrawn");
+});
+
+test("G5-f (told meanwhile): a stopped another run told while this one cancels the pair out is taken; its resumed is told", async () => {
+  const files = new Map<string, string>([[`/docs/headroom-events-${TAG}-4`, ""]]);
+  const notifier = newNotifier();
+  const told5 = `/docs/${lib.recordName("told", TAG, 5)}`;
+  await runWidget({ family: "medium", inApp: true, shortcut: "notify", files, notifier, now: NOTE_NOW, responder: eventsAt(feed(6, [stoppedEv(5), resumedEv(6)])),
+    onWrite: (p: string, f: Map<string, string>) => { if (p.includes("headroom-pair-") && !f.has(told5)) f.set(told5, JSON.stringify({ mark: null })); } } as any);
+  assert.deepEqual(notifier.log.flatMap((n: any) => plain(n.userInfo.seqs)), [6]);
+  assert.ok(files.has(`/docs/headroom-events-${TAG}-6`));
+  assert.ok(![...files.keys()].some((k) => k.includes("headroom-pair-")), "its pair is taken back");
+});
+
+test("G5-j (what the intent holds): a notification's intent keeps each number's cycle, read from its event", async () => {
+  const files = new Map<string, string>([[`/docs/headroom-events-${TAG}-4`, ""]]);
+  let written: any = null;
+  await runWidget({ family: "medium", inApp: true, shortcut: "notify", files, notifier: newNotifier(), now: NOTE_NOW, responder: eventsAt(feed(5, [ev(5, "limit")])),
+    onWrite: (p: string, f: Map<string, string>) => { if (p.includes("headroom-intent-") && written === null) written = JSON.parse(f.get(p)!); } } as any);
+  assert.deepEqual(plain(written?.seqs), [5]);
+  assert.equal(written?.marks?.[5]?.key, lib.eventMark(ev(5, "limit")).key);
+});
+
+test("G5-l (the notifying run): a reminder is saved as being cancelled before it is removed, when cancelling what is owed and when withdrawn", async () => {
+  const gen = lib.DEFAULT_CONFIG_ID;
+  const t = NOTE_NOW.getTime() + 3_600_000;
+  const id = `headroom.${gen}.back.claude.five_hour.${Math.round(t / 60_000)}.0123456789abcdef.0a0a0a0a`;
+  const row = { id, kind: "back", provider: "claude", window_id: "five_hour", cycle: t, fire_at: t, set_at: NOTE_NOW.getTime() - 3_600_000, confirmed: true, from: 5 };
+  const setup = () => new Map<string, string>([[`/docs/headroom-events-${TAG}-3`, ""],
+    [`/docs/headroom-notify-${TAG}.json`, JSON.stringify({ reminders: [row], told: { limits: [], warned: [] }, sent: [], view_version: 5 })]]);
+  const cancelling = (files: Map<string, string>) => JSON.parse(files.get(`/docs/headroom-notify-${TAG}.json`)!).reminders.find((r: any) => r.id === id)?.cancelling;
+  // time reminders off: what is owed is cancelled
+  const owed = setup();
+  const n1 = newNotifier();
+  n1.pending.set(id, { id });
+  await runWidget({ family: "medium", inApp: true, shortcut: "notify", files: owed, notifier: n1, now: NOTE_NOW, removePendingThenFails: true,
+    keychain: { "headroom.url": "https://headroom.example.com", "headroom.token": "read-token-xyz", [lib.KEYCHAIN_NOTIFY]: JSON.stringify({ events: true, times: false }) },
+    responder: (url: string) => (url.includes("/v2/events") ? { status: 200, body: feed(3, []) } : url.includes("/v2/view") ? { status: 503, body: {} } : undefined) } as any);
+  assert.equal(cancelling(owed), true, "owed");
+  // a withdrawal: the plan cancels it
+  const withdrawn = setup();
+  const n2 = newNotifier();
+  n2.pending.set(id, { id });
+  await runWidget({ family: "medium", inApp: true, shortcut: "notify", files: withdrawn, notifier: n2, now: NOTE_NOW, removePendingThenFails: true,
+    response: { status: 200, body: emptyView(6) }, responder: eventsAt(feed(3, [])) } as any);
+  assert.equal(cancelling(withdrawn), true, "withdrawn");
+});
+
+// ---- Fixes after the limitations check
+test("G5-h (shown at the re-read): a stopped in flight that shows on the device only at the last check lets its resumed be told in that run", async () => {
+  const gen = lib.DEFAULT_CONFIG_ID;
+  const files = new Map<string, string>([[`/docs/headroom-events-${TAG}-4`, ""],
+    [`/docs/${lib.recordName("intent", TAG, 5, "aaaaaaaa")}`, JSON.stringify({ seqs: [5], at: NOTE_NOW.getTime() - 30_000 })]]);
+  const notifier = newNotifier();
+  const events = feed(6, [stoppedEv(5), resumedEv(6)]);
+  await runWidget({ family: "medium", inApp: true, shortcut: "notify", files, notifier, now: NOTE_NOW, responder: eventsAt(events),
+    onAllDelivered: (n: Notifier, call: number) => {
+      if (call === 2) n.delivered.set("s", { id: `headroom.${gen}.events.5.all`, title: "t", body: "b", userInfo: { seqs: [5] } });
+    } } as any);
+  assert.deepEqual(notifier.log.flatMap((n: any) => plain(n.userInfo.seqs)), [6], "the resumed is told");
+  assert.ok(files.has(`/docs/headroom-events-${TAG}-6`));
+  await runWidget({ family: "medium", inApp: true, shortcut: "notify", files, notifier, now: NOTE_NOW, responder: eventsAt(events) });
+  assert.equal(notifier.log.length, 1, "not again");
+});
+
+test("G5-g (taking over, due): a reminder being cancelled or of another account is planned again also within its last minute", () => {
+  const gen = lib.DEFAULT_CONFIG_ID;
+  const c = NOTE_NOW.getTime() + 30_000;
+  const item = { kind: "runout", provider: "claude", window_id: "five_hour", cycle: c, fire_at: c, boundary: "2026-11-19T12:00:00.000Z#2", title: "t", body: "b" };
+  const prev = (o: Record<string, unknown>) => ({ id: `headroom.${gen}.runout.claude.five_hour.${Math.round(c / 60_000)}.0123456789abcdef.0a0a0a0a`,
+    kind: "runout", provider: "claude", window_id: "five_hour", cycle: c, fire_at: c, set_at: 1, confirmed: true, boundary: item.boundary, ...o });
+  // being cancelled and still waiting (its cancel hasn't gone through): planned again under a new identifier
+  const waiting = prev({ cancelling: true });
+  assert.equal(plain(lib.reconcileReminders([waiting], [item], NOTE_NOW, gen, new Set([waiting.id]))).schedule.length, 1);
+  // being cancelled and gone, whether it rang unknown (the notifying run settles it by the device first): held as it is
+  const gone = plain(lib.reconcileReminders([prev({ cancelling: true })], [item], NOTE_NOW, gen, new Set()));
+  assert.deepEqual([gone.schedule.length, gone.reminders[0].cancelling], [0, true]);
+  // another account's, gone (it rang for that account): this account's is planned
+  assert.equal(plain(lib.reconcileReminders([prev({ boundary: null })], [item], NOTE_NOW, gen, new Set())).schedule.length, 1);
+  // the control: the same account's, gone from the device within its minute, rang
+  assert.equal(plain(lib.reconcileReminders([prev({})], [item], NOTE_NOW, gen, new Set())).schedule.length, 0);
+});
+
+test("G5-l (settled by the device): a reminder left as being cancelled is forgotten once gone, and taken as rung once delivered", async () => {
+  const gen = lib.DEFAULT_CONFIG_ID;
+  // its time has passed (a reminder delivered has rung)
+  const t = NOTE_NOW.getTime() - 60_000;
+  const id = `headroom.${gen}.back.claude.five_hour.${Math.round(t / 60_000)}.0123456789abcdef.0a0a0a0a`;
+  const row = { id, kind: "back", provider: "claude", window_id: "five_hour", cycle: t, fire_at: t, set_at: 1, confirmed: true, cancelling: true };
+  const run = async (delivered: string | null | undefined, opts: Record<string, unknown> = {}) => {
+    const files = new Map<string, string>([[`/docs/headroom-events-${TAG}-3`, ""],
+      [`/docs/headroom-notify-${TAG}.json`, JSON.stringify({ reminders: [row], told: { limits: [], warned: [] }, sent: [] })]]);
+    const notifier = newNotifier();
+    if (delivered !== undefined) notifier.delivered.set(id, { id, title: "t", body: "b", userInfo: { boundary: delivered } });
+    await runWidget({ family: "medium", inApp: true, shortcut: "notify", files, notifier, now: NOTE_NOW,
+      response: { status: 200, body: emptyView(6) }, responder: eventsAt(feed(3, [])), ...opts } as any);
+    return JSON.parse(files.get(`/docs/headroom-notify-${TAG}.json`)!).reminders.find((r: any) => r.id === id);
+  };
+  assert.equal(await run(undefined), undefined, "the cancel went through: forgotten");
+  assert.equal((await run(null))?.cancelling, false, "delivered under its own stamp: it rang");
+  assert.equal(await run("2026-11-19T10:00:00.000Z#1"), undefined, "delivered under another account's stamp: not this one");
+  assert.equal((await run(null, { deliveredFailsOnCall: 1 }))?.cancelling, true, "the list can't be read: left as it is");
+});
+
+test("G5-i (two intents): the cycle an intent kept is used whichever of two intents for the number is read first", async () => {
+  const gen = lib.DEFAULT_CONFIG_ID;
+  const mark = lib.eventMark(ev(5, "limit"));
+  const good = [`/docs/${lib.recordName("intent", TAG, 5, "bbbbbbbb")}`, JSON.stringify({ seqs: [5], marks: { 5: mark }, at: NOTE_NOW.getTime() - 10 * 60_000 })] as const;
+  const bad = [`/docs/${lib.recordName("intent", TAG, 5, "aaaaaaaa")}`, "{"] as const;
+  for (const order of [[bad, good], [good, bad]]) {
+    const files = new Map<string, string>([[`/docs/headroom-events-${TAG}-4`, ""], ...order.map(([k, v]) => [k, v] as [string, string])]);
+    const notifier = newNotifier();
+    notifier.delivered.set("five", { id: `headroom.${gen}.events.5.claude`, title: "t", body: "b", userInfo: { seqs: [5] } } as any);
+    await runWidget({ family: "medium", inApp: true, shortcut: "notify", files, notifier, now: NOTE_NOW,
+      responder: eventsAt({ last_seq: 7, oldest_seq: 6, events: [ev(6, "threshold", { threshold: 80, provider: "codex" }), ev(7, "reset")] }) });
+    assert.ok(notifier.log.some((n: any) => plain(n.userInfo.seqs).includes(7)), order[0] === bad ? "the corrupt one first" : "the good one first");
+  }
+});
+
+test("G2-g (a marker not saved, the older body kept): nothing is planned from the older body in the run that read the newer view", async () => {
+  const files = new Map<string, string>([[`/docs/headroom-events-${TAG}-3`, ""]]);
+  saveViewFile(files, { ...demoBody("reset", NOTE_NOW), data_version: 5 });
+  const notifier = newNotifier();
+  await runWidget({ family: "medium", inApp: true, shortcut: "notify", files, notifier, now: NOTE_NOW, response: { status: 200, body: emptyView(6) },
+    responder: eventsAt(feed(3, [])), writeFailsWhen: (p: string) => p.includes(`headroom-seen-${TAG}-6`) } as any);
+  assert.equal(notifier.log.length, 0, "no reminder from 5");
+  // the control: no newer view read, the saved 5 plans its reminder
+  const files2 = new Map<string, string>([[`/docs/headroom-events-${TAG}-3`, ""]]);
+  saveViewFile(files2, { ...demoBody("reset", NOTE_NOW), data_version: 5 });
+  const notifier2 = newNotifier();
+  await runWidget({ family: "medium", inApp: true, shortcut: "notify", files: files2, notifier: notifier2, now: NOTE_NOW, response: { status: 503, body: {} },
+    responder: eventsAt(feed(3, [])) } as any);
+  assert.equal(notifier2.pending.size, 1);
+});
+
+test("G2-h (one provider withdrawn): its reminder due within a minute is cancelled; the other provider's is kept", () => {
+  const gen = lib.DEFAULT_CONFIG_ID;
+  const c = NOTE_NOW.getTime() + 30_000;
+  const row = (provider: string) => ({ id: `headroom.${gen}.back.${provider}.all.${Math.round(c / 60_000)}.0123456789abcdef.0a0a0a0a`,
+    kind: "back", provider, window_id: "all", cycle: c, fire_at: c, set_at: 1, confirmed: true, from: 5 });
+  const codex = row("codex");
+  const claude = row("claude");
+  const r = plain(lib.reconcileReminders([codex, claude], [], NOTE_NOW, gen, new Set([codex.id, claude.id]), 8, new Set(["codex"])));
+  assert.deepEqual(r.cancel, [codex.id], "codex withdrawn: cancelled");
+  assert.ok(r.reminders.some((x: any) => x.id === claude.id), "claude's kept (it rings in a moment)");
+});
+
+test("G5-l (the list unreadable): a reminder being cancelled whose fate can't be told isn't planned again in that run", async () => {
+  const files = new Map<string, string>([[`/docs/headroom-events-${TAG}-3`, ""]]);
+  const notifier = newNotifier();
+  const body = { ...demoBody("reset", NOTE_NOW), data_version: 5 };
+  await notifyWith(files, notifier, { status: 200, body });
+  assert.equal(notifier.log.length, 1);
+  // left as being cancelled and gone from the device (cancelled, or it rang)
+  const path = `/docs/headroom-notify-${TAG}.json`;
+  const st = JSON.parse(files.get(path)!);
+  files.set(path, JSON.stringify({ ...st, reminders: st.reminders.map((r: any) => ({ ...r, cancelling: true })) }));
+  notifier.pending.clear();
+  // the delivered list can't be read for the check: nothing is planned again for it
+  await runWidget({ family: "medium", inApp: true, shortcut: "notify", files, notifier, now: NOTE_NOW, response: { status: 200, body },
+    responder: eventsAt(feed(3, [])), deliveredFailsOnCall: 1 } as any);
+  assert.equal(notifier.log.length, 1, "not scheduled again");
+  // readable and not delivered: the cancel went through, so it is planned again
+  await runWidget({ family: "medium", inApp: true, shortcut: "notify", files, notifier, now: NOTE_NOW, response: { status: 200, body },
+    responder: eventsAt(feed(3, [])) } as any);
+  assert.equal(notifier.log.length, 2);
 });

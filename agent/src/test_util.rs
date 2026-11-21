@@ -35,3 +35,9 @@ impl Drop for TempHome {
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }
+
+/// Makes the clock state of a test home trusted at epoch 1 (as the agent does on its first start), so values taken in there are used
+pub fn trust_clock(home: &Path) {
+    std::fs::create_dir_all(home).unwrap();
+    crate::clock::ensure_locked(home, || Ok(false)).unwrap();
+}

@@ -16,8 +16,9 @@ import { STOPPED_AFTER_MINUTES, type ProviderView, type SnapshotView, type Windo
 
 const MINUTE_MS = 60_000;
 /**
- * The same value from the same PC with a fetch time this close to the judged one is the same fetch (a resend, even if a fetch time
- * written by an earlier Worker was adjusted by its send delay)
+ * For a state judged before fetch times were kept as the PC sent them (no judged_exact): the same value from the same PC with a fetch
+ * time this close to the judged one is the same fetch (an earlier Worker adjusted fetch times by the send delay). A state judged since
+ * compares fetch times exactly, so a real new fetch within a minute with the same value is judged
  */
 const SAME_FETCH_MS = MINUTE_MS;
 
@@ -85,6 +86,11 @@ export interface EventBody {
   status_text: string;
   /** Collection stopped/resumed: last receive time from any PC */
   last_received_at: string | null;
+  /**
+   * The provider's history boundary stamp the event was judged under ("<accepted time>#<count>"; no account info). Clients tell an
+   * account's events apart from the next account's by it. null for events without a provider or judged without boundaries
+   */
+  boundary?: string | null;
 }
 
 export interface JudgedEvent {
@@ -113,6 +119,8 @@ export interface CycleState {
   judged_reset?: string | null;
   /** PC whose fetch was last judged (only a fetch from the same PC can be a resend of it) */
   judged_by?: string | null;
+  /** judged_at is the fetch time as the PC sent it (compared exactly). Absent in states judged by an earlier Worker */
+  judged_exact?: boolean;
 }
 
 export interface EventState {
@@ -216,7 +224,9 @@ export function judgeEvents(
     new Date(Math.max(at + EVENT_RETENTION_MS, (time(cycle) ?? 0) + 24 * 60 * MINUTE_MS)).toISOString();
   const events: JudgedEvent[] = [];
   /** Cycle-bound events are created only if not already created in that cycle */
-  const add = (key: string, visible: boolean, body: EventBody, cycle?: CycleState) => {
+  const add = (key: string, visible: boolean, judged: EventBody, cycle?: CycleState) => {
+    // The stamp given for this judgment (not one kept from an earlier one: an event judged without stamps says nothing about them)
+    const body: EventBody = { ...judged, boundary: judged.provider ? (o.boundaries as Partial<Record<ProviderId, string>>)[judged.provider] ?? null : null };
     if (cycle) {
       if (cycle.sent.includes(key)) return;
       cycle.sent.push(key);
@@ -383,13 +393,18 @@ export function judgeEvents(
       if (sameValue) {
         cycle.judged_at = w.fetched_at;
         cycle.judged_by = p.collector;
+        cycle.judged_exact = true;
         return;
       }
-    } else if (judged !== null && (fetched < judged || (samePc && fetched - judged <= SAME_FETCH_MS && sameValue))) return;
+    } else if (judged !== null) {
+      const sameFetch = samePc && sameValue && (cycle.judged_exact === true ? fetched === judged : fetched - judged <= SAME_FETCH_MS);
+      if (fetched < judged || sameFetch) return;
+    }
     cycle.judged_at = w.fetched_at;
     cycle.judged_used = w.used_percent;
     cycle.judged_reset = w.resets_at;
     cycle.judged_by = p.collector;
+    cycle.judged_exact = true;
 
     // Limit reached: when any window, overall or per-model / per-group, reaches 100%
     if (w.used_percent >= 100) {

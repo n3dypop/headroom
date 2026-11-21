@@ -21,9 +21,11 @@ import {
   judgeEvents,
   mergeSnapshots,
   toView,
+  SCHEMA_VERSION,
   type ProviderId,
+  type Snapshot,
 } from "../../core/src/index.ts";
-import { COLLECTOR_NAME, authenticate, parseTokens } from "./auth.ts";
+import { AGENT_PROTOCOL, COLLECTOR_NAME, authenticate, parseTokens } from "./auth.ts";
 import {
   BudgetDeadline,
   RESERVE,
@@ -39,6 +41,10 @@ import {
 import { sanitizeUpload, settleLimits, withoutUnstored, type CleanUpload } from "./sanitize.ts";
 import {
   ALL_VERSION,
+  databaseUsed,
+  loadPublicView,
+  metricsOf,
+  readGeneration,
   loadDerived,
   hasSnapshots,
   loadBoundaryStamps,
@@ -59,6 +65,7 @@ import {
   prune,
   pruneEvents,
   readDataVersion,
+  bumpAllVersion,
   rebuildEventFeed,
   recordEvents,
   saveDerived,
@@ -95,7 +102,8 @@ const MAX_BODY_BYTES = 1_000_000;
 const HISTORY_MS = (24 * 60 + 30) * 60_000;
 const PROVIDERS: readonly ProviderId[] = ["claude", "codex"];
 /** Derived-value format version. 2: added rate_pace */
-const METRICS_FORMAT = 2;
+// 3: recomputed after rows an earlier Worker accepted are held to today's rules (observations ahead of their receipt, markers)
+const METRICS_FORMAT = 3;
 
 function json(status: number, body: unknown): Response {
   return new Response(body === null ? null : JSON.stringify(body), {
@@ -147,12 +155,18 @@ async function publish(db: D1Like, env: Env): Promise<void> {
   const loaded = await loadSnapshots(db);
   const merged = mergeSnapshots(loaded.snapshots, { collectorPriority: priority(env) });
   if (!merged) {
-    // No PC's latest value is left (all past retention): the old merged value is not shown either (unless an upload put a new one)
+    // No PC's latest value is left that today's rules use (all past retention, or only rows from a clock it refuses): the merged value is
+    // withdrawn as an empty one under a new version, so an iPhone replaces what it saved (a missing value would read as "couldn't read",
+    // and the old one would stay and plan reminders). Once withdrawn, nothing more is written
     if (loaded.snapshots.length === 0) {
-      await db
-        .prepare("DELETE FROM public_state WHERE id = 1 AND version <= ? AND NOT EXISTS (SELECT 1 FROM collector_snapshots)")
-        .bind(version)
-        .run();
+      const row = await loadPublicRow(db);
+      if (row !== null && withdrawn(row.snapshot)) return;
+      // No row: either nothing was ever saved (left alone: "no value yet"), or an earlier Worker deleted it (the database was used)
+      if (row === null && !(await databaseUsed(db))) return;
+      // From the counter read before the PC rows: an upload since then puts its own value, which this must not replace
+      if (!(await bumpAllVersion(db, version))) return;
+      const base = row?.snapshot ?? { schema_version: SCHEMA_VERSION, generated_at: new Date(0).toISOString(), providers: {}, collectors: [] };
+      await savePublicState(db, { ...base, providers: {}, collectors: [] }, version + 1, stamps);
     }
     return;
   }
@@ -167,6 +181,8 @@ async function publish(db: D1Like, env: Env): Promise<void> {
  * The counter is read before computing, and a save loses to a computation with a newer counter
  */
 export async function refreshDerived(db: D1Like, env: Env, at: Date): Promise<void> {
+  // The generation before anything else this computation reads (a save across the cleanup is refused by it)
+  const generation = await readGeneration(db);
   const stored = await loadDerivedVersions(db);
   // Read boundaries before observations. If a boundary moves mid-computation, the stamp is saved stale and the next Cron recomputes
   const boundaries = await loadBoundaryStamps(db);
@@ -183,13 +199,13 @@ export async function refreshDerived(db: D1Like, env: Env, at: Date): Promise<vo
     // Include the derived-value format version in the basis (bump it when adding fields so old-format rows get recomputed)
     const basis = `${METRICS_FORMAT}:${JSON.stringify(p)}`;
     // Recompute if the counter advanced, it was computed under a different boundary, never computed, or the latest value differs from when computed
-    const stale = saved === undefined || saved.boundary !== stampOf(boundaries, id) || saved.basis !== basis;
+    const stale = saved === undefined || saved.generation !== generation || saved.boundary !== stampOf(boundaries, id) || saved.basis !== basis;
     if (version <= (saved?.version ?? 0) && !stale) continue;
     const times = p.windows.map((w) => Date.parse(w.fetched_at ?? "")).filter(Number.isFinite);
     const oldest = Math.min(at.getTime(), ...times);
     const observations = await loadObservations(db, id, new Date(oldest - HISTORY_MS));
     const metrics = computeMetrics(merged, observations, { collectorPriority: priority(env) }, [id])[id] ?? {};
-    await saveDerived(db, id, metrics, version, at, stampOf(boundaries, id), basis, row.version);
+    await saveDerived(db, id, metrics, version, at, stampOf(boundaries, id), basis, row.version, generation);
   }
 }
 
@@ -283,6 +299,9 @@ export async function handle(request: Request, env: Env, now: () => Date = () =>
 
   const token = await authenticate(request, parseTokens(env.TOKENS));
   if (!token) return problem(401, "unauthorized");
+  // Writes come only from agents of this protocol: an older agent's upload (one sent before an upgrade and arriving after it) is refused
+  // before D1 is touched, so the one-time cleanup can't be undone by it
+  if ((put || turn) && request.headers.get("headroom-protocol") !== AGENT_PROTOCOL) return json(426, { error: "agent_outdated" });
 
   const writer = put ?? turn;
   let collector = "";
@@ -325,7 +344,7 @@ export async function handle(request: Request, env: Env, now: () => Date = () =>
     if ("error" in upload) return problem(400, upload.error);
     const received = now();
     // A PC whose clock is off by more than the tolerance is refused before D1 is touched (its times would be taken as they are).
-    // The PC keeps its observations and shows the offset until its clock is fixed
+    // The PC drops its queued observations and latest values (stamped by the wrong clock) and shows the offset until its clock is fixed
     const offset = Date.parse(upload.snapshot.generated_at) - received.getTime();
     if (Math.abs(offset) > CLOCK_TOLERANCE_MS) return json(422, { error: "clock_skew", offset_s: Math.round(offset / 1000) });
     const result = await withinBudget(env, received, RESERVE.put, (db) => receive(db, env, upload, received), now);
@@ -345,12 +364,14 @@ export async function handle(request: Request, env: Env, now: () => Date = () =>
   if (url.pathname === "/v2/history") return readHistory(env.DB, url, now());
   const timeZone = url.searchParams.get("tz") ?? "Asia/Tokyo";
   if (url.pathname === "/v2/view" && !validTimeZone(timeZone)) return problem(400, "invalid_time_zone");
-  const row = await loadPublicRow(env.DB);
-  if (!row) return problem(404, "no_data");
+  // The public row and its derived values in one read (never a body of one moment with derived values of another)
+  const read = await loadPublicView(env.DB);
+  if (!read) return problem(404, "no_data");
+  const { row } = read;
   // Don't expose a provider's latest value not re-put after a boundary move. Use only derived values computed under the current boundary
   const { snapshot, stamps } = publicSnapshot(row);
   if (url.pathname === "/v2/snapshot") return json(200, snapshot);
-  const metrics = await loadDerived(env.DB, stamps);
+  const metrics = metricsOf(read.derived, stamps);
   // data_version: the counter of this latest-value row (advances on every save). Clients order responses by it (by the order of data read,
   // not response creation time, so a late old response doesn't revert a newer display)
   // boundaries: per-provider history boundary stamps (only accepted time and sequence number; no account info). Clients compare with
@@ -434,6 +455,7 @@ const WEEKLY_HOURS = 7 * 24 + 2;
  * nothing is read. When building, reads at most 170 hourly-aggregate rows per provider
  */
 export async function refreshWeekly(db: D1Like, at: Date): Promise<void> {
+  const generation = await readGeneration(db);
   const boundaries = await loadPublicBoundaries(db);
   if (!boundaries) return;
   const hour = at.toISOString().slice(0, 13);
@@ -447,7 +469,7 @@ export async function refreshWeekly(db: D1Like, at: Date): Promise<void> {
     const since = stamp.split("#")[0] ?? "";
     const fromHour = from.toISOString().slice(0, 13);
     const rows = await loadHourly(db, provider, "seven_day", fromHour, hour, since);
-    await saveWeekly(db, provider, hourlySeries(rows, new Date(`${fromHour}:00:00.000Z`)), stamp, hour, at);
+    await saveWeekly(db, provider, hourlySeries(rows, new Date(`${fromHour}:00:00.000Z`)), stamp, hour, at, generation);
   }
 }
 
@@ -491,6 +513,11 @@ export async function judge(db: D1Like, env: Env, at: Date): Promise<void> {
  * Re-puts the latest-value row if it lags the current save (global counter) and boundaries (an upload's re-put failed, a save after reading
  * prevented putting, or a pre-migration row). Aligns on the next Cron without another upload
  */
+/** A merged value withdrawn because no PC's latest value is left (an empty value) */
+function withdrawn(s: Snapshot): boolean {
+  return Object.keys(s.providers).length === 0;
+}
+
 export async function repairPublicState(db: D1Like, env: Env): Promise<void> {
   const version = await readDataVersion(db, ALL_VERSION);
   const current = await loadBoundaryStamps(db);
@@ -500,6 +527,24 @@ export async function repairPublicState(db: D1Like, env: Env): Promise<void> {
   const outdated = row !== null && JSON.stringify(settleLimits(withoutUnstored(row.snapshot))) !== JSON.stringify(row.snapshot);
   // A row left after every PC's latest value expired (also when an earlier Worker deleted them) is removed by publish
   if (row !== null && !(await hasSnapshots(db))) return publish(db, env);
-  if (row ? row.version === version && same(row.boundaries) && same(row.current) && !outdated : !(await hasSnapshots(db))) return;
-  await publish(db, env);
+  // Each put below is without an upload, under a new data version (so an iPhone holding the old one, or getting a slow response of
+  // it, takes it as newer), moved on from the counter read above: an upload meanwhile puts its own value instead
+  const putAgain = async () => {
+    if (await bumpAllVersion(db, version)) await publish(db, env);
+  };
+  // A put that lags the saves (an upload's re-put failed, or the upgrade cleanup withdrew the body below the counter): put again under
+  // a newer counter than the one read
+  if (row !== null && row.version !== version) return putAgain();
+  // Boundaries moved since the put (and no upload put it again)
+  if (row !== null && !(same(row.boundaries) && same(row.current))) return putAgain();
+  // No row: latest values saved but never put, or nothing left and an earlier Worker deleted the row (withdrawn by publish)
+  if (row === null) return (await hasSnapshots(db)) || (await databaseUsed(db)) ? putAgain() : undefined;
+  if (outdated) return putAgain();
+  // A row an earlier Worker merged under other rules (e.g. without today's clock and boundary checks): rebuilt when today's merge of
+  // the saved latest values differs (a few rows; no PC needs to be sending)
+  const loaded = await loadSnapshots(db);
+  const merged = mergeSnapshots(loaded.snapshots, { collectorPriority: priority(env) });
+  if (merged) for (const c of merged.collectors ?? []) c.received_at = loaded.received.get(c.id) ?? null;
+  if (merged === null && withdrawn(row.snapshot)) return;
+  if (JSON.stringify(merged) !== JSON.stringify(row.snapshot)) await putAgain();
 }

@@ -24,6 +24,7 @@ interface Options {
   blocked?: boolean | null;
   error?: "login_required" | "safety_stop" | "fetch_failed" | null;
   received?: number | null;
+  boundaries?: Record<string, string>;
 }
 
 function judge(windows: UsageWindow[], state: EventState, o: Options = {}) {
@@ -34,7 +35,7 @@ function judge(windows: UsageWindow[], state: EventState, o: Options = {}) {
   const received = o.received === undefined ? (o.now ?? 1) : o.received;
   snapshot.collectors = [{ id: "win", generated_at: at(0), received_at: received === null ? null : at(received) }];
   const view = toView(snapshot, now, { observations: o.observations ?? [] });
-  return judgeEvents(view, state, { last_received_at: view.last_received_at }, now);
+  return judgeEvents(view, state, { last_received_at: view.last_received_at }, now, o.boundaries ? { boundaries: o.boundaries } : undefined);
 }
 
 const visible = (events: JudgedEvent[]) => events.filter((e) => e.visible).map((e) => e.key);
@@ -149,9 +150,10 @@ test("collection stopped: once after 30 minutes without data from any PC, once o
 test("event body holds the values media use and the reliability label (no account information)", () => {
   const [event] = judge([session(85)], emptyEventState()).events;
   assert.deepEqual(Object.keys(event!.body).sort(), [
-    "blocked", "confidence", "confirmed", "cycle", "error_code", "eta_minutes", "kind", "label", "last_received_at",
+    "blocked", "boundary", "confidence", "confirmed", "cycle", "error_code", "eta_minutes", "kind", "label", "last_received_at",
     "provider", "resets_at", "scope", "status_text", "threshold", "used_percent", "window_id",
   ]);
+  assert.equal(event!.body.boundary, null, "judged without boundaries");
   assert.equal(event!.body.used_percent, 85);
   assert.equal(event!.body.label, "5h");
   assert.ok(Date.parse(event!.keep_until) >= base + 8 * 24 * 3_600_000);
@@ -303,10 +305,18 @@ test("after an account switch, the new account's threshold is notified exactly o
   assert.deepEqual(visible(judgeAt([session(83, 180, 15)], switched.state, 16, `${at(-30)}#1`).events), []);
 });
 
-test("a resend whose fetch time moved by seconds is the same fetch, even if the forecast changed", () => {
+test("a resend whose fetch time moved by seconds is the same fetch only in a state judged by an earlier Worker", () => {
   const first = judge([session(50, 180, 10)], emptyEventState(), { now: 11 });
-  const resend = judge([makeWindow("five_hour", 50, at(180), { fetched_at: new Date(Date.parse(at(10)) + 2_000).toISOString() })], first.state, { now: 12 });
+  assert.equal(first.state.cycles["claude.five_hour"]?.judged_exact, true);
+  const moved = makeWindow("five_hour", 50, at(180), { fetched_at: new Date(Date.parse(at(10)) + 2_000).toISOString() });
+  // A state of an earlier Worker (fetch times adjusted by the send delay): a second off is the same fetch
+  const { judged_exact: _exact, ...older } = first.state.cycles["claude.five_hour"]!;
+  const legacy: EventState = { ...first.state, cycles: { "claude.five_hour": older } };
+  const resend = judge([moved], legacy, { now: 12 });
   assert.equal(resend.state.cycles["claude.five_hour"]?.judged_at, first.state.cycles["claude.five_hour"]?.judged_at);
+  // The same fetch time is the same fetch in a current state too
+  const same = judge([session(50, 180, 10)], first.state, { now: 12 });
+  assert.equal(same.events.length, 0);
   assert.equal(first.state.cycles["claude.five_hour"]?.judged_by, "win");
   // A new fetch with a new value is judged
   const next = judge([session(85, 180, 15)], first.state, { now: 16 });
@@ -345,11 +355,36 @@ test("a state written before fetch times were placed in real time doesn't judge 
     used_percent: 30 + i * 5, observed_at: at(-60 + i * 5),
   }));
   const base = judge([session(90)], emptyEventState(), { observations: rows.slice(-1) });
-  const { judged_by: _, ...legacy } = { ...base.state.cycles["claude.five_hour"]!, judged_at: at(60) };
+  const { judged_by: _, judged_exact: _exact, ...legacy } = { ...base.state.cycles["claude.five_hour"]!, judged_at: at(60) };
   const state: EventState = { ...base.state, cycles: { "claude.five_hour": legacy } };
   const late = judge([session(90)], state, { observations: rows, now: 5 });
   assert.equal(late.events.filter((e) => e.body.kind === "soon").length, 0);
   // The same fetch takes the state over, so a real new fetch with the same value is judged like a current state
   assert.equal(late.state.cycles["claude.five_hour"]?.judged_by, "win");
   assert.equal(late.state.cycles["claude.five_hour"]?.judged_at, at(0));
+  assert.equal(late.state.cycles["claude.five_hour"]?.judged_exact, true);
+  // 30 seconds later the same PC fetches 90% again: judged (not taken for the same fetch)
+  const again = judge([makeWindow("five_hour", 90, at(180), { fetched_at: new Date(Date.parse(at(0)) + 30_000).toISOString() })], late.state, { observations: rows, now: 6 });
+  assert.notEqual(again.state.cycles["claude.five_hour"]?.judged_at, at(0));
+});
+
+test("in a current state, a real new fetch within a minute with the same value is judged (its forecast can warn)", () => {
+  // 90% judged first with too little history for a forecast
+  const first = judge([session(90, 15, 0)], emptyEventState(), { now: 1 });
+  const cycle = first.state.cycles["claude.five_hour"]!;
+  assert.equal(cycle.judged_exact, true);
+  // 30 seconds later the same PC fetches 90% again; the change of judged_at shows it was judged, not skipped
+  const again = judge([makeWindow("five_hour", 90, at(15), { fetched_at: new Date(Date.parse(at(0)) + 30_000).toISOString() })], first.state, { now: 2 });
+  assert.notEqual(again.state.cycles["claude.five_hour"]?.judged_at, cycle.judged_at);
+});
+
+test("an event carries the boundary stamp it was judged under (no account information, only the accepted time and count)", () => {
+  const [event] = judge([session(85)], emptyEventState(), { boundaries: { claude: "2026-11-19T10:00:00.000Z#2", codex: "#0" } }).events;
+  assert.equal(event!.body.boundary, "2026-11-19T10:00:00.000Z#2");
+});
+
+test("an event judged without stamps carries none, even if the state kept one", () => {
+  const first = judge([session(85)], emptyEventState(), { boundaries: { claude: "2026-11-19T10:00:00.000Z#2", codex: "#0" } });
+  const [event] = judge([session(96)], first.state).events;
+  assert.equal(event!.body.boundary, null);
 });
