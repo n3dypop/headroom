@@ -2,7 +2,13 @@ import { RESET_TOLERANCE_MS, preferCollector, simultaneousMs, type CollectorSele
 import type { UsageObservation, UsageWindow, WindowKind } from "./schema.ts";
 
 const MINUTE_MS = 60_000;
-const MAX_GAP = 15;
+/**
+ * Longest gap (minutes) between observations of one cycle still taken as continuous: fetches every 15 minutes (jittered up to 18) are
+ * stretched to 60 (72 with the jitter) while nothing changes, plus a margin for a start. A longer gap is a stop (the PC was off)
+ */
+const MAX_GAP = 75;
+/** How far (minutes) the observation nearest the start of the recent span may be from it for the consumption to be exact */
+const EXACT_START = 20;
 const MIN_RATE = 0.01;
 
 export type RecentQuality = "exact" | "approx" | "unknown";
@@ -94,7 +100,7 @@ function recentConsumption(
     if (point.at >= start) firstInRange ??= point;
     const distance = Math.abs(point.at - start);
     // On a tie in distance take the later observation, so consumption isn't overstated.
-    if (distance <= MAX_GAP * MINUTE_MS && (!nearest || distance <= Math.abs(nearest.at - start))) {
+    if (distance <= EXACT_START * MINUTE_MS && (!nearest || distance <= Math.abs(nearest.at - start))) {
       nearest = point;
     }
   }

@@ -246,19 +246,23 @@ The agent reads its settings when it starts, so write them before you install it
    [claude]
    enabled = true
    claude_bin = ""                   # empty: find claude on PATH
-   interval_min = 5                  # how often to run /usage (does not use quota)
+   # interval_min = 15               # minutes between /usage runs (does not use quota); 15 when left out, never under 10
 
    [codex]
    enabled = true
    codex_bin = ""                    # empty: config, then HEADROOM_CODEX_BIN, then PATH, then the default location
-   interval_min = 5
 
    [schedule]
-   idle_interval_min = 10            # stretch the interval up to this when nothing changed for 30 minutes
-   own_fetch_min = 60                # longest wait for another PC's turn before fetching on this PC
+   idle_interval_min = 30            # the interval while nothing changed for 30 minutes
+   idle_long_interval_min = 60       # ... and for 2 hours
+   own_fetch_min = 120               # this PC asks for a fetch of its own after this long without one
    ```
 
-   When several PCs are on, they take turns fetching through the server, so the same values are not fetched twice. A PC that stops with `headroom stop` hands its turn back. Another PC takes over when its own next fetch is due: a PC told to wait asks again within one fetch interval plus 2 minutes, however long the turn was held for. A PC that shuts down without `headroom stop` keeps the turn until it runs out, which can take up to an hour while a limit is reached.
+   Each fetch is planned one interval after the last, with a ±20 % jitter (PCs don't fetch at the same moment). While the statusLine brings fresh values, the next fetch waits for them, up to an hour. Values from `interval_min = 5` in an earlier config are read as 10.
+
+   When several PCs are on, they take turns fetching through the server, so the same values are not fetched twice. With `[push]` set, a PC fetches only when the server says it may, also right after a start, for its own fetch and for `headroom collect`; if the server can't be reached, it waits and asks again a few minutes later. A PC that stops with `headroom stop` hands its turn back. Another PC takes over when its own next fetch is due: a PC told to wait asks again within the longest jittered interval plus 3 minutes. A PC that hasn't fetched for `own_fetch_min` asks for a fetch of its own, which passes another PC's turn (one PC at a time).
+
+   If a service answers that it is rate limiting the fetches, every PC waits (30, 60, 120, then 240 minutes, or longer if the service says so). If it denies access, every PC stops fetching that provider until you resume it (see 5).
 
 2. **Store the PC's write token.**
    - It goes to the OS credential store (Windows Credential Manager or the macOS Keychain). It is never written to a file or shown on screen.
@@ -305,7 +309,7 @@ To confirm it works, run `headroom status`. The "Push" line shows the result of 
 
 ### 2.6 Optional: Claude Code statusLine
 
-With the statusLine, values arrive while you use Claude Code instead of every 5 minutes. Use the line that `install` printed, or add it to `~/.claude/settings.json` yourself. Quote the path, because a home folder may contain spaces:
+With the statusLine, values arrive while you use Claude Code, between the agent's fetches. Use the line that `install` printed, or add it to `~/.claude/settings.json` yourself. Quote the path, because a home folder may contain spaces:
 
 ```json
 { "statusLine": { "type": "command", "command": "\"C:/Users/<you>/.headroom/bin/headroom.exe\" statusline" } }
@@ -318,8 +322,12 @@ On macOS, the path is `/Users/<you>/.headroom/bin/headroom`. These examples assu
 | Command | What it does |
 |---|---|
 | `headroom status` | Shows the last results, the next fetch, the agent state and the send state |
-| `headroom collect [--provider claude\|codex] [--force] [--accept-account]` | Fetches once and prints the snapshot. `--force` resumes after a safety stop. `--accept-account` resumes after an account switch (use it with `--provider`) |
-| `headroom start` / `headroom stop` | Starts the agent, or stops it at the next safe point |
+| `headroom collect [--provider claude\|codex\|gemini] [--force] [--accept-account \| --same-account]` | Asks the background agent to fetch once, when its plan and the server allow it, and prints the agent's values afterwards. The agent must be running (start it with `headroom start`); the command waits up to 2 minutes in all. `--force` fetches now, also after a safety stop, but still not past another PC's fetch in progress, a rate limit or an access denial. `--accept-account` resumes after an account switch. `--same-account` (Gemini) resumes after a change of limits of the same account. Use both with `--provider`; only the switch `headroom status` showed when you ran the command is accepted. The command exits with 1 when something it asked for wasn't done |
+| `headroom collect --provider <name> --resume-access <stop> [--force]` | After an access denial: tries once to fetch again, for the stop that `headroom status` names. Add `--force` when a safety stop shows too. Exits with 0 only when the stop ended |
+| `headroom collect --provider <name> ... --replace <attempt>` | With `--force` or `--resume-access`: replaces the fetch attempt whose result couldn't be checked, as `headroom status` names it (only that attempt, and only 5 minutes after it began) |
+| `headroom collect --result <request>` | Shows what a collect the agent was still doing when the command stopped waiting did (the command names the request). Results are kept for a day |
+| `headroom collect --reset-fetch-state` | Starts the fetch state (`schedule-plan.json`) anew when it can't be read on a PC without `[push]` (with the agent stopped) |
+| `headroom start` / `headroom stop` | Starts the agent (reported once it is up), or stops it at the next safe point. A stop that can't wait for a long fetch stays: the agent stops once that fetch ends, and an agent started later isn't stopped by it |
 | `headroom install` / `headroom uninstall` | Registers and starts the agent, or stops and unregisters it |
 | `headroom credentials set` / `headroom credentials clear` | Stores or deletes the Worker token |
 | `headroom statusline [--then "<cmd>"]` | Command for the Claude Code statusLine |
@@ -399,6 +407,8 @@ If the widget can't schedule notifications on your iPhone, use a Shortcuts autom
   1. Apply new migrations with `npx wrangler d1 migrations apply headroom --remote -c wrangler.prod.toml`.
   2. Deploy with `npx wrangler deploy -c wrangler.prod.toml`.
 
+  A server and agents of different protocols refuse each other (426): an older agent stops sending and fetching until it is updated, and a newer agent facing an older server waits and checks again hourly. Update the server first, then every PC.
+
   Apply migrations before deploying. **Exception:** a migration that only drops a table is applied **after** deploying that Worker; its header comment says so.
 - **Planned stop** (when a release or a migration's header asks for it, so nothing an older Worker accepted is sent again):
   1. On every PC: stop the agent with the installed version (`headroom stop`). Then, with the `headroom` of the **new, extracted package** (not installed yet; the old version has no such command), run `headroom discard-queue` and check that `headroom status` shows `Push: 0 unsent observations`. A PC that is asleep is handled the same way before it sends again.
@@ -421,7 +431,11 @@ If the widget can't schedule notifications on your iPhone, use a Shortcuts autom
 - **Claude `last error unsupported_cli`:** the `claude` the agent found is older than 2.1.325, or its version could not be read, so the agent does not run `/usage`. Update the CLI (see 2.1; with Homebrew, use `claude-code@latest`), then run `headroom stop` and `headroom start`.
 - **`Push: ... last result Cannot connect to the destination`:** the agent could not reach the URL in `config.toml`. Check that `curl -i <url>/v2/view` returns 401. Fix the URL if needed, then restart the agent.
 - **`Push: ... last result The destination rejected the credentials (401, 403)`:** the server refused this PC's token. Check that this PC's write token is in `TOKENS`, that `credentials set` stored this PC's token, and that `collector_id` matches the name you created the token for.
-- **`next check ... (another PC holds the fetch turn; checks again then)`:** another PC is fetching the same values, so this PC waits and decides again at that time. Its own values in `snapshot.json` can look old; the widget shows the values the server merges from all PCs. `own_fetch_min` caps how long this PC waits: after that, it fetches without asking for the turn (unless its own retry backoff or a safety stop holds it).
+- **`next check ... (another PC holds the fetch turn; checks again then)`:** another PC is fetching the same values, so this PC waits and decides again at that time. Its own values in `snapshot.json` can look old; the widget shows the values the server merges from all PCs. After `own_fetch_min`, this PC asks for a fetch of its own (still not past a rate limit, an access denial or another fetch in progress).
+- **`next check ... (couldn't ask the destination for the fetch turn; asks again then)`:** with `[push]` set, the agent fetches only when the server says it may. Check the URL, the token and the send result; if the server is older than the agent, update it.
+- **`next check ... (rate limited by the service; every PC waits until then)`:** a service answered that the fetches were too frequent. Every PC waits; nothing needs to be done.
+- **`none (access denied by the service; ...)`, or the widget shows `Access denied`:** a service denied access, so every PC stopped fetching that provider. Check the account (sign in again with its CLI if needed). Then, on one PC, run the command that `headroom status` shows (`headroom collect --provider <name> --resume-access <stop>`). It tries once; on success every PC fetches again. If the stop changed meanwhile (another denial), nothing is tried: check again and use the new number. If a safety stop shows too, add `--force` to the same command.
+- **`none (the last fetch's result couldn't be checked; ...)`:** a fetch stopped before its result was checked (the PC slept or the agent was stopped), so whether it was refused can't be told; every PC waits for it. Check `headroom status`. After 5 minutes, run the command it shows on that PC (`headroom collect --provider <name> --force --replace <attempt>`). Another attempt ID replaces nothing.
 - **Widget shows `Check your credentials`:** the read token is wrong or was revoked.
 - **Widget shows `Can't reach the server`:** check the URL, or `ALLOWED_HOST` on the server.
 - **No notifications:** check that notifications are allowed for Scriptable, that exactly one widget has `notify`, and the last check time under **Notifications** in the app menu. After the server's database is recreated, choose **Settings** > **Reset saved data**.

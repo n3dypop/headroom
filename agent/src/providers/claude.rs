@@ -28,12 +28,12 @@ use crate::schema::{
     ErrorCode, ProviderSnapshot, ProviderStatus, UsageWindow, known_scope, known_window,
     make_window,
 };
-use crate::statusline::{capture_at, read_capture_in};
+use crate::statusline::{capture_at, raise_claude_gen, read_capture_since};
 use crate::store::{Logger, backoff_ms, fnv1a_hex, read_json, write_json_atomic};
 use crate::time::{MINUTE_MS, iso_from_ms};
 
-/// Values older than this are stale (judged at collection time; the display side re-judges with freshnessOf)
-pub const STALE_AFTER_MS: i64 = 15 * MINUTE_MS;
+/// Values older than this are stale (judged at collection time; the display side re-judges with freshnessOf). 20 minutes
+pub const STALE_AFTER_MS: i64 = 20 * MINUTE_MS;
 const USAGE_TIMEOUT: Duration = Duration::from_secs(60);
 const AUTH_TIMEOUT: Duration = Duration::from_secs(15);
 /// Max wait for the state-file lock (the other process's /usage run time plus margin)
@@ -91,6 +91,11 @@ pub enum Diag {
     PolicyUnknown,
     /// `claude auth status` doesn't confirm a claude.ai subscription sign-in (unknown `authMethod`). /usage is not run
     AuthUnknown,
+    /// The service denies this account (on hold, or not allowed: a 403), shown by a run that confirmed zero use
+    AccessDenied,
+    /// The service denies this account, shown by a run whose zero use can't be confirmed: both stops (the shared one and the
+    /// safety stop)
+    AccessDeniedUnverified,
 }
 
 impl Diag {
@@ -150,6 +155,12 @@ impl Diag {
             Diag::ManagedPolicy => {
                 "Not running /usage: with organization managed settings or an organization plan (Team / Enterprise), zero quota use can't be guaranteed (only statusLine values are used)"
             }
+            Diag::AccessDenied => {
+                "The service denied access to this Claude account (on hold, or not allowed). Fetching stopped on every PC: check the account, then run the command headroom status shows"
+            }
+            Diag::AccessDeniedUnverified => {
+                "Auto-fetch stopped: the service denied access to this Claude account, and zero quota use couldn't be confirmed. Check the account, then run the command headroom status shows (with --force)"
+            }
         }
     }
 
@@ -172,7 +183,9 @@ impl Diag {
             | Diag::NotLocal
             | Diag::Interrupted
             | Diag::StateUnreadable
-            | Diag::ManagedPolicy => ErrorCode::SafetyStop,
+            | Diag::ManagedPolicy
+            | Diag::AccessDeniedUnverified => ErrorCode::SafetyStop,
+            Diag::AccessDenied => ErrorCode::AccessDenied,
             Diag::AccountChanged => ErrorCode::AccountChanged,
             _ => ErrorCode::FetchFailed,
         }
@@ -213,12 +226,20 @@ pub struct ClaudeState {
     /// Result of the last successful `/usage`
     pub last_ok: Option<Observation>,
     pub failures: u32,
+    /// The last attempt, also one that never launched (the backoff counts from it)
     pub last_attempt_ms: i64,
+    /// The last /usage launched (a query that may have gone upstream; 0 = none known). The common schedule compares passive values
+    /// with it: an attempt that never launched replaced nothing
+    pub last_query_ms: i64,
     pub last_error: Option<Diag>,
     /// Hash of accountUuid + organizationUuid (the values themselves are not stored)
     pub account_hash: Option<String>,
     /// statusLine captures older than this are ignored (account switch / sign-out)
     pub account_switched_ms: i64,
+    /// Counts the account switches found (pending_switch): an acceptance is made only for the one the user saw
+    pub switch_seq: u64,
+    /// The statusLine acceptance generation this state was last accepted in: a record of one before isn't used
+    pub accept_gen: u64,
     /// Auto-fetch is stopped because it couldn't be confirmed that no quota was consumed
     pub guard_tripped: bool,
     /// Result of `claude auth status` (no email address or organization ID kept)
@@ -234,6 +255,10 @@ pub struct ClaudeState {
     pub account_changed: bool,
     /// When an account switch was last accepted (0 = never). Used as the history boundary on the server
     pub account_accepted_ms: i64,
+    /// The state was started again because it couldn't be read: no statusLine record from before is used, and the next
+    /// identification starts a new history (a boundary), as whose history it continues can't be told
+    #[serde(default)]
+    pub recover_identity: bool,
     /// Organization managed settings or an organization plan were found (/usage is not run, even with --force)
     pub managed_policy: bool,
     /// The latest `claude auth status` was readable. If not, /usage is not run and auth is rechecked at the next fetch opportunity
@@ -269,6 +294,7 @@ fn state_from(read: std::io::Result<Vec<u8>>) -> ClaudeState {
     let unreadable = ClaudeState {
         guard_tripped: true,
         last_error: Some(Diag::StateUnreadable),
+        recover_identity: true,
         ..initial.clone()
     };
     let v = match read {
@@ -280,7 +306,12 @@ fn state_from(read: std::io::Result<Vec<u8>>) -> ClaudeState {
         },
     };
     // A stop flag that is present but not a boolean (or a marker that is not a number) is treated as "stopped"
-    let flag_ok = |k: &str| v.get(k).is_none_or(Value::is_boolean);
+    // A state of this version always carries its safety stop: one without it can't say it isn't stopped
+    let current = v["state_version"].as_u64() == Some(STATE_VERSION as u64);
+    let flag_ok = |k: &str| match v.get(k) {
+        None => !(current && k == "guard_tripped"),
+        Some(x) => x.is_boolean(),
+    };
     let flags_ok = ["guard_tripped", "account_changed", "managed_policy"]
         .iter()
         .all(|k| flag_ok(k))
@@ -298,6 +329,7 @@ fn state_from(read: std::io::Result<Vec<u8>>) -> ClaudeState {
             .as_u64()
             .map_or(0, |n| n.min(u32::MAX as u64) as u32),
         last_attempt_ms: i("last_attempt_ms"),
+        last_query_ms: i("last_query_ms"),
         // Drop the old free-text last_error (it may contain CLI text)
         last_error: if flags_ok {
             from(&v, "last_error")
@@ -306,6 +338,8 @@ fn state_from(read: std::io::Result<Vec<u8>>) -> ClaudeState {
         },
         account_hash: v["account_hash"].as_str().map(str::to_string),
         account_switched_ms: i("account_switched_ms"),
+        switch_seq: v["switch_seq"].as_u64().unwrap_or(0),
+        accept_gen: v["accept_gen"].as_u64().unwrap_or(0),
         guard_tripped: v["guard_tripped"].as_bool().unwrap_or(false) || !flags_ok,
         account: from(&v, "account"),
         last_auth_ms: i("last_auth_ms"),
@@ -314,6 +348,7 @@ fn state_from(read: std::io::Result<Vec<u8>>) -> ClaudeState {
         usage_in_flight_ms: v["usage_in_flight_ms"].as_i64(),
         account_changed: v["account_changed"].as_bool().unwrap_or(false),
         account_accepted_ms: i("account_accepted_ms"),
+        recover_identity: v["recover_identity"].as_bool().unwrap_or(false) || !flags_ok,
         managed_policy: v["managed_policy"].as_bool().unwrap_or(false),
         auth_verified: v["auth_verified"].as_bool().unwrap_or(false),
         capture_ahead_ms: v["capture_ahead_ms"].as_i64(),
@@ -328,24 +363,36 @@ pub trait ClaudeCli: Send {
     fn version(&mut self) -> Result<String, Diag>;
     fn auth_status(&mut self) -> Result<AccountInfo, Diag>;
     fn usage(&mut self, cwd: &Path) -> Result<String, UsageError>;
+    /// What the next usage call needs found first (the executable), done before the go's last check: between that check and the
+    /// launch, nothing but the launch. Default: nothing
+    fn prepare_usage(&mut self) {}
     /// Whether this PC has organization managed settings (files / policies). Contents are not read
     fn managed_settings(&mut self) -> Managed;
 }
 
 pub struct RealCli {
     bin: String,
+    /// The executable found by prepare_usage, for the next usage call only
+    prepared: Option<Option<PathBuf>>,
 }
 
 impl RealCli {
     pub fn new(bin: String) -> Self {
-        Self { bin }
+        Self {
+            bin,
+            prepared: None,
+        }
     }
 
     fn command(&self) -> Result<Command, Diag> {
         let path = resolve_bin(&self.bin).ok_or(Diag::CliNotFound)?;
+        Ok(Self::command_at(&path))
+    }
+
+    fn command_at(path: &Path) -> Command {
         let mut cmd = background_command(&path.to_string_lossy());
         strip_host_env(&mut cmd);
-        Ok(cmd)
+        cmd
     }
 }
 
@@ -386,11 +433,19 @@ impl ClaudeCli for RealCli {
         managed_settings_state()
     }
 
+    fn prepare_usage(&mut self) {
+        self.prepared = Some(resolve_bin(&self.bin));
+    }
+
     fn usage(&mut self, cwd: &Path) -> Result<String, UsageError> {
-        std::fs::create_dir_all(cwd).map_err(|_| UsageError::Retry(Diag::CliStartFailed))?;
-        let mut cmd = self.command().map_err(UsageError::Retry)?;
+        // The working folder and the executable were found before the go's last check: nothing more but the launch here (a folder
+        // that isn't there fails the launch)
+        let mut cmd = match self.prepared.take() {
+            Some(found) => Self::command_at(&found.ok_or(UsageError::Retry(Diag::CliNotFound))?),
+            None => self.command().map_err(UsageError::Retry)?,
+        };
         cmd.args(usage_args()).current_dir(cwd);
-        classify_usage_output(run_with_timeout(cmd, USAGE_TIMEOUT))
+        classify_usage_run(run_capturing(cmd, USAGE_TIMEOUT))
     }
 }
 
@@ -427,9 +482,24 @@ pub struct ClaudeProvider {
     log: Logger,
     pub state: ClaudeState,
     claude_json: PathBuf,
+    /// The account this process identified last (in memory: a state read back that doesn't know it reads .claude.json again)
+    identified_hash: Option<String>,
+    /// The state file couldn't be read: when it is read again (nothing is due before)
+    state_retry_at: Option<i64>,
     claude_json_mtime: Option<SystemTime>,
     plan: Option<String>,
     capture: Option<(i64, Vec<UsageWindow>)>,
+    /// What the last collect did upstream (take_run)
+    run: Option<super::Run>,
+    /// The go this collect was allowed by: its time limit (this PC's clock) and when it was given (monotonic). Past either, the query
+    /// isn't started (the destination may have replaced the go)
+    fetch_deadline: Option<super::Grant>,
+    /// The user's explicit go past a safety stop, for the next collect only
+    safety_confirmed: bool,
+    /// The switch the next acceptance is for (the mark pending_switch gave when the user asked)
+    accept_target: Option<i64>,
+    /// This collect only takes the statusLine record (take_passive): no CLI is started
+    passive_only: bool,
     capture_dirty: bool,
     tz: TimeZone,
     cli: Box<dyn ClaudeCli>,
@@ -461,9 +531,16 @@ impl ClaudeProvider {
             log,
             state: load_state(&home.join(STATE_FILE)),
             claude_json: home.join("nonexistent-claude.json"),
+            identified_hash: None,
+            state_retry_at: None,
             claude_json_mtime: None,
             plan: None,
             capture: None,
+            run: None,
+            passive_only: false,
+            fetch_deadline: None,
+            safety_confirmed: false,
+            accept_target: None,
             capture_dirty: true,
             tz: TimeZone::system(),
             cli,
@@ -561,6 +638,17 @@ impl ClaudeProvider {
         self.capture = None;
     }
 
+    /// The account .claude.json shows now, read whatever its time (None: it can't be read, or names no account)
+    fn current_account_hash(&self) -> Option<String> {
+        let v = read_json::<Value>(&self.claude_json)?;
+        let acct = &v["oauthAccount"];
+        let uuid = acct["accountUuid"].as_str()?;
+        Some(fnv1a_hex(&[
+            uuid,
+            acct["organizationUuid"].as_str().unwrap_or(""),
+        ]))
+    }
+
     /// Read .claude.json only when it changed, to detect account switches and infer the plan.
     fn refresh_account(&mut self, now: i64) {
         let mtime = std::fs::metadata(&self.claude_json)
@@ -569,7 +657,6 @@ impl ClaudeProvider {
         if mtime.is_none() || mtime == self.claude_json_mtime {
             return;
         }
-        self.claude_json_mtime = mtime;
         let Some(v) = read_json::<Value>(&self.claude_json) else {
             return;
         };
@@ -577,7 +664,14 @@ impl ClaudeProvider {
         let Some(uuid) = acct["accountUuid"].as_str() else {
             return;
         };
+        self.claude_json_mtime = mtime;
         let hash = fnv1a_hex(&[uuid, acct["organizationUuid"].as_str().unwrap_or("")]);
+        // Identified again after the state was lost: a new history starts here
+        if self.state.account_hash.is_none() && std::mem::take(&mut self.state.recover_identity) {
+            self.state.account_accepted_ms = now;
+            self.state.account_switched_ms = self.state.account_switched_ms.max(now);
+            self.log.log("claude: identified the account again after the state was lost; a new history starts");
+        }
         if self
             .state
             .account_hash
@@ -589,10 +683,12 @@ impl ClaudeProvider {
             self.state.last_auth_ms = 0;
             // A single account is assumed. Stop until manually resumed so another account's values don't mix into history
             self.state.account_changed = true;
+            self.state.switch_seq = self.state.switch_seq.wrapping_add(1);
             self.state.last_error = Some(Diag::AccountChanged);
             self.log_diag("account", Diag::AccountChanged);
         }
         self.state.account_hash = Some(hash);
+        self.identified_hash = self.state.account_hash.clone();
         self.plan = [
             "userRateLimitTier",
             "organizationRateLimitTier",
@@ -714,7 +810,13 @@ impl ClaudeProvider {
         }
     }
 
+    /// Whether the go this collect was allowed by is no longer to be used (`now`: read after the state lock was waited for)
+    fn deadline_passed(&self, now: i64) -> bool {
+        self.fetch_deadline.is_some_and(|g| g.passed(now))
+    }
+
     fn fetch_usage(&mut self, now: i64) {
+        let before = self.state.last_attempt_ms;
         self.state.last_attempt_ms = now;
         // Save "in flight" before launching. If it can't be saved, don't launch
         self.state.usage_in_flight_ms = Some(now);
@@ -725,15 +827,33 @@ impl ClaudeProvider {
             self.log_diag("usage", Diag::StateWriteFailed);
             return;
         }
+        let _ = std::fs::create_dir_all(self.home.join("claude-cwd"));
+        self.cli.prepare_usage();
+        // The go checked again right before the launch, after the save (a sleep while saving): past it, nothing is launched
+        let launch_now = self.clock.map_or(now, |clock| clock());
+        if self.deadline_passed(launch_now) {
+            self.state.usage_in_flight_ms = None;
+            self.state.last_attempt_ms = before;
+            let _ = write_json_atomic(&self.home.join(STATE_FILE), &self.state);
+            self.log.log(
+                "claude: the fetch turn came too long ago; not fetched (asked again next round)",
+            );
+            return;
+        }
         let cwd = self.home.join("claude-cwd");
         let tz = self.tz.clone();
+        // From here the query may run: its outcome is unknown until checked below
+        self.run = Some(super::Run::Unknown);
+        let query_before = self.state.last_query_ms;
+        self.state.last_query_ms = now;
         let result = self.cli.usage(&cwd).and_then(|text| {
             let lower = text.to_ascii_lowercase();
-            if lower.contains("last-known usage") {
-                return Err(UsageError::Retry(Diag::LastKnownUsage));
-            }
+            // Rate limited also when the last-known values are shown with it (they aren't a new observation either way)
             if lower.contains("rate limited") {
                 return Err(UsageError::Retry(Diag::RateLimited));
+            }
+            if lower.contains("last-known usage") {
+                return Err(UsageError::Retry(Diag::LastKnownUsage));
             }
             let windows = parse_usage_text(&text, now, &tz);
             if windows.is_empty() {
@@ -744,6 +864,43 @@ impl ClaudeProvider {
         });
         // The result was checked (failed to launch, confirmed zero use, or safety-stopped), so clear the marker
         self.state.usage_in_flight_ms = None;
+        // A safety stop leaves the outcome unknown
+        self.run = Some(match &result {
+            Ok(_) => super::Run::Ran(super::Outcome::Ok),
+            Err(UsageError::Retry(Diag::CliNotFound | Diag::CliStartFailed)) => {
+                // Never launched: not a query (the backoff still counts the attempt)
+                self.state.last_query_ms = query_before;
+                super::Run::NotRun
+            }
+            Err(UsageError::Retry(Diag::RateLimited)) => {
+                super::Run::Ran(super::Outcome::RateLimited { retry_ms: None })
+            }
+            // The service denied the account: shared with every PC (also beside a safety stop)
+            Err(UsageError::Retry(Diag::AccessDenied))
+            | Err(UsageError::Stop(Diag::AccessDeniedUnverified)) => {
+                super::Run::Ran(super::Outcome::AccessDenied)
+            }
+            Err(UsageError::Retry(_)) => super::Run::Ran(super::Outcome::Failed),
+            Err(UsageError::Stop(_)) => super::Run::Unknown,
+        });
+        // Used only in the clock epoch it started in and for the account it started with (read again now)
+        let account_before = self.state.account_hash.clone();
+        let same_epoch = crate::clock::usable_epoch(&self.home) == self.epoch;
+        if result.is_ok() && same_epoch {
+            self.refresh_account(now);
+        }
+        // An account known before is read again now, whatever the file's time: one that can't be read (gone, or naming no account)
+        // isn't the one the fetch started with
+        let same_account = !self.state.account_changed
+            && self.state.account_hash == account_before
+            && (account_before.is_none() || self.current_account_hash() == account_before);
+        if result.is_ok() && !(same_epoch && same_account) {
+            self.run = Some(super::Run::Ran(super::Outcome::Failed));
+            self.log.log(
+                "claude: the clock state or the account changed during the fetch: its result isn't used",
+            );
+            return;
+        }
         match result {
             Ok(windows) => {
                 self.state.last_ok = Some(Observation {
@@ -853,7 +1010,8 @@ impl ClaudeProvider {
             };
         };
         let age = now - fetched;
-        let fresh = age <= STALE_AFTER_MS;
+        // After a rate limit (429), the values before are shown as old, with their own time
+        let fresh = age <= STALE_AFTER_MS && self.state.last_error != Some(Diag::RateLimited);
         // Only "blocked" when the overall limit (scope: null) is maxed out. Per-model limits don't count
         let blocked = windows
             .iter()
@@ -889,14 +1047,27 @@ impl Provider for ClaudeProvider {
     }
 
     fn next_due_ms(&self, now: i64) -> i64 {
-        if self.capture_dirty {
+        // A state that couldn't be read is read again a minute on: nothing is due before
+        if let Some(at) = self.state_retry_at.filter(|&at| at > now) {
+            return at;
+        }
+        // A record written is taken at once, unless turned off (nothing is taken then)
+        if self.capture_dirty && self.cfg.enabled {
             return now;
         }
         self.usage_due_ms(now).min(self.cli_check_due_ms(now))
     }
 
     fn collect(&mut self, now: i64, force: bool) -> ProviderSnapshot {
+        self.run = Some(super::Run::NotRun);
+        // Asked for this collect only, and taken before anything can end it early: an acceptance never waits for a later one, and
+        // one this collect doesn't make is reported as not made
+        let asked = std::mem::take(&mut self.accept_account_pending);
+        let target = self.accept_target.take();
+        let confirmed = std::mem::take(&mut self.safety_confirmed);
+        self.accepted = asked.then_some(false);
         if !self.cfg.enabled {
+            self.capture_dirty = false;
             return ProviderSnapshot::empty(
                 ProviderStatus::Unavailable,
                 "Disabled in config",
@@ -911,7 +1082,41 @@ impl Provider for ClaudeProvider {
             return self.build(now);
         };
         let state_path = self.home.join(STATE_FILE);
-        self.state = load_state(&state_path);
+        let state_gone = !state_path.exists();
+        let Some(state) = read_state(&state_path) else {
+            // Read again a minute on (said once until it can be read): a record waiting is taken then
+            if self.state_retry_at.is_none() {
+                self.log
+                    .log("claude: skipped this round: the state file couldn't be read (read again every minute)");
+            }
+            self.state_retry_at = Some(self.clock.map_or(now, |clock| clock()) + MINUTE_MS);
+            return self.build(now);
+        };
+        self.state_retry_at = None;
+        self.state = state;
+        // A state that is gone starts again knowing the account it knew (another one seen is a switch)
+        if state_gone && self.state.account_hash.is_none() {
+            self.state.account_hash = crate::store::known_account(&self.home, "claude");
+            self.identified_hash = self.state.account_hash.clone();
+        }
+        // A generation file broken since the last acceptance is written again with this state's
+        if crate::statusline::repair_claude_gen(&self.home, self.state.accept_gen) {
+            self.log
+                .log("claude: the statusLine generation file was broken; written again");
+        }
+        // A state that doesn't know the account this process identified last (that save failed, or another process saved): the file
+        // is read again, whatever its time
+        if self.state.account_hash != self.identified_hash {
+            self.claude_json_mtime = None;
+        }
+        // Started again from a state that couldn't be read: .claude.json is read again, and no statusLine record from before now
+        // is used (whose account it was can't be told)
+        if self.state.recover_identity {
+            self.claude_json_mtime = None;
+            if self.state.account_switched_ms == 0 {
+                self.state.account_switched_ms = self.clock.map_or(now, |clock| clock());
+            }
+        }
         // The clock epoch this collect works under: values of another one are neither used nor shown, and nothing is fetched
         // without one (the clock isn't trusted now)
         self.epoch = crate::clock::usable_epoch(&self.home);
@@ -939,14 +1144,48 @@ impl Provider for ClaudeProvider {
             self.state.last_attempt_ms = self.state.last_attempt_ms.max(started);
             self.log_diag("usage (stopped by safety guard)", Diag::Interrupted);
         }
-        // An acceptance only under a usable clock epoch (one that can't be confirmed now isn't made; the switch stays pending). Asked
-        // for once: never left to accept a later switch
-        self.accepted = None;
-        let asked = std::mem::take(&mut self.accept_account_pending);
-        if asked && self.state.account_changed {
-            self.accepted = Some(false);
+        // The account as it is now first: an acceptance is for the switch the user saw, never one found after it
+        if asked {
+            self.refresh_account(now);
         }
-        if asked && self.state.account_changed && self.epoch.is_some() {
+        // An acceptance only under a usable clock epoch (one that can't be confirmed now isn't made; the switch stays pending), and only
+        // of the switch the user saw (another seen since isn't the one they checked)
+        if asked && !self.state.account_changed {
+            self.log
+                .log("claude: no account switch waits to be accepted; nothing was accepted");
+        }
+        if asked && self.state.account_changed && target != Some(self.state.switch_seq as i64) {
+            self.log.log(
+                "claude: the account switch shown changed since you asked (check headroom status, then accept again); nothing was accepted",
+            );
+        }
+        // The account switched to must be the one .claude.json shows now (one that can't be read isn't confirmed)
+        let shown_now = self.current_account_hash();
+        let confirmed_account =
+            shown_now.is_some() && shown_now.as_deref() == self.state.account_hash.as_deref();
+        if asked
+            && self.state.account_changed
+            && target == Some(self.state.switch_seq as i64)
+            && !confirmed_account
+        {
+            self.log.log(
+                "claude: the account can't be read now (sign in again, then accept again); nothing was accepted",
+            );
+        }
+        // Under the statusLine writers' lock, with the generation raised (an input of the account before is never saved after)
+        let raised = (asked
+            && self.state.account_changed
+            && target == Some(self.state.switch_seq as i64)
+            && confirmed_account
+            && self.epoch.is_some())
+        .then(|| raise_claude_gen(&self.home, self.state.accept_gen));
+        if let Some(Err(e)) = &raised {
+            self.log.log(&format!(
+                "claude: couldn't mark the acceptance for the statusLine ({}); nothing was accepted",
+                e.kind()
+            ));
+        }
+        if let Some(Ok((next_gen, _writers))) = raised {
             // Saved at once and by itself, before anything else is saved or run: what is said (and logged) is what was saved. One
             // that can't be saved isn't made (the switch stays pending, so nothing is fetched)
             let before = (
@@ -954,8 +1193,10 @@ impl Provider for ClaudeProvider {
                 self.state.account_accepted_ms,
                 self.state.last_error,
             );
+            let gen_before = self.state.accept_gen;
             self.state.account_changed = false;
             self.state.account_accepted_ms = now;
+            self.state.accept_gen = next_gen;
             if self.state.last_error == Some(Diag::AccountChanged) {
                 self.state.last_error = None;
             }
@@ -971,6 +1212,7 @@ impl Provider for ClaudeProvider {
                         self.state.account_accepted_ms,
                         self.state.last_error,
                     ) = before;
+                    self.state.accept_gen = gen_before;
                     self.log.log(&format!(
                         "claude: couldn't save the account acceptance: {}",
                         e.kind()
@@ -980,10 +1222,18 @@ impl Provider for ClaudeProvider {
         }
         self.refresh_account(now);
         let switched = self.state.account_switched_ms;
-        let capture = if self.state.account_changed {
+        let account_now_unknown = self.state.account_hash.is_some()
+            && self.current_account_hash() != self.state.account_hash;
+        let capture = if self.state.account_changed || account_now_unknown {
             None
         } else {
-            read_capture_in(&self.home, self.epoch).filter(|(at, _)| *at >= switched)
+            // Of the last acceptance's generation or later, as the state says it or as the statusLine writers' mark does (a state
+            // that can't be read starts at 0)
+            let min_gen = self
+                .state
+                .accept_gen
+                .max(crate::statusline::read_claude_gen(&self.home));
+            read_capture_since(&self.home, self.epoch, min_gen).filter(|(at, _)| *at >= switched)
         };
         // The clock is read again after the statusLine value (one written since the time above isn't ahead of it)
         let capture_now = self.clock.map_or(now, |clock| clock());
@@ -993,9 +1243,12 @@ impl Provider for ClaudeProvider {
             self.state.capture_ahead_ms = Some(*at);
         }
         self.capture = capture.filter(|(at, _)| self.state.capture_ahead_ms != Some(*at));
-        self.refresh_cli(now, force);
+        if !self.passive_only {
+            self.refresh_cli(now, force);
+        }
         self.capture_dirty = false;
-        let allowed = self.epoch.is_some()
+        let allowed = !self.passive_only
+            && self.epoch.is_some()
             && self.state.cli_supported == Some(true)
             && !self.state.account_changed
             // Only a confirmed claude.ai subscription sign-in (an unknown sign-in method is not enough)
@@ -1003,18 +1256,37 @@ impl Provider for ClaudeProvider {
             // Don't run when signed out
             && self.state.account.as_ref().and_then(|a| a.logged_in) != Some(false)
             && !self.state.managed_policy
-            && (force || !self.state.guard_tripped);
+            // Past a safety stop only on the user's explicit --force (checked on the state read under the lock, so a stop restored
+            // just now counts)
+            && (confirmed || !self.state.guard_tripped);
+        let kept_before = self.state.last_ok.clone();
         if allowed && (force || self.usage_due_ms(now) <= now) {
             // Check managed settings again right before launch (in case they appeared between hourly checks)
             let check = self.policy_check();
             self.apply_policy(check);
-            if check.is_none() {
+            if self.deadline_passed(now) {
+                self.log
+                    .log("claude: the fetch turn came too long ago; not fetched (asked again next round)");
+            } else if check.is_none() {
                 self.fetch_usage(now);
             }
         }
-        if let Err(e) = write_json_atomic(&state_path, &self.state) {
-            self.log
-                .log(&format!("claude: failed to save state: {}", e.kind()));
+        match write_json_atomic(&state_path, &self.state) {
+            // The account accepted (one switched to waits until accepted)
+            Ok(()) if !self.state.account_changed => {
+                crate::store::keep_account(&self.home, "claude", self.state.account_hash.as_deref())
+            }
+            Ok(()) => {}
+            Err(e) => {
+                self.log
+                    .log(&format!("claude: failed to save state: {}", e.kind()));
+                // A value that couldn't be kept isn't a success to share (no lease, no resume, no end of a rate limit), nor shown or
+                // sent
+                if self.run == Some(super::Run::Ran(super::Outcome::Ok)) {
+                    self.run = Some(super::Run::Ran(super::Outcome::Failed));
+                    self.state.last_ok = kept_before;
+                }
+            }
         }
         self.build(now)
     }
@@ -1024,12 +1296,75 @@ impl Provider for ClaudeProvider {
     }
 
     fn fetch_due_ms(&self, now: i64) -> i64 {
-        self.usage_due_ms(now)
+        // No turn is asked for while the state can't be read
+        match self.state_retry_at.filter(|&at| at > now) {
+            Some(at) => self.usage_due_ms(now).max(at),
+            None => self.usage_due_ms(now),
+        }
     }
 
     fn hold_fetch_until(&mut self, until_ms: i64) -> bool {
         self.fetch_hold_until_ms = until_ms;
         true
+    }
+
+    fn last_passive(&self) -> Option<super::Passive> {
+        self.capture.as_ref().map(|(at, windows)| super::Passive {
+            at_ms: *at,
+            windows: windows.iter().map(|w| w.id.clone()).collect(),
+        })
+    }
+
+    fn state_retry_at(&self) -> Option<i64> {
+        self.state_retry_at
+    }
+
+    fn passive_pending(&self) -> bool {
+        // Not while the state can't be read: it is read again on its own time, not on each event
+        self.capture_dirty && self.state_retry_at.is_none()
+    }
+
+    fn take_passive(&mut self, now: i64) -> Option<ProviderSnapshot> {
+        self.passive_only = true;
+        let snapshot = self.collect(now, false);
+        self.passive_only = false;
+        self.run = None;
+        Some(snapshot)
+    }
+
+    fn take_run(&mut self) -> Option<super::Run> {
+        self.run.take()
+    }
+
+    fn fetch_deadline(&mut self, until_ms: Option<i64>) {
+        self.fetch_deadline = until_ms.map(|until_ms| super::Grant {
+            until_ms,
+            until: std::time::Instant::now()
+                + std::time::Duration::from_millis(crate::schedule::GRANT_VALID_MS as u64),
+        });
+    }
+
+    fn grant(&mut self, grant: Option<super::Grant>) {
+        self.fetch_deadline = grant;
+    }
+
+    fn safety_stopped(&self) -> bool {
+        // As saved: also an attempt left in flight (it becomes a safety stop when next read)
+        let saved = load_state(&self.home.join(STATE_FILE));
+        saved.guard_tripped || saved.usage_in_flight_ms.is_some()
+    }
+
+    fn confirm_safety(&mut self, yes: bool) {
+        self.safety_confirmed = yes;
+    }
+
+    fn pending_switch(&self) -> Option<i64> {
+        let saved = load_state(&self.home.join(STATE_FILE));
+        saved.account_changed.then_some(saved.switch_seq as i64)
+    }
+
+    fn accept_target(&mut self, target: Option<i64>) {
+        self.accept_target = target;
     }
 
     fn takes_passive_values(&self) -> bool {
@@ -1046,6 +1381,8 @@ impl Provider for ClaudeProvider {
         let Some(state) = read_state(&state_path) else {
             self.log
                 .log("claude: couldn't read the state to forget the cached values");
+            self.state_retry_at =
+                Some(self.clock.map_or_else(crate::time::now_ms, |clock| clock()) + MINUTE_MS);
             return false;
         };
         self.state = state;
@@ -1104,13 +1441,13 @@ impl Provider for ClaudeProvider {
     }
 
     fn last_fetch_attempt_ms(&self) -> Option<i64> {
-        Some(self.state.last_attempt_ms).filter(|&t| t > 0)
+        Some(self.state.last_query_ms).filter(|&t| t > 0)
     }
 
     fn on_event(&mut self, event: &Event) {
         match event {
             Event::ClaudeStatuslineCaptured => self.capture_dirty = true,
-            Event::StopRequested => {}
+            Event::GeminiStatuslineCaptured | Event::StopRequested | Event::CollectRequested => {}
         }
     }
 
@@ -1330,7 +1667,12 @@ pub fn background_command(bin: &str) -> Command {
     }
     #[cfg(not(windows))]
     {
-        let mut c = Command::new("nice");
+        // By its full path where it is (macOS, Linux): no search of PATH at the launch
+        let nice = ["/usr/bin/nice", "/bin/nice"]
+            .into_iter()
+            .find(|p| Path::new(p).is_file())
+            .unwrap_or("nice");
+        let mut c = Command::new(nice);
         c.args(["-n", "10", bin]);
         c
     }
@@ -1351,31 +1693,116 @@ pub enum RunError {
 
 /// Run a child process with a deadline. Past the deadline, kill and reap it and return.
 /// Reads up to 4 MB of stdout. stderr is not used (to avoid bringing in raw CLI text).
-pub fn run_with_timeout(mut cmd: Command, timeout: Duration) -> Result<CmdOutput, RunError> {
+pub fn run_with_timeout(cmd: Command, timeout: Duration) -> Result<CmdOutput, RunError> {
+    run_child(cmd, timeout, false).map(|(out, stdout_utf8)| CmdOutput {
+        // As before: output that isn't UTF-8 reads as none (a cut at the size limit is kept)
+        stdout: if stdout_utf8 {
+            out.stdout
+        } else {
+            String::new()
+        },
+        success: out.code == Some(0),
+    })
+}
+
+/// What a run printed, its error output and its exit code (None: ended by a signal). The error output is for classifying the run in
+/// memory only: it is never logged or saved
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RunOutput {
+    pub stdout: String,
+    pub stderr: String,
+    pub code: Option<i32>,
+    /// Both outputs were read whole, as UTF-8 (none cut at its size limit, none left unread when the child ended). Text that isn't
+    /// UTF-8 is kept with replacement characters
+    pub complete: bool,
+}
+
+/// `run_with_timeout`, keeping the error output (up to 64 KiB; the rest is read and dropped so the child never waits on it) and the
+/// exit code
+pub fn run_capturing(cmd: Command, timeout: Duration) -> Result<RunOutput, RunError> {
+    run_child(cmd, timeout, true).map(|(out, _)| out)
+}
+
+/// One output of a child: its text, and whether it was read whole as UTF-8
+struct PipeText {
+    text: String,
+    whole: bool,
+    utf8: bool,
+}
+
+fn run_child(
+    mut cmd: Command,
+    timeout: Duration,
+    keep_stderr: bool,
+) -> Result<(RunOutput, bool), RunError> {
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+        .stderr(if keep_stderr {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        });
     let mut child = cmd.spawn().map_err(|e| match e.kind() {
         std::io::ErrorKind::NotFound => RunError::NotFound,
         _ => RunError::StartFailed,
     })?;
-    let mut stdout = child.stdout.take().ok_or(RunError::StartFailed)?;
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let mut s = String::new();
-        let _ = (&mut stdout).take(4 * 1024 * 1024).read_to_string(&mut s);
-        let _ = tx.send(s);
-    });
+    let read_all = |pipe: Option<Box<dyn Read + Send>>, limit: u64| {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let mut whole = true;
+            if let Some(mut pipe) = pipe {
+                // One byte past the limit tells a cut; the rest is read and dropped so the child never waits on it
+                whole = (&mut pipe).take(limit + 1).read_to_end(&mut bytes).is_ok();
+                if bytes.len() as u64 > limit {
+                    bytes.truncate(limit as usize);
+                    whole = false;
+                }
+                let _ = std::io::copy(&mut pipe, &mut std::io::sink());
+            }
+            let (text, utf8) = match String::from_utf8(bytes) {
+                Ok(text) => (text, true),
+                Err(e) => (String::from_utf8_lossy(e.as_bytes()).into_owned(), false),
+            };
+            let _ = tx.send(PipeText { text, whole, utf8 });
+        });
+        rx
+    };
+    let stdout = child.stdout.take().ok_or(RunError::StartFailed)?;
+    let stdout_rx = read_all(Some(Box::new(stdout)), 4 * 1024 * 1024);
+    let stderr_rx = read_all(
+        child
+            .stderr
+            .take()
+            .map(|e| Box::new(e) as Box<dyn Read + Send>),
+        64 * 1024,
+    );
     let deadline = Instant::now() + timeout;
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
                 // The child has exited. Wait briefly for the output read to finish (so we can return even if a grandchild holds the pipe)
-                let stdout = rx.recv_timeout(Duration::from_secs(5)).unwrap_or_default();
-                return Ok(CmdOutput {
-                    stdout,
-                    success: status.success(),
-                });
+                let unread = || PipeText {
+                    text: String::new(),
+                    whole: false,
+                    utf8: true,
+                };
+                let stdout = stdout_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap_or_else(|_| unread());
+                let stderr = stderr_rx
+                    .recv_timeout(Duration::from_secs(1))
+                    .unwrap_or_else(|_| unread());
+                let complete = stdout.whole && stdout.utf8 && stderr.whole && stderr.utf8;
+                return Ok((
+                    RunOutput {
+                        stdout: stdout.text,
+                        stderr: stderr.text,
+                        code: status.code(),
+                        complete,
+                    },
+                    stdout.utf8,
+                ));
             }
             Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(50)),
             _ => {
@@ -1413,13 +1840,54 @@ fn strip_host_env(cmd: &mut Command) {
 }
 
 /// Classify the result after launch. Only launch failures are ordinary failures; anything unverifiable after launch is a stop.
+/// classify_usage_output for a run whose output may not have been read whole: one cut (at its size limit, left unread) can't confirm
+/// zero use whatever its first part says
+pub fn classify_usage_run(r: Result<RunOutput, RunError>) -> Result<String, UsageError> {
+    let out = match r {
+        Ok(out) => out,
+        Err(e) => return classify_usage_output(Err(e)),
+    };
+    let complete = out.complete;
+    let denied_on_stderr = super::says_access_denied(&out.stderr);
+    let result = if complete {
+        classify_usage_output(Ok(CmdOutput {
+            stdout: out.stdout,
+            success: out.code == Some(0),
+        }))
+    } else {
+        Err(UsageError::Stop(Diag::Unverifiable))
+    };
+    match result {
+        // A denial told only on the error output: with zero use confirmed, the service's denial; without, both stops
+        Err(UsageError::Retry(d)) if denied_on_stderr && d != Diag::AccessDenied => {
+            Err(UsageError::Retry(Diag::AccessDenied))
+        }
+        Err(UsageError::Stop(d)) if denied_on_stderr && d != Diag::AccessDeniedUnverified => {
+            Err(UsageError::Stop(Diag::AccessDeniedUnverified))
+        }
+        r => r,
+    }
+}
+
 pub fn classify_usage_output(r: Result<CmdOutput, RunError>) -> Result<String, UsageError> {
     match r {
         Err(RunError::NotFound) => Err(UsageError::Retry(Diag::CliNotFound)),
         Err(RunError::StartFailed) => Err(UsageError::Retry(Diag::CliStartFailed)),
         Err(RunError::Timeout) => Err(UsageError::Stop(Diag::UsageTimeout)),
+        // A denial of the account shown by output that can't confirm zero use: both stops
         Ok(out) => match serde_json::from_str::<Value>(out.stdout.trim()) {
-            Ok(v) => check_usage_result(&v),
+            Ok(v) => match check_usage_result(&v) {
+                Err(UsageError::Stop(_))
+                    if super::says_access_denied(&v.to_string())
+                        || super::is_denial_code(v["error"].as_str().unwrap_or_default()) =>
+                {
+                    Err(UsageError::Stop(Diag::AccessDeniedUnverified))
+                }
+                r => r,
+            },
+            Err(_) if super::says_access_denied(&out.stdout) => {
+                Err(UsageError::Stop(Diag::AccessDeniedUnverified))
+            }
             Err(_) => Err(UsageError::Stop(Diag::Unverifiable)),
         },
     }
@@ -1487,11 +1955,24 @@ pub fn check_usage_result(v: &Value) -> Result<String, UsageError> {
     // Zero use is confirmed at this point. Anything after this can be treated as an ordinary failure
     let text = v["result"].as_str().unwrap_or_default();
     if v["is_error"] == true {
-        return Err(UsageError::Retry(if looks_like_login(text) {
-            Diag::LoginRequired
-        } else {
-            Diag::CliError
-        }));
+        // The service denying the account (its text, or the error code -p mode gives), before a sign-in failure
+        let (error, subtype) = (
+            v["error"].as_str().unwrap_or_default(),
+            v["subtype"].as_str().unwrap_or_default(),
+        );
+        let said = format!("{text} {error}");
+        return Err(UsageError::Retry(
+            if super::says_access_denied(&said)
+                || super::is_denial_code(error)
+                || super::is_denial_code(subtype)
+            {
+                Diag::AccessDenied
+            } else if looks_like_login(text) {
+                Diag::LoginRequired
+            } else {
+                Diag::CliError
+            },
+        ));
     }
     if text.is_empty() {
         return Err(UsageError::Retry(Diag::UnrecognizedOutput));
@@ -1819,6 +2300,12 @@ mod tests {
         marker_seen: Option<bool>,
         /// Organization managed settings on this PC
         managed: Managed,
+        /// A file made unwritable while /usage runs (a folder put in its place)
+        break_file: Option<PathBuf>,
+        /// A file written while /usage runs (its path and new text)
+        rewrite: Option<(PathBuf, String)>,
+        /// How long the preparation (finding the executable) takes
+        prepare_delay: Duration,
     }
 
     /// Stand-in CLI. Counts calls and returns the given results
@@ -1838,6 +2325,9 @@ mod tests {
                 marker_probe: None,
                 marker_seen: None,
                 managed: Managed::Absent,
+                break_file: None,
+                rewrite: None,
+                prepare_delay: Duration::ZERO,
             })))
         }
         fn calls(&self) -> usize {
@@ -1855,6 +2345,10 @@ mod tests {
     }
 
     impl ClaudeCli for Fake {
+        fn prepare_usage(&mut self) {
+            let delay = self.0.lock().unwrap().prepare_delay;
+            std::thread::sleep(delay);
+        }
         fn version(&mut self) -> Result<String, Diag> {
             let mut s = self.0.lock().unwrap();
             s.versions.pop_front().unwrap_or_else(|| s.version.clone())
@@ -1873,6 +2367,13 @@ mod tests {
                 s.usage_calls += 1;
                 if let Some(p) = s.marker_probe.clone() {
                     s.marker_seen = Some(load_state(&p).usage_in_flight_ms.is_some());
+                }
+                if let Some(p) = s.break_file.take() {
+                    let _ = std::fs::remove_file(&p);
+                    std::fs::create_dir(&p).unwrap();
+                }
+                if let Some((p, text)) = s.rewrite.take() {
+                    std::fs::write(p, text).unwrap();
                 }
                 s.usage_delay
             };
@@ -2081,7 +2582,10 @@ Current session limit for org: 100% used
         assert!(saved.guard_tripped && saved.usage_in_flight_ms.is_none());
         p.collect(NOW + 120 * MINUTE_MS, false);
         assert_eq!(fake.calls(), 0);
-        p.collect(NOW + 121 * MINUTE_MS, true);
+        {
+            p.confirm_safety(true);
+            p.collect(NOW + 121 * MINUTE_MS, true)
+        };
         assert_eq!(fake.calls(), 1, "resumes with a manual --force");
         let _ = std::fs::remove_dir_all(h);
     }
@@ -2184,7 +2688,10 @@ Current session limit for org: 100% used
             );
             assert_eq!(snap.error_code, Some(ErrorCode::SafetyStop), "{name}");
             assert!(load_state(&h.join(STATE_FILE)).guard_tripped, "{name}");
-            again.collect(NOW + 121 * MINUTE_MS, true);
+            {
+                again.confirm_safety(true);
+                again.collect(NOW + 121 * MINUTE_MS, true)
+            };
             assert_eq!(fake.calls(), 1, "{name}: resumes with a manual --force");
         }
         // Only a missing file starts fresh
@@ -2311,6 +2818,54 @@ Current session limit for org: 100% used
         p.collect(NOW + 20 * MINUTE_MS, false);
         assert_eq!(p.state.last_error, Some(Diag::RateLimited));
         assert_eq!(p.state.failures, 2, "retries with a longer interval");
+        assert_eq!(
+            p.take_run(),
+            Some(crate::providers::Run::Ran(
+                crate::providers::Outcome::RateLimited { retry_ms: None }
+            ))
+        );
+        assert_eq!(p.take_run(), None, "taken once");
+        let _ = std::fs::remove_dir_all(h);
+    }
+
+    #[test]
+    fn a_go_that_came_too_long_ago_starts_no_query() {
+        use crate::providers::Run;
+        let (mut p, fake, h) = provider("deadline", vec![Ok(usage_text(10)), Ok(usage_text(11))]);
+        p.fetch_deadline(Some(NOW - 1));
+        p.collect(NOW, false);
+        assert_eq!((fake.calls(), p.take_run()), (0, Some(Run::NotRun)));
+        p.fetch_deadline(Some(NOW + 60_000));
+        p.collect(NOW, false);
+        assert_eq!(fake.calls(), 1);
+        let _ = std::fs::remove_dir_all(h);
+    }
+
+    #[test]
+    fn the_collect_says_what_went_upstream() {
+        use crate::providers::{Outcome, Run};
+        let both = "Showing last-known usage\nUsage is rate limited until 3:14am\n";
+        let (mut p, fake, h) = provider(
+            "run",
+            vec![Ok(usage_text(10)), Ok(both.into()), Ok(usage_text(12))],
+        );
+        p.collect(NOW, false);
+        assert_eq!(p.take_run(), Some(Run::Ran(Outcome::Ok)));
+        // not due: nothing went upstream
+        p.collect(NOW + MINUTE_MS, false);
+        assert_eq!(p.take_run(), Some(Run::NotRun));
+        // rate limited with the last-known values shown: rate limited
+        p.collect(NOW + 20 * MINUTE_MS, false);
+        assert_eq!(
+            p.take_run(),
+            Some(Run::Ran(Outcome::RateLimited { retry_ms: None }))
+        );
+        assert_eq!(p.state.last_error, Some(Diag::RateLimited));
+        // the passive intake starts no CLI and says nothing of a run
+        let calls = fake.calls();
+        let _ = p.take_passive(NOW + 120 * MINUTE_MS);
+        assert_eq!(fake.calls(), calls);
+        assert_eq!(p.take_run(), None);
         let _ = std::fs::remove_dir_all(h);
     }
 
@@ -2727,6 +3282,7 @@ Current session limit for org: 100% used
     #[test]
     fn an_acceptance_is_made_only_under_a_trusted_clock_and_said_only_once_saved() {
         let (mut p, _fake, h) = provider("accept-epoch", vec![Ok(usage_text(10))]);
+        signed_in_as(&mut p, &h, "b");
         p.state.account_changed = true;
         write_json_atomic(&h.join(STATE_FILE), &p.state).unwrap();
         {
@@ -2734,6 +3290,7 @@ Current session limit for org: 100% used
             let state = crate::clock::ensure_locked(&h, || Ok(false)).unwrap();
             crate::clock::advance_locked(&h, &state, false).unwrap();
         }
+        p.accept_target(p.pending_switch());
         p.accept_account();
         p.collect(NOW, true);
         assert_eq!(p.account_accepted(), Some(false));
@@ -2746,6 +3303,7 @@ Current session limit for org: 100% used
         p.collect(NOW + MINUTE_MS, true);
         assert!(load_state(&h.join(STATE_FILE)).account_changed);
         // the control: asked under a trusted clock, accepted and saved
+        p.accept_target(p.pending_switch());
         p.accept_account();
         p.collect(NOW + 2 * MINUTE_MS, true);
         assert_eq!(p.account_accepted(), Some(true));
@@ -2756,6 +3314,7 @@ Current session limit for org: 100% used
     fn g3_i_an_acceptance_that_cant_be_saved_isnt_made_and_one_that_can_is_said() {
         let (mut p, _fake, h) =
             provider("accept-save", vec![Ok(usage_text(10)), Ok(usage_text(10))]);
+        signed_in_as(&mut p, &h, "b");
         p.state.account_changed = true;
         write_json_atomic(&h.join(STATE_FILE), &p.state).unwrap();
         // the state can't be written (a folder where its temporary file goes)
@@ -2763,6 +3322,7 @@ Current session limit for org: 100% used
             .join(STATE_FILE)
             .with_extension(format!("{}.tmp", std::process::id()));
         std::fs::create_dir(&tmp).unwrap();
+        p.accept_target(p.pending_switch());
         p.accept_account();
         p.collect(NOW, true);
         assert_eq!(p.account_accepted(), Some(false));
@@ -2773,6 +3333,7 @@ Current session limit for org: 100% used
         assert!(load_state(&h.join(STATE_FILE)).account_changed);
         // the control: it can be saved, so it is made and said (saved by itself before the fetch and the last save)
         std::fs::remove_dir(&tmp).unwrap();
+        p.accept_target(p.pending_switch());
         p.accept_account();
         p.collect(NOW + MINUTE_MS, true);
         assert_eq!(p.account_accepted(), Some(true));
@@ -3005,6 +3566,7 @@ Current session limit for org: 100% used
         );
 
         // Accepting manually resumes with the new account
+        p2.accept_target(p2.pending_switch());
         p2.accept_account();
         let snap = p2.collect(NOW + 61 * MINUTE_MS, false);
         assert_eq!(fake.calls(), 2);
@@ -3269,7 +3831,10 @@ Current session limit for org: 100% used
             1,
             "does not resume except with a manual --force"
         );
-        p.collect(NOW + 601 * MINUTE_MS, true);
+        {
+            p.confirm_safety(true);
+            p.collect(NOW + 601 * MINUTE_MS, true)
+        };
         assert_eq!(fake.calls(), 2);
         assert!(
             !p.state.guard_tripped,
@@ -3672,5 +4237,731 @@ Current session limit for org: 100% used
             (ws[0].used_percent, ws[0].resets_at.as_deref()),
             (12.0, None)
         );
+    }
+
+    /// .claude.json names this account, and the state knows it as the one switched to
+    fn signed_in_as(p: &mut ClaudeProvider, h: &Path, uuid: &str) {
+        let cj = h.join("claude.json");
+        std::fs::write(
+            &cj,
+            format!(r#"{{"oauthAccount":{{"accountUuid":"{uuid}","organizationUuid":"o"}}}}"#),
+        )
+        .unwrap();
+        p.set_claude_json(cj);
+        p.state.account_hash = Some(fnv1a_hex(&[uuid, "o"]));
+    }
+
+    /// A provider stopped by an account switch (the switch seen at NOW + 6 minutes)
+    fn switched(name: &str) -> (ClaudeProvider, Fake, crate::test_util::TempHome) {
+        let (mut p, fake, h) = provider(name, vec![Ok(usage_text(80)), Ok(usage_text(10))]);
+        let cj = h.join("claude.json");
+        std::fs::write(
+            &cj,
+            r#"{"oauthAccount":{"accountUuid":"a","organizationUuid":"o"}}"#,
+        )
+        .unwrap();
+        p.set_claude_json(cj.clone());
+        p.collect(NOW, false);
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::write(
+            &cj,
+            r#"{"oauthAccount":{"accountUuid":"b","organizationUuid":"o"}}"#,
+        )
+        .unwrap();
+        p.collect(NOW + 6 * MINUTE_MS, false);
+        assert!(p.state.account_changed);
+        (p, fake, h)
+    }
+
+    #[test]
+    fn an_acceptance_a_collect_couldnt_make_is_never_left_for_a_later_one() {
+        let (mut p, fake, h) = switched("accept-once");
+        // a collect that ends early (turned off meanwhile, a lock held elsewhere): not made, and said so
+        p.cfg.enabled = false;
+        p.accept_target(p.pending_switch());
+        p.accept_account();
+        p.collect(NOW + 10 * MINUTE_MS, false);
+        assert_eq!(p.account_accepted(), Some(false));
+        p.cfg.enabled = true;
+        let _ = &h;
+        // the next collect, not asked to, doesn't accept it
+        p.collect(NOW + 20 * MINUTE_MS, false);
+        assert!(p.state.account_changed);
+        assert_eq!(p.account_accepted(), None);
+        assert_eq!(fake.calls(), 1);
+    }
+
+    #[test]
+    fn only_the_switch_the_user_saw_is_accepted() {
+        let (mut p, fake, _h) = switched("accept-target");
+        let seen = p.pending_switch();
+        assert!(seen.is_some());
+        // another switch seen since (or none seen when asking): not accepted
+        for target in [seen.map(|t| t - 1), None] {
+            p.accept_target(target);
+            p.accept_account();
+            p.collect(NOW + 10 * MINUTE_MS, false);
+            assert_eq!(p.account_accepted(), Some(false));
+            assert!(p.state.account_changed);
+        }
+        p.accept_target(seen);
+        p.accept_account();
+        p.collect(NOW + 11 * MINUTE_MS, false);
+        assert_eq!(p.account_accepted(), Some(true));
+        assert_eq!(fake.calls(), 2);
+    }
+
+    #[test]
+    fn a_forced_collect_passes_a_safety_stop_only_on_the_user_s_explicit_go() {
+        let (mut p, fake, h) = provider(
+            "confirm",
+            vec![Err(UsageError::Stop(Diag::UsageTimeout)), Ok(usage_text(5))],
+        );
+        p.collect(NOW, false);
+        assert!(p.safety_stopped());
+        // brought forward (a resume, a fetch the user asked for) but not confirmed: nothing runs
+        p.collect(NOW + 20 * MINUTE_MS, true);
+        assert_eq!(fake.calls(), 1);
+        // confirmed: once; the confirmation is for that collect only
+        p.confirm_safety(true);
+        p.collect(NOW + 21 * MINUTE_MS, true);
+        assert_eq!(fake.calls(), 2);
+        assert!(!p.safety_stopped());
+        let _ = std::fs::remove_dir_all(h);
+    }
+
+    #[test]
+    fn an_attempt_that_never_launched_isnt_a_query_and_a_value_that_couldnt_be_kept_isnt_a_success()
+    {
+        let (mut p, fake, h) = provider(
+            "not-launched",
+            vec![
+                Err(UsageError::Retry(Diag::CliStartFailed)),
+                Ok(usage_text(5)),
+            ],
+        );
+        p.collect(NOW, true);
+        assert_eq!(p.take_run(), Some(crate::providers::Run::NotRun));
+        assert_eq!(p.last_fetch_attempt_ms(), None, "no query went upstream");
+        // a value fetched whose state can't be saved: not a success to share
+        fake.0.lock().unwrap().break_file = Some(h.join(STATE_FILE));
+        let snap = p.collect(NOW + 20 * MINUTE_MS, true);
+        assert_eq!(fake.calls(), 2);
+        // nor shown or sent
+        assert!(
+            !snap.windows.iter().any(|w| w.used_percent == 5.0),
+            "{:?}",
+            snap.windows
+        );
+        assert_eq!(
+            p.take_run(),
+            Some(crate::providers::Run::Ran(
+                crate::providers::Outcome::Failed
+            ))
+        );
+    }
+
+    #[test]
+    fn output_not_read_whole_never_confirms_zero_use() {
+        let run = |complete| {
+            Ok(RunOutput {
+                stdout: real_fixture().to_string(),
+                stderr: String::new(),
+                code: Some(0),
+                complete,
+            })
+        };
+        assert!(classify_usage_run(run(true)).is_ok());
+        assert_eq!(
+            classify_usage_run(run(false)),
+            Err(UsageError::Stop(Diag::Unverifiable))
+        );
+    }
+
+    #[test]
+    fn an_acceptance_reads_the_account_first_and_a_switch_found_then_isn_t_the_one_seen() {
+        let (mut p, fake, h) = switched("accept-latest");
+        let seen = p.pending_switch();
+        // the account moved on again before the acceptance (not yet read)
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::write(
+            h.join("claude.json"),
+            r#"{"oauthAccount":{"accountUuid":"c","organizationUuid":"o"}}"#,
+        )
+        .unwrap();
+        p.accept_target(seen);
+        p.accept_account();
+        p.collect(NOW + 10 * MINUTE_MS, false);
+        assert_eq!(p.account_accepted(), Some(false));
+        assert!(p.state.account_changed);
+        assert_ne!(p.pending_switch(), seen);
+        // the one now, seen: accepted
+        p.accept_target(p.pending_switch());
+        p.accept_account();
+        p.collect(NOW + 11 * MINUTE_MS, false);
+        assert_eq!(p.account_accepted(), Some(true));
+        assert_eq!(fake.calls(), 2);
+    }
+
+    #[test]
+    fn a_statusline_record_of_the_account_before_isn_t_taken_after_the_acceptance() {
+        let (mut p, _fake, h) = switched("accept-gen");
+        p.accept_target(p.pending_switch());
+        p.accept_account();
+        p.collect(NOW + 10 * MINUTE_MS, false);
+        assert_eq!(p.account_accepted(), Some(true));
+        // a writer that read the account before's input saved it late (stamped after the acceptance, of the generation before)
+        let late = crate::statusline::Capture {
+            captured_at: iso_from_ms(NOW + 11 * MINUTE_MS),
+            captured_at_ms: NOW + 11 * MINUTE_MS,
+            rate_limits: json!({"five_hour": {"used_percentage": 77, "resets_at": 1794844800}}),
+            epoch: crate::clock::usable_epoch(&h),
+            accept_gen: p.state.accept_gen - 1,
+        };
+        crate::store::write_json_atomic(&h.join(crate::statusline::CAPTURE_FILE), &late).unwrap();
+        p.on_event(&Event::ClaudeStatuslineCaptured);
+        let snap = p.collect(NOW + 12 * MINUTE_MS, false);
+        assert!(
+            !snap.windows.iter().any(|w| w.used_percent == 77.0),
+            "{:?}",
+            snap.windows
+        );
+        // the control: the same record of the generation now is taken
+        let now_gen = crate::statusline::Capture {
+            accept_gen: p.state.accept_gen,
+            captured_at_ms: NOW + 13 * MINUTE_MS,
+            captured_at: iso_from_ms(NOW + 13 * MINUTE_MS),
+            ..late
+        };
+        crate::store::write_json_atomic(&h.join(crate::statusline::CAPTURE_FILE), &now_gen)
+            .unwrap();
+        p.on_event(&Event::ClaudeStatuslineCaptured);
+        let snap = p.collect(NOW + 14 * MINUTE_MS, false);
+        assert!(
+            snap.windows.iter().any(|w| w.used_percent == 77.0),
+            "{:?}",
+            snap.windows
+        );
+    }
+
+    #[test]
+    fn a_state_that_can_t_be_read_after_an_acceptance_brings_back_no_value_of_the_account_before() {
+        let (mut p, _fake, h) = switched("accept-unreadable");
+        // the account before's record, of the generation before the acceptance
+        crate::statusline::save_capture(
+            &h,
+            &json!({"five_hour": {"used_percentage": 66, "resets_at": 1794844800}}),
+            NOW + 9 * MINUTE_MS,
+        )
+        .unwrap();
+        p.accept_target(p.pending_switch());
+        p.accept_account();
+        p.collect(NOW + 10 * MINUTE_MS, false);
+        assert_eq!(p.account_accepted(), Some(true));
+        // the state can't be read once (it starts again at generation 0): the record before still isn't taken
+        std::fs::write(h.join(STATE_FILE), b"{broken").unwrap();
+        p.on_event(&Event::ClaudeStatuslineCaptured);
+        let snap = p.collect(NOW + 11 * MINUTE_MS, false);
+        assert!(
+            !snap.windows.iter().any(|w| w.used_percent == 66.0),
+            "{:?}",
+            snap.windows
+        );
+    }
+
+    #[test]
+    fn an_acceptance_needs_the_account_switched_to_readable_now() {
+        let (mut p, fake, h) = switched("accept-unreadable-account");
+        let seen = p.pending_switch();
+        // .claude.json names no account now
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::write(h.join("claude.json"), r#"{"oauthAccount":{}}"#).unwrap();
+        p.accept_target(seen);
+        p.accept_account();
+        p.collect(NOW + 10 * MINUTE_MS, false);
+        assert_eq!(p.account_accepted(), Some(false));
+        assert!(p.state.account_changed);
+        // readable again as the account switched to: accepted
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::write(
+            h.join("claude.json"),
+            r#"{"oauthAccount":{"accountUuid":"b","organizationUuid":"o"}}"#,
+        )
+        .unwrap();
+        p.accept_target(p.pending_switch());
+        p.accept_account();
+        p.collect(NOW + 11 * MINUTE_MS, false);
+        assert_eq!(p.account_accepted(), Some(true));
+        assert_eq!(fake.calls(), 2);
+    }
+
+    #[test]
+    fn a_fetch_during_which_the_account_can_t_be_read_any_more_isn_t_used() {
+        let (mut p, fake, h) =
+            provider("account-gone", vec![Ok(usage_text(10)), Ok(usage_text(44))]);
+        let cj = h.join("claude.json");
+        std::fs::write(
+            &cj,
+            r#"{"oauthAccount":{"accountUuid":"a","organizationUuid":"o"}}"#,
+        )
+        .unwrap();
+        p.set_claude_json(cj.clone());
+        p.collect(NOW, false);
+        assert_eq!(
+            p.take_run(),
+            Some(crate::providers::Run::Ran(crate::providers::Outcome::Ok))
+        );
+        // signed out while it ran: the file names no account
+        fake.0.lock().unwrap().rewrite = Some((cj, r#"{"oauthAccount":{}}"#.into()));
+        let snap = p.collect(NOW + 20 * MINUTE_MS, true);
+        assert_eq!(fake.calls(), 2);
+        assert_eq!(
+            p.take_run(),
+            Some(crate::providers::Run::Ran(
+                crate::providers::Outcome::Failed
+            ))
+        );
+        assert!(
+            !snap.windows.iter().any(|w| w.used_percent == 44.0),
+            "{:?}",
+            snap.windows
+        );
+    }
+
+    #[test]
+    fn a_provider_turned_off_never_asks_to_be_woken() {
+        let (mut p, _fake, _h) = provider("off-wake", vec![]);
+        p.cfg.enabled = false;
+        p.on_event(&Event::ClaudeStatuslineCaptured);
+        assert_eq!(p.next_due_ms(NOW), i64::MAX);
+        p.collect(NOW, false);
+        assert_eq!(p.next_due_ms(NOW), i64::MAX);
+    }
+
+    #[test]
+    fn a_state_that_can_t_be_read_once_while_a_switch_waits_skips_the_round_and_keeps_it() {
+        let (mut p, fake, h) = switched("pending-unreadable");
+        crate::statusline::save_capture(
+            &h,
+            &json!({"five_hour": {"used_percentage": 66, "resets_at": 1794844800}}),
+            NOW + 7 * MINUTE_MS,
+        )
+        .unwrap();
+        // the state can't be read now (a folder in its place): nothing is decided or saved, no value shown
+        let state = h.join(STATE_FILE);
+        let kept = std::fs::read(&state).unwrap();
+        std::fs::remove_file(&state).unwrap();
+        std::fs::create_dir(&state).unwrap();
+        p.on_event(&Event::ClaudeStatuslineCaptured);
+        let snap = p.collect(NOW + 8 * MINUTE_MS, false);
+        assert!(
+            !snap.windows.iter().any(|w| w.used_percent == 66.0),
+            "{:?}",
+            snap.windows
+        );
+        // read again a minute on, not at once, and no turn is asked for meanwhile
+        assert_eq!(p.next_due_ms(NOW + 8 * MINUTE_MS), NOW + 9 * MINUTE_MS);
+        assert!(p.fetch_due_ms(NOW + 8 * MINUTE_MS) >= NOW + 9 * MINUTE_MS);
+        // nothing was decided on a stand-in: the switch still shows as waiting, not as a state that can't be read
+        assert!(p.state.account_changed);
+        assert_eq!(snap.error_code, Some(ErrorCode::AccountChanged));
+        std::fs::remove_dir(&state).unwrap();
+        std::fs::write(&state, kept).unwrap();
+        assert!(load_state(&state).account_changed, "the switch still waits");
+        assert_eq!(fake.calls(), 1);
+    }
+
+    #[test]
+    fn a_state_lost_takes_no_record_from_before_also_with_no_account_read() {
+        // .claude.json can't be read (none): no identification draws the line, the start again does
+        let (mut p, _fake, h) = provider("state-lost-unidentified", vec![]);
+        crate::statusline::save_capture(
+            &h,
+            &json!({"five_hour": {"used_percentage": 66, "resets_at": 1794844800}}),
+            NOW,
+        )
+        .unwrap();
+        std::fs::write(h.join(STATE_FILE), b"{broken").unwrap();
+        p.on_event(&Event::ClaudeStatuslineCaptured);
+        let snap = p.collect(NOW + MINUTE_MS, false);
+        assert!(
+            !snap.windows.iter().any(|w| w.used_percent == 66.0),
+            "{:?}",
+            snap.windows
+        );
+    }
+
+    #[test]
+    fn a_state_lost_takes_no_record_from_before_and_starts_a_new_history() {
+        let (mut p, _fake, h) = provider("state-lost", vec![]);
+        signed_in_as(&mut p, &h, "a");
+        crate::statusline::save_capture(
+            &h,
+            &json!({"five_hour": {"used_percentage": 66, "resets_at": 1794844800}}),
+            NOW,
+        )
+        .unwrap();
+        std::fs::write(h.join(STATE_FILE), b"{broken").unwrap();
+        p.on_event(&Event::ClaudeStatuslineCaptured);
+        let snap = p.collect(NOW + MINUTE_MS, false);
+        assert!(
+            !snap.windows.iter().any(|w| w.used_percent == 66.0),
+            "{:?}",
+            snap.windows
+        );
+        assert_eq!(
+            snap.history_since.as_deref(),
+            Some(iso_from_ms(NOW + MINUTE_MS).as_str())
+        );
+        // a record after it is used
+        crate::statusline::save_capture(
+            &h,
+            &json!({"five_hour": {"used_percentage": 67, "resets_at": 1794844800}}),
+            NOW + 2 * MINUTE_MS,
+        )
+        .unwrap();
+        p.on_event(&Event::ClaudeStatuslineCaptured);
+        let snap = p.collect(NOW + 3 * MINUTE_MS, false);
+        assert!(
+            snap.windows.iter().any(|w| w.used_percent == 67.0),
+            "{:?}",
+            snap.windows
+        );
+    }
+
+    #[test]
+    fn an_account_file_that_couldn_t_be_read_once_is_read_again() {
+        let (mut p, _fake, h) = provider("account-reread", vec![Ok(usage_text(10))]);
+        let cj = h.join("claude.json");
+        std::fs::write(
+            &cj,
+            r#"{"oauthAccount":{"accountUuid":"a","organizationUuid":"o"}}"#,
+        )
+        .unwrap();
+        p.set_claude_json(cj.clone());
+        p.collect(NOW, false);
+        // B's file, read while half written (not JSON); later whole, with the same time
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::write(&cj, b"{").unwrap();
+        let at = std::fs::metadata(&cj).unwrap().modified().unwrap();
+        p.collect(NOW + MINUTE_MS, false);
+        assert!(!p.state.account_changed);
+        std::fs::write(
+            &cj,
+            r#"{"oauthAccount":{"accountUuid":"b","organizationUuid":"o"}}"#,
+        )
+        .unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&cj)
+            .unwrap()
+            .set_modified(at)
+            .unwrap();
+        p.collect(NOW + 2 * MINUTE_MS, false);
+        assert!(p.state.account_changed, "the switch is found");
+    }
+
+    #[test]
+    fn finding_the_executable_comes_before_the_go_s_last_check() {
+        let (mut p, fake, _h) = provider("prepare-late", vec![Ok(usage_text(10))]);
+        static AT: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+        fn at() -> i64 {
+            AT.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        AT.store(NOW, std::sync::atomic::Ordering::SeqCst);
+        p.clock = Some(at);
+        // a go good for a moment only; finding the executable takes longer
+        fake.0.lock().unwrap().prepare_delay = Duration::from_millis(300);
+        crate::providers::Provider::grant(
+            &mut p,
+            Some(crate::providers::Grant {
+                until_ms: NOW + 60_000,
+                until: std::time::Instant::now() + Duration::from_millis(100),
+            }),
+        );
+        p.collect(NOW, true);
+        assert_eq!(fake.calls(), 0, "nothing launched past the go");
+    }
+
+    #[test]
+    fn a_denial_code_counts_as_the_result_s_code_only() {
+        let mut coded = on_hold();
+        coded["result"] = json!("Something went wrong");
+        assert_eq!(
+            check_usage_result(&coded),
+            Err(UsageError::Retry(Diag::AccessDenied)),
+            "the -p error code"
+        );
+        // the same word in free text (a local file's name) isn't one
+        let mut text = on_hold();
+        text["result"] = json!(r#"cannot open local file "account_on_hold.json""#);
+        text["error"] = Value::Null;
+        assert_ne!(
+            check_usage_result(&text),
+            Err(UsageError::Retry(Diag::AccessDenied))
+        );
+    }
+
+    #[test]
+    fn a_current_state_without_its_safety_stop_is_stopped() {
+        let (_p, _fake, h) = provider("guard-missing", vec![]);
+        let path = h.join(STATE_FILE);
+        std::fs::write(
+            &path,
+            format!(r#"{{"state_version":{STATE_VERSION},"failures":0}}"#),
+        )
+        .unwrap();
+        assert!(load_state(&path).guard_tripped);
+        // the control: written with it
+        std::fs::write(
+            &path,
+            format!(r#"{{"state_version":{STATE_VERSION},"guard_tripped":false}}"#),
+        )
+        .unwrap();
+        assert!(!load_state(&path).guard_tripped);
+    }
+
+    #[test]
+    fn a_switch_whose_save_failed_is_found_again() {
+        let (mut p, fake, h) = provider("switch-unsaved", vec![Ok(usage_text(10))]);
+        let cj = h.join("claude.json");
+        std::fs::write(
+            &cj,
+            r#"{"oauthAccount":{"accountUuid":"a","organizationUuid":"o"}}"#,
+        )
+        .unwrap();
+        p.set_claude_json(cj.clone());
+        p.collect(NOW, false);
+        // B signs in; the round that finds it can't save (a folder where the state goes)
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::write(
+            &cj,
+            r#"{"oauthAccount":{"accountUuid":"b","organizationUuid":"o"}}"#,
+        )
+        .unwrap();
+        fake.0.lock().unwrap().break_file = None;
+        let tmp = h
+            .join(STATE_FILE)
+            .with_extension(format!("{}.tmp", std::process::id()));
+        std::fs::create_dir(&tmp).unwrap();
+        p.collect(NOW + MINUTE_MS, false);
+        std::fs::remove_dir(&tmp).unwrap();
+        assert!(
+            !load_state(&h.join(STATE_FILE)).account_changed,
+            "not saved"
+        );
+        // the next round reads the state of A back, and the file again: the switch is found
+        p.collect(NOW + 2 * MINUTE_MS, false);
+        assert!(p.state.account_changed);
+    }
+
+    #[test]
+    fn no_statusline_record_is_used_while_the_account_can_t_be_read() {
+        let (mut p, _fake, h) = provider("account-unread-capture", vec![Ok(usage_text(10))]);
+        let cj = h.join("claude.json");
+        std::fs::write(
+            &cj,
+            r#"{"oauthAccount":{"accountUuid":"a","organizationUuid":"o"}}"#,
+        )
+        .unwrap();
+        p.set_claude_json(cj.clone());
+        p.collect(NOW, false);
+        // the file can't be read as an account now; a record came meanwhile
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::write(&cj, b"{").unwrap();
+        crate::statusline::save_capture(
+            &h,
+            &json!({"five_hour": {"used_percentage": 55, "resets_at": 1794844800}}),
+            NOW + MINUTE_MS,
+        )
+        .unwrap();
+        p.on_event(&Event::ClaudeStatuslineCaptured);
+        let snap = p.collect(NOW + 2 * MINUTE_MS, false);
+        assert!(
+            !snap.windows.iter().any(|w| w.used_percent == 55.0),
+            "{:?}",
+            snap.windows
+        );
+    }
+
+    #[test]
+    fn values_before_a_rate_limit_are_shown_as_old() {
+        let (mut p, _fake, _h) = provider(
+            "rate-stale",
+            vec![
+                Ok(usage_text(10)),
+                Err(UsageError::Retry(Diag::RateLimited)),
+            ],
+        );
+        p.collect(NOW, false);
+        let snap = p.collect(NOW + 15 * MINUTE_MS, true);
+        assert_eq!(snap.status, ProviderStatus::Stale);
+        assert_eq!(snap.fetched_at.as_deref(), Some(iso_from_ms(NOW).as_str()));
+    }
+
+    #[test]
+    fn no_turn_is_asked_for_while_the_state_can_t_be_read() {
+        let (mut p, _fake, h) = provider("state-unread-due", vec![Ok(usage_text(10))]);
+        p.collect(NOW, false);
+        let due = NOW + 20 * MINUTE_MS;
+        assert!(p.fetch_due_ms(due) <= due, "the fetch is due");
+        let state = h.join(STATE_FILE);
+        let kept = std::fs::read(&state).unwrap();
+        std::fs::remove_file(&state).unwrap();
+        std::fs::create_dir(&state).unwrap();
+        p.collect(due, false);
+        assert_eq!(p.fetch_due_ms(due), due + MINUTE_MS);
+        assert_eq!(p.next_due_ms(due), due + MINUTE_MS);
+        // a statusLine record that comes meanwhile wakes nothing before then
+        p.on_event(&Event::ClaudeStatuslineCaptured);
+        assert!(!p.passive_pending());
+        assert_eq!(p.next_due_ms(due), due + MINUTE_MS);
+        std::fs::remove_dir(&state).unwrap();
+        std::fs::write(&state, kept).unwrap();
+        // readable again: as planned
+        p.collect(due + MINUTE_MS, false);
+        assert!(p.state_retry_at.is_none());
+        // a tidy that is the first to find it unreadable starts the wait too
+        std::fs::remove_file(&state).unwrap();
+        std::fs::create_dir(&state).unwrap();
+        assert!(!p.forget_cached());
+        assert!(p.state_retry_at.is_some());
+    }
+
+    #[test]
+    fn claude_writes_a_broken_generation_file_again() {
+        let (mut p, _fake, h) = switched("gen-broken-claude");
+        p.accept_target(p.pending_switch());
+        p.accept_account();
+        p.collect(NOW + 10 * MINUTE_MS, false);
+        assert_eq!(p.account_accepted(), Some(true));
+        let accepted = p.state.accept_gen;
+        assert!(accepted >= 1);
+        std::fs::write(h.join("claude-statusline.gen"), b"").unwrap();
+        p.collect(NOW + 11 * MINUTE_MS, false);
+        assert_eq!(crate::statusline::read_claude_gen(&h), accepted);
+        // gone: written again too
+        std::fs::remove_file(h.join("claude-statusline.gen")).unwrap();
+        p.collect(NOW + 12 * MINUTE_MS, false);
+        assert_eq!(crate::statusline::read_claude_gen(&h), accepted);
+    }
+
+    #[test]
+    fn a_claude_state_gone_while_a_switch_waits_still_waits_for_it() {
+        let (_p, fake, h) = switched("state-gone-claude");
+        // only the state is gone (the account switched to B is in .claude.json)
+        std::fs::remove_file(h.join(STATE_FILE)).unwrap();
+        let mut again = provider_with(&h, &fake, Logger::stderr());
+        again.set_claude_json(h.join("claude.json"));
+        let snap = again.collect(NOW + 10 * MINUTE_MS, false);
+        assert!(again.state.account_changed, "the switch still waits");
+        assert_eq!(snap.error_code, Some(ErrorCode::AccountChanged));
+    }
+
+    /// The account-on-hold result (synthetic: shaped after the documented message and -p error code, not seen on this PC)
+    fn on_hold() -> Value {
+        serde_json::from_str(
+            &std::fs::read_to_string(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../fixtures/claude/usage-account-on-hold.sample.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn an_account_the_service_denies_is_an_access_denial_shared_with_every_pc() {
+        // zero use confirmed: an access denial, not a sign-in failure (its text names OAuth)
+        assert!(matches!(
+            check_usage_result(&on_hold()),
+            Err(UsageError::Retry(Diag::AccessDenied))
+        ));
+        let mut org = on_hold();
+        org["result"] =
+            json!("OAuth authentication is currently not allowed for this organization.");
+        org["error"] = json!("oauth_org_not_allowed");
+        assert!(matches!(
+            check_usage_result(&org),
+            Err(UsageError::Retry(Diag::AccessDenied))
+        ));
+        let mut forbidden = on_hold();
+        forbidden["result"] = json!(
+            r#"API Error: 403 {"type":"error","error":{"type":"permission_error","message":"x"}}"#
+        );
+        forbidden["error"] = Value::Null;
+        assert!(matches!(
+            check_usage_result(&forbidden),
+            Err(UsageError::Retry(Diag::AccessDenied))
+        ));
+        // other failures stay as they were
+        let mut login = on_hold();
+        login["result"] = json!("Not logged in · Please run /login");
+        login["error"] = Value::Null;
+        assert!(matches!(
+            check_usage_result(&login),
+            Err(UsageError::Retry(Diag::LoginRequired))
+        ));
+        // shown by output that can't confirm zero use: both stops
+        let plain = CmdOutput {
+            stdout: "Your account is on hold and can't use Claude Code. View details or appeal: https://claude.ai/restricted\n".into(),
+            success: false,
+        };
+        assert!(matches!(
+            classify_usage_output(Ok(plain)),
+            Err(UsageError::Stop(Diag::AccessDeniedUnverified))
+        ));
+        // on the error output alone: both stops, also when the output was cut; beside a result that confirms zero use, the
+        // service's denial
+        let run = |stdout: &str, complete| {
+            Ok(RunOutput {
+                stdout: stdout.into(),
+                stderr: "Your account is on hold and can't use Claude Code. View details or appeal: https://claude.ai/restricted".into(),
+                code: Some(1),
+                complete,
+            })
+        };
+        for (stdout, complete) in [("", true), ("", false)] {
+            assert_eq!(
+                classify_usage_run(run(stdout, complete)),
+                Err(UsageError::Stop(Diag::AccessDeniedUnverified))
+            );
+        }
+        let mut failed = on_hold();
+        failed["result"] = json!("Not logged in · Please run /login");
+        failed["error"] = Value::Null;
+        assert_eq!(
+            classify_usage_run(run(&failed.to_string(), true)),
+            Err(UsageError::Retry(Diag::AccessDenied))
+        );
+        // a collect that met it: an access denial upstream (the common side shares it), shown as one
+        let (mut p, _fake, _h) =
+            provider("denied", vec![Err(UsageError::Retry(Diag::AccessDenied))]);
+        let snap = p.collect(NOW, false);
+        assert_eq!(
+            p.take_run(),
+            Some(crate::providers::Run::Ran(
+                crate::providers::Outcome::AccessDenied
+            ))
+        );
+        assert_eq!(snap.error_code, Some(ErrorCode::AccessDenied));
+        assert!(!p.safety_stopped());
+        let (mut p, _fake, _h) = provider(
+            "denied-unverified",
+            vec![Err(UsageError::Stop(Diag::AccessDeniedUnverified))],
+        );
+        let snap = p.collect(NOW, false);
+        assert_eq!(
+            p.take_run(),
+            Some(crate::providers::Run::Ran(
+                crate::providers::Outcome::AccessDenied
+            ))
+        );
+        assert_eq!(
+            snap.error_code,
+            Some(ErrorCode::SafetyStop),
+            "the safety stop shows first"
+        );
+        assert!(p.safety_stopped(), "and it stays until the user's --force");
     }
 }

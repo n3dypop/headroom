@@ -2,9 +2,9 @@
 // ProviderSnapshot.status is the judgment at collection time, so displays must always use this instead.
 
 /** At or below this: normal display */
-export const FRESH_MAX_MINUTES = 15;
+export const FRESH_MAX_MINUTES = 20;
 /** At or below this: "caution"; above it: "old" */
-export const CAUTION_MAX_MINUTES = 60;
+export const CAUTION_MAX_MINUTES = 75;
 
 export type FreshnessLevel = "fresh" | "caution" | "old" | "unknown";
 
@@ -26,9 +26,11 @@ export function formatAge(minutes: number): string {
 export function freshnessOf(fetchedAt: string | null | undefined, now: Date = new Date()): Freshness {
   const t = fetchedAt ? Date.parse(fetchedAt) : Number.NaN;
   if (Number.isNaN(t)) return { level: "unknown", age_minutes: null, message: "⚠ Fetch time unknown" };
-  const age = Math.max(0, Math.floor((now.getTime() - t) / 60_000));
-  if (age <= FRESH_MAX_MINUTES) return { level: "fresh", age_minutes: age, message: null };
-  if (age <= CAUTION_MAX_MINUTES) {
+  // Judged on the time itself; only the minutes shown are rounded down
+  const ms = Math.max(0, now.getTime() - t);
+  const age = Math.floor(ms / 60_000);
+  if (ms <= FRESH_MAX_MINUTES * 60_000) return { level: "fresh", age_minutes: age, message: null };
+  if (ms <= CAUTION_MAX_MINUTES * 60_000) {
     return { level: "caution", age_minutes: age, message: `⚠ Value from ${formatAge(age)} ago` };
   }
   return { level: "old", age_minutes: age, message: `⚠ Value from ${formatAge(age)} ago (old)` };

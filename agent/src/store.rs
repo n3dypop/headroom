@@ -140,3 +140,83 @@ mod send_seq_tests {
         assert_eq!(next_send_seq(Some(after_clock_fix), 5_000), 5_000);
     }
 }
+
+/// A file lock in the Headroom folder (a provider's state; a statusLine record and its writers). The OS
+/// releases it when the file is closed
+pub struct FileLock {
+    _file: std::fs::File,
+}
+
+impl FileLock {
+    pub fn acquire(home: &Path, name: &str, wait: std::time::Duration) -> Option<Self> {
+        std::fs::create_dir_all(home).ok()?;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(home.join(name))
+            .ok()?;
+        let deadline = std::time::Instant::now() + wait;
+        loop {
+            match file.try_lock() {
+                Ok(()) => return Some(Self { _file: file }),
+                Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(20))
+                }
+                Err(_) => return None,
+            }
+        }
+    }
+}
+
+/// A statusLine acceptance generation file that isn't a number (written over, cut) or is gone: written again with the generation
+/// the caller's state was accepted in, under the writers' lock, so new inputs are taken again (a writer reads 0 from it meanwhile, and
+/// its records are of a generation before). true if it was written. Common to every provider that keeps one
+pub fn repair_gen_file(
+    home: &std::path::Path,
+    gen_file: &str,
+    lock_file: &str,
+    known: u64,
+) -> bool {
+    let path = home.join(gen_file);
+    let broken = |path: &std::path::Path| match std::fs::read_to_string(path) {
+        Ok(text) => text.trim().parse::<u64>().is_err(),
+        // Gone after an acceptance (the caller's state knows one), or can't be read
+        Err(_) => true,
+    };
+    if known == 0 || !broken(&path) {
+        return false;
+    }
+    let Some(_lock) = FileLock::acquire(home, lock_file, std::time::Duration::from_millis(500))
+    else {
+        return false;
+    };
+    broken(&path) && std::fs::write(&path, known.to_string()).is_ok()
+}
+
+/// The account a provider's state knows (its hash, this PC only: never sent), kept beside the state, so a state that is gone
+/// (deleted, lost) starts again knowing it: another account seen then is a switch to accept, not the first one. Common to
+/// every provider that tells accounts apart
+fn known_account_path(home: &std::path::Path, provider: &str) -> std::path::PathBuf {
+    home.join(format!("account-{provider}.txt"))
+}
+
+/// Keeps the account hash the state just saved (written only when it changed)
+pub fn keep_account(home: &std::path::Path, provider: &str, hash: Option<&str>) {
+    let Some(hash) = hash else {
+        return;
+    };
+    let path = known_account_path(home, provider);
+    if std::fs::read_to_string(&path).is_ok_and(|kept| kept.trim() == hash) {
+        return;
+    }
+    let _ = std::fs::write(path, hash);
+}
+
+/// The account hash kept for a state that is gone (None: none kept)
+pub fn known_account(home: &std::path::Path, provider: &str) -> Option<String> {
+    std::fs::read_to_string(known_account_path(home, provider))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}

@@ -10,7 +10,7 @@
 //   previous account are dropped, and the provider's keys carry a switch count, so the new account's events are never taken for old ones
 
 import { RESET_TOLERANCE_MS } from "./collector-selection.ts";
-import type { ErrorCode, ProviderId } from "./schema.ts";
+import { LIMIT_WITHOUT_WINDOWS, PROVIDERS, WINDOW_LIMIT_PROVIDERS, isDetailOnly, type ErrorCode, type ProviderId } from "./schema.ts";
 import type { Confidence } from "./history.ts";
 import { STOPPED_AFTER_MINUTES, type ProviderView, type SnapshotView, type WindowView } from "./view.ts";
 
@@ -266,7 +266,7 @@ export function judgeEvents(
   /** Windows judged from the view this round (including windows whose cycle was cleared) */
   const handled = new Set<string>();
 
-  for (const id of ["claude", "codex"] as const) {
+  for (const id of PROVIDERS) {
     const p = view[id];
     if (p) judgeProvider(id, p);
   }
@@ -304,7 +304,8 @@ export function judgeEvents(
       next.errors[id] = code;
     }
 
-    const windows = Object.values(p.windows);
+    // Windows shown in details only are never judged (no event, no cycle state, no stand-in for a windowless limit)
+    const windows = Object.values(p.windows).filter((w) => !isDetailOnly(id, w.id));
     for (const w of windows) judgeWindow(id, p, w);
 
     // The PC confirmed it is at the limit (blocked). If not already notified via an overall window at 100%, notify once while blocked
@@ -317,6 +318,9 @@ export function judgeEvents(
     if (windows.some((w) => o.pending.includes(w.key))) return;
     const main = windows.filter((w) => w.scope === null && !w.reset_passed);
     if (!main.some((w) => w.used_percent >= 100)) {
+      // A flag that follows from the overall windows stands only while one of them is at 100% now: once that one has reset (or is gone)
+      // nothing stands in for it. Without any window, only a provider whose agent may report the limit that way keeps it
+      if (WINDOW_LIMIT_PROVIDERS.includes(id) && (windows.length > 0 || !LIMIT_WITHOUT_WINDOWS.includes(id))) return;
       const w = main.reduce<WindowView | null>((a, b) => (a === null || b.used_percent > a.used_percent ? b : a), null);
       const c = w ? next.cycles[w.key] : undefined;
       if (w && c) {
@@ -432,6 +436,11 @@ export function judgeEvents(
     }, cycle));
     if (crossed.length > 0) cycle.alerted = true;
 
+    forecast(id, w, cycle);
+  }
+
+  /** The forecast's events of a judged fetch of an overall window: the limit soon, sudden consumption */
+  function forecast(id: ProviderId, w: WindowView, cycle: CycleState) {
     const trusted = w.confidence !== null && TRUSTED.includes(w.confidence);
     // Limit soon: at the faster rate the limit comes before the reset. Show only the smallest minutes crossed
     const eta = w.eta_fast_minutes;

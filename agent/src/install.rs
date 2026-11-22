@@ -2,8 +2,10 @@
 //!
 //! - `install`: stops a running agent, copies the executables to `~/.headroom/bin`, registers autostart at login and starts it.
 //! - `uninstall`: stops the agent and removes the registration. State, logs and config are kept.
-//! - `stop`: drops a stop-request file and waits for the agent to stop after its current fetch. Killing it in the middle of `/usage`
-//!   means zero quota use cannot be confirmed and the provider goes into a safety stop, so the process is never killed.
+//! - `stop`: drops a stop-request file naming the running agent's session and waits for it to stop after its current fetch. Killing it
+//!   in the middle of `/usage` means zero quota use cannot be confirmed and the provider goes into a safety stop, so the process is never
+//!   killed. A stop it couldn't wait out stays (the agent stops when its fetch ends); an agent started later never takes it.
+//! - `start`: reports a start only once the agent's session is up.
 //! - Windows uses the registry `HKCU\...\Run` (windowless `headroomw.exe agent`); Mac uses a LaunchAgent.
 
 use std::fs::{File, OpenOptions};
@@ -18,6 +20,8 @@ pub const STOP_FILE: &str = "stop-request";
 pub const LOCK_FILE: &str = "agent.lock";
 /// Wait longer than one fetch can take (Claude's `/usage` timeout of 60 seconds plus margin)
 pub const STOP_WAIT: Duration = Duration::from_secs(120);
+/// How long `start` waits for the agent's session to come up
+const START_WAIT: Duration = Duration::from_secs(30);
 pub const RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
 pub const RUN_VALUE: &str = "Headroom";
 pub const LAUNCH_LABEL: &str = "com.headroom.agent";
@@ -73,6 +77,20 @@ pub fn hold_agent_lock(home: &Path) -> Result<File, String> {
     }
 }
 
+/// The running agent's session: only while its writer holds the session lock (a session file an earlier agent left isn't one). The
+/// agent publishes it right after taking agent.lock
+pub fn session_of(home: &Path) -> Option<String> {
+    let probe = File::open(home.join(crate::schedule::SESSION_LOCK_FILE)).ok()?;
+    match probe.try_lock_shared() {
+        Err(std::fs::TryLockError::WouldBlock) => {}
+        Ok(()) | Err(std::fs::TryLockError::Error(_)) => return None,
+    }
+    drop(probe);
+    std::fs::read_to_string(home.join(crate::schedule::SESSION_FILE))
+        .ok()
+        .filter(|s| !s.is_empty())
+}
+
 /// Ok(true) if another process holds the lock. Taking it (Ok(false)) holds it until `lock` is dropped
 fn lock_is_held(lock: &File, home: &Path) -> Result<bool, String> {
     match lock.try_lock() {
@@ -87,7 +105,8 @@ fn lock_is_held(lock: &File, home: &Path) -> Result<bool, String> {
 
 /// Asks the agent to stop and waits until it does. Ok(false) if it was not running.
 /// The wait watches the same lock file handle it first found held, so renaming the folder meanwhile cannot look like a stop.
-/// (The stop request itself is still written and removed by path, so renaming the folder during the wait is not supported)
+/// The request names the agent's session: one held by another command (agent.lock with no session) is never stopped, and a request
+/// that outlives this wait stops that agent only (an agent started later drops it)
 pub fn stop(home: &Path, wait: Duration) -> Result<bool, String> {
     if matches!(home.try_exists(), Ok(false)) {
         return Ok(false);
@@ -97,10 +116,29 @@ pub fn stop(home: &Path, wait: Duration) -> Result<bool, String> {
         let _ = std::fs::remove_file(home.join(STOP_FILE));
         return Ok(false);
     }
-    File::create(home.join(STOP_FILE)).map_err(|_| "Cannot write the stop request".to_string())?;
+    // An agent starting publishes its session at once: it is waited for a moment
+    let begin = Instant::now();
+    let session = loop {
+        if let Some(s) = session_of(home) {
+            break s;
+        }
+        if !lock_is_held(&lock, home)? {
+            return Ok(false);
+        }
+        if begin.elapsed() >= wait.min(Duration::from_secs(10)) {
+            return Err(
+                "Another command holds the background agent's lock (or it is starting); try again"
+                    .into(),
+            );
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    std::fs::write(home.join(STOP_FILE), &session)
+        .map_err(|_| "Cannot write the stop request".to_string())?;
     let result = wait_for_release(&lock, home, wait);
-    // Whatever the outcome, remove the request so an agent started later is not stopped by it
-    let _ = std::fs::remove_file(home.join(STOP_FILE));
+    if result.is_ok() && std::fs::read_to_string(home.join(STOP_FILE)).is_ok_and(|s| s == session) {
+        let _ = std::fs::remove_file(home.join(STOP_FILE));
+    }
     result
 }
 
@@ -112,17 +150,33 @@ fn wait_for_release(lock: &File, home: &Path, wait: Duration) -> Result<bool, St
             return Ok(true);
         }
     }
-    Err("The agent did not stop (stuck in a fetch). Wait a while and try again".into())
+    Err("The agent is still in a fetch; it stops when that ends (it is never stopped in the middle of one)".into())
 }
 
-/// If a stop request exists, removes it and returns true (called by the agent loop)
-pub fn take_stop_request(home: &Path) -> bool {
+/// Whether a stop request for this session (or of an earlier version, naming none) waits: taken (removed) if so. One naming another
+/// session is dropped
+pub fn take_stop_request(home: &Path, session: &str) -> bool {
     let path = home.join(STOP_FILE);
-    if path.exists() {
+    match std::fs::read_to_string(&path) {
+        Ok(named) => {
+            let _ = std::fs::remove_file(&path);
+            named.is_empty() || named == session
+        }
+        Err(_) => false,
+    }
+}
+
+/// Whether a stop request for this session (or naming none) waits, left in place (the loop takes it at its top)
+pub fn stop_requested(home: &Path, session: &str) -> bool {
+    std::fs::read_to_string(home.join(STOP_FILE))
+        .is_ok_and(|named| named.is_empty() || named == session)
+}
+
+/// At the agent's start: a stop request left for another session (or naming none) is dropped; one naming this session stays
+pub fn drop_other_stops(home: &Path, session: &str) {
+    let path = home.join(STOP_FILE);
+    if std::fs::read_to_string(&path).is_ok_and(|named| named != session) {
         let _ = std::fs::remove_file(path);
-        true
-    } else {
-        false
     }
 }
 
@@ -130,8 +184,21 @@ pub fn take_stop_request(home: &Path) -> bool {
 /// Ok(false) if it was already running
 pub fn start(home: &Path) -> Result<bool, String> {
     crate::config::check_home(home)?;
-    if agent_lock_state(home)? {
+    if session_of(home).is_some() {
         return Ok(false);
+    }
+    // agent.lock held with no session: an agent starting, or another command holding it for a while (waited for)
+    let begin = Instant::now();
+    while agent_lock_state(home)? {
+        if session_of(home).is_some() {
+            return Ok(false);
+        }
+        if begin.elapsed() >= Duration::from_secs(10) {
+            return Err(
+                "Another command holds the background agent's lock; try again when it ends".into(),
+            );
+        }
+        std::thread::sleep(Duration::from_millis(200));
     }
     let program = installed_agent(home);
     if !program.is_file() {
@@ -140,7 +207,16 @@ pub fn start(home: &Path) -> Result<bool, String> {
             program.display()
         ));
     }
-    spawn_detached(&program, home).map(|()| true)
+    spawn_detached(&program, home)?;
+    // Started once its session is up (an agent that exits at once isn't)
+    let begin = Instant::now();
+    while begin.elapsed() < START_WAIT {
+        if session_of(home).is_some() {
+            return Ok(true);
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    Err("The background agent didn't come up (see agent.log in HEADROOM_HOME)".into())
 }
 
 /// Executable used for the background agent (windowless headroomw on Windows)
@@ -309,6 +385,11 @@ fn missing_cli_notes(cfg: &Config) -> Vec<String> {
             "Note: {name} was not found on PATH in this environment. It may be found when started at login; to be sure, set an absolute path in [{name}] {name}_bin in config.toml"
         )
     })
+    .chain(
+        (cfg.gemini.enabled && crate::providers::gemini::gemini_bin(&cfg.gemini).is_none()).then(|| {
+            "Note: agy (the Antigravity CLI) was not found on PATH or in its install folders. Install it, or set an absolute path in [gemini] gemini_bin in config.toml".to_string()
+        }),
+    )
     .collect()
 }
 
@@ -411,6 +492,13 @@ pub fn launch_path(cfg: &Config) -> String {
         if let Some(dir) = resolve_bin(&bin).and_then(|p| p.parent().map(Path::to_path_buf)) {
             add(dir);
         }
+    }
+    // agy is found by its path (not by PATH), but its own child processes may need its folder. Added also while Gemini is turned
+    // off, so turning it on later doesn't need another install
+    if let Some(dir) = crate::providers::gemini::gemini_bin(&cfg.gemini)
+        .and_then(|p| p.parent().map(Path::to_path_buf))
+    {
+        add(dir);
     }
     add(user_home().join(".local/bin"));
     for d in [
@@ -582,7 +670,7 @@ mod tests {
             Ok(false),
             "does nothing when not running"
         );
-        // Stand-in for the agent: holds the lock and releases it on seeing the stop request
+        // Stand-in for the agent: holds the lock, publishes its session and releases them on seeing the stop request for it
         let h2 = h.clone();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let agent = std::thread::spawn(move || {
@@ -593,10 +681,12 @@ mod tests {
                 .open(h2.join(LOCK_FILE))
                 .unwrap();
             f.try_lock().unwrap();
+            let session = crate::agent::publish_session(&h2, "s1").unwrap();
             ready_tx.send(()).unwrap();
-            while !take_stop_request(&h2) {
+            while !take_stop_request(&h2, "s1") {
                 std::thread::sleep(Duration::from_millis(50));
             }
+            drop(session);
             drop(f);
         });
         ready_rx.recv().unwrap();
@@ -611,7 +701,8 @@ mod tests {
     }
 
     #[test]
-    fn stop_gives_up_without_killing_and_clears_the_request() {
+    fn stop_gives_up_without_killing_keeps_its_request_for_that_session_only_and_never_stops_another_command()
+     {
         let h = home("stuck");
         let f = OpenOptions::new()
             .create(true)
@@ -620,8 +711,17 @@ mod tests {
             .open(h.join(LOCK_FILE))
             .unwrap();
         f.try_lock().unwrap();
+        // agent.lock held by another command (no session): nothing is asked of it
         assert!(stop(&h, Duration::from_millis(500)).is_err());
         assert!(!h.join(STOP_FILE).exists());
+        // an agent stuck in a fetch: the request for its session stays, so it stops once the fetch ends
+        let session = crate::agent::publish_session(&h, "s1").unwrap();
+        assert!(stop(&h, Duration::from_millis(500)).is_err());
+        assert_eq!(std::fs::read_to_string(h.join(STOP_FILE)).unwrap(), "s1");
+        // an agent started later (another session) drops it, and isn't stopped by it
+        drop_other_stops(&h, "s2");
+        assert!(!take_stop_request(&h, "s2"));
+        drop(session);
         drop(f);
         let _ = std::fs::remove_dir_all(h);
     }

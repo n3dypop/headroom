@@ -5,16 +5,21 @@
 // - error: the Worker picks a fixed text from error_code (the PC's text is not used)
 // - label: built by the Worker from the window id
 // - window id: only a base length form (five_hour, seven_day, monthly, window_<minutes>m, primary / secondary of unknown duration) or a known id,
-//   with a known model/group name (core's KNOWN_SCOPES) as prefix or suffix, plus a number to avoid collisions.
+//   with a known model/group name (core's KNOWN_SCOPES, then the provider's own PROVIDER_SCOPES) as prefix or suffix, plus a number
+//   to avoid collisions.
 //   Windows that don't match (including ids of another shape), and their observations, are not stored; the rest of the upload is
 //   (short org names can't be told apart by shape, so only known values are allowed)
 // - scope: derived from the known name in the id (the scope string sent by the PC is not used)
 // - plan: only known plan names (core's KNOWN_PLANS); anything else is null
 import {
   KNOWN_PLANS,
-  KNOWN_SCOPES,
+  PROVIDERS,
+  WINDOW_LIMIT_PROVIDERS,
+  LIMIT_WITHOUT_WINDOWS,
   CLOCK_TOLERANCE_MS,
   KNOWN_WINDOWS,
+  parseWindowId,
+  type WindowIdParts,
   shouldReplaceCollectorSnapshot,
   type ErrorCode,
   type ProviderId,
@@ -32,7 +37,6 @@ export interface CleanUpload {
   observations: UsageObservation[];
 }
 
-const PROVIDERS: readonly ProviderId[] = ["claude", "codex"];
 const STATUSES: readonly ProviderStatus[] = ["ok", "stale", "error", "unavailable"];
 const KINDS: readonly WindowKind[] = ["session", "weekly", "monthly", "other"];
 const ERROR_CODES: readonly ErrorCode[] = [
@@ -41,12 +45,8 @@ const ERROR_CODES: readonly ErrorCode[] = [
   "fetch_failed",
   "safety_stop",
   "account_changed",
+  "access_denied",
 ];
-const WINDOW_ID = /^[a-z0-9_]{1,64}$/;
-/** Base forms of a window id that express its length (primary / secondary are Codex limits of unknown duration) */
-const BASE_WINDOW = /^(five_hour|seven_day|monthly|window_(\d{1,6})m|primary|secondary)$/;
-/** Suffix Codex appends when the same id would collide (a number only follows _primary / _secondary) */
-const ID_SUFFIX = /(?:_(?:primary|secondary)(?:_\d{1,2})?)?$/;
 export const MAX_WINDOWS = 32;
 /** Max observations per upload. Keeps the rows written per request small. The PC sends them in batches of 200 */
 export const MAX_OBSERVATIONS = 200;
@@ -59,6 +59,7 @@ export const ERROR_TEXT: Readonly<Record<ErrorCode, string>> = {
   fetch_failed: "Fetch failed (see headroom status on the PC)",
   safety_stop: "Fetching paused for safety (see headroom status on the PC)",
   account_changed: "Fetching paused after an account switch (see headroom status on the PC)",
+  access_denied: "Access denied by the service: fetching stopped on every PC (see headroom status on the PC)",
 };
 
 class Invalid extends Error {}
@@ -80,43 +81,7 @@ export function isoOrNull(v: unknown): string | null {
   return year >= 2000 && year <= 2100 ? new Date(t).toISOString() : null;
 }
 
-/** A parsed window id. scope is the display name of the known name (null for the overall limit) */
-export interface WindowIdParts {
-  base: string;
-  minutes: number | null;
-  scope: string | null;
-  /** The known name as it appears in the id (null for the overall limit) */
-  slug: string | null;
-}
-
-/** Parses a window id. null if it is not a shape that may be stored */
-export function parseWindowId(id: unknown): WindowIdParts | null {
-  if (typeof id !== "string" || !WINDOW_ID.test(id)) return null;
-  if (Object.hasOwn(KNOWN_WINDOWS, id) && !BASE_WINDOW.test(id)) {
-    const slug = Object.keys(KNOWN_SCOPES).find((k) => id.endsWith(`_${k}`));
-    return { base: id, minutes: null, scope: slug === undefined ? null : KNOWN_SCOPES[slug]!, slug: slug ?? null };
-  }
-  const candidates = [id, id.replace(ID_SUFFIX, "")];
-  for (const core of candidates) {
-    const forms: [string, string | null][] = [[core, null]];
-    for (const slug of Object.keys(KNOWN_SCOPES)) {
-      if (core.startsWith(`${slug}_`)) forms.push([core.slice(slug.length + 1), slug]);
-      if (core.endsWith(`_${slug}`)) forms.push([core.slice(0, -slug.length - 1), slug]);
-    }
-    for (const [rest, slug] of forms) {
-      const m = BASE_WINDOW.exec(rest);
-      if (m) {
-        return {
-          base: m[1]!,
-          minutes: m[2] === undefined ? null : Number(m[2]),
-          scope: slug === null ? null : KNOWN_SCOPES[slug]!,
-          slug,
-        };
-      }
-    }
-  }
-  return null;
-}
+export { parseWindowId, type WindowIdParts } from "../../core/src/index.ts";
 
 /** Builds the display label from the id (the label sent by the PC is not used) */
 export function windowLabel(id: string, parts: WindowIdParts): string {
@@ -140,11 +105,11 @@ function oneOf<T extends string>(v: unknown, list: readonly T[], what: string): 
   fail(`${what} is invalid`);
 }
 
-/** Repacks a window. null if the id is not a shape that may be stored (the window is not stored) */
-function cleanWindow(v: unknown): UsageWindow | null {
+/** Repacks a window of `provider`. null if the id is not a shape that may be stored (the window is not stored) */
+function cleanWindow(v: unknown, provider: ProviderId): UsageWindow | null {
   if (!isRecord(v)) fail("invalid window shape");
   if (typeof v.id !== "string") fail("invalid window id");
-  const parts = parseWindowId(v.id);
+  const parts = parseWindowId(v.id, provider);
   if (parts === null) return null;
   const sentScope = v.scope !== null && v.scope !== undefined;
   // A per-model/per-group limit without a known name is not stored (so it is never mistaken for the overall limit)
@@ -170,7 +135,8 @@ function slugOf(name: string): string {
 }
 
 /**
- * Claude's limit flag means an overall window at 100% (that is how the agent sets it). An older Claude agent also counted windows
+ * Claude's and Gemini's limit flag means an overall window at 100% (that is how their agents set it). Gemini's is kept only while
+ * such a window remains (one without windows, from the start or after they were dropped, says nothing about the limit). An older Claude agent also counted windows
  * that are not stored (extra usage) or per-model windows it sent without a model, and a history boundary can drop the window that
  * set it. When windows remain but none of the overall ones is at 100%, the limit is unknown rather than reached (a value with
  * no windows at all keeps its flag). Other providers can know the limit apart from the windows, so their flag is kept
@@ -181,26 +147,32 @@ function limitFlag(
   blocked: boolean | null,
   dropped = false,
 ): boolean | null {
-  if (provider !== "claude") return blocked;
-  // A value whose windows were all dropped says nothing about the limit (true or false); one that came without windows keeps its flag
-  if (windows.length === 0) return dropped ? null : blocked;
+  if (!WINDOW_LIMIT_PROVIDERS.includes(provider)) return blocked;
+  // A value whose windows were all dropped says nothing about the limit (true or false). One that came without windows (every limit
+  // turned off) is not at a limit (false stands, so it stays a value of its own over another PC's older one); at the limit (true) only
+  // for a provider whose agent may report the limit that way
+  if (windows.length === 0) return dropped ? null : blocked === true && !LIMIT_WITHOUT_WINDOWS.includes(provider) ? null : blocked;
   if (blocked !== true) return blocked;
   return windows.some((w) => w.scope === null && w.used_percent >= 100) ? true : null;
 }
 
-/** Claude's provider fetch time is its oldest window's. After windows are dropped it is taken from the remaining ones */
+/** Claude's and Gemini's provider fetch time is its oldest window's. After windows are dropped it is taken from the remaining ones */
 function providerFetchedAt(provider: ProviderId, fetchedAt: string | null, windows: readonly UsageWindow[], dropped: boolean) {
-  if (provider !== "claude" || !dropped) return fetchedAt;
+  if (!WINDOW_LIMIT_PROVIDERS.includes(provider) || !dropped) return fetchedAt;
   const times = windows.map((w) => w.fetched_at).filter((t): t is string => t !== null).sort();
   return times[0] ?? fetchedAt;
 }
 
 /** Applies the limit-flag rule to a latest value after boundaries were applied */
 export function settleLimits(snapshot: Snapshot): Snapshot {
-  const claude = snapshot.providers.claude;
-  if (!claude || claude.blocked !== true) return snapshot;
-  const blocked = limitFlag("claude", claude.windows, claude.blocked);
-  return blocked === claude.blocked ? snapshot : { ...snapshot, providers: { ...snapshot.providers, claude: { ...claude, blocked } } };
+  let providers = snapshot.providers;
+  for (const id of WINDOW_LIMIT_PROVIDERS) {
+    const p = providers[id];
+    if (!p || p.blocked !== true) continue;
+    const blocked = limitFlag(id, p.windows, p.blocked);
+    if (blocked !== p.blocked) providers = { ...providers, [id]: { ...p, blocked } };
+  }
+  return providers === snapshot.providers ? snapshot : { ...snapshot, providers };
 }
 
 /**
@@ -211,7 +183,7 @@ export function withoutUnstored(snapshot: Snapshot): Snapshot {
   const providers: Snapshot["providers"] = {};
   for (const [id, p] of Object.entries(snapshot.providers) as [ProviderId, ProviderSnapshot][]) {
     const kept = p.windows.filter((w) => {
-      const parts = parseWindowId(w.id);
+      const parts = parseWindowId(w.id, id);
       return parts !== null && !(w.scope !== null && parts.scope === null);
     });
     const dropped = kept.length !== p.windows.length;
@@ -227,7 +199,7 @@ function cleanProvider(id: ProviderId, v: unknown, collector: string): ProviderS
   if (!isRecord(v)) fail("invalid provider shape");
   const windows = v.windows;
   if (!Array.isArray(windows) || windows.length > MAX_WINDOWS) fail("invalid windows");
-  const cleaned = windows.map(cleanWindow).filter((w): w is UsageWindow => w !== null);
+  const cleaned = windows.map((w) => cleanWindow(w, id)).filter((w): w is UsageWindow => w !== null);
   const dropped = cleaned.length !== windows.length;
   const blocked = limitFlag(id, cleaned, typeof v.blocked === "boolean" ? v.blocked : null, dropped);
   if (new Set(cleaned.map((w) => w.id)).size !== cleaned.length) fail("duplicate window id");
@@ -308,10 +280,12 @@ function notAfterSend(id: ProviderId, p: ProviderSnapshot, generatedAt: string):
 function cleanObservation(v: unknown, collector: string): UsageObservation | null {
   if (!isRecord(v)) fail("invalid observation shape");
   if (typeof v.window_id !== "string") fail("invalid observation window_id");
-  if (parseWindowId(v.window_id) === null) return null;
+  // The provider first: a window's names depend on it
+  const provider = oneOf(v.provider, PROVIDERS, "observation provider");
+  if (parseWindowId(v.window_id, provider) === null) return null;
   const windowId = v.window_id;
   return {
-    provider: oneOf(v.provider, PROVIDERS, "observation provider"),
+    provider,
     window_id: windowId,
     collector,
     resets_at: isoOrNull(v.resets_at),

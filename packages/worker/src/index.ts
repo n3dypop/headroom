@@ -2,7 +2,10 @@
 //
 //   PUT  /v2/snapshots/:collector  Write (only that PC's credential). Body is { seq, snapshot, observations }.
 //                                  After saving, puts the merged latest value (with boundaries applied) into public_state
-//   POST /v2/turns/:collector      Fetch turn (same credential as above). Body is { "claude": minutes, ... }; response is { "claude": { go, wait_s } }
+//   POST /v2/turns/:collector      Fetch turn of one attempt (same credential as above; holds.ts). Body is
+//                                  { "<provider>": { kind, attempt, gen? } }; response is { "<provider>": { go, kind, attempt, reason?, wait_s?, state } }
+//   POST /v2/turns/:collector/result  The attempt's result (same credential). Body is
+//                                  { "<provider>": { attempt, outcome, retry_s?, interval_s, minutes } }; response is { "<provider>": { ack, applied, state } }
 //   GET  /v2/snapshot              Merged snapshot (read credential). Reads only the one public_state row
 //   GET  /v2/view?tz=Asia/Tokyo    Display view (same). Reads only public_state and the derived-value rows, never history
 //   GET  /v2/events?after=<seq>    Events (same). Only seq greater than after. Reads only the one event_feed row
@@ -22,6 +25,8 @@ import {
   mergeSnapshots,
   toView,
   SCHEMA_VERSION,
+  PROVIDERS,
+  isDetailOnly,
   type ProviderId,
   type Snapshot,
 } from "../../core/src/index.ts";
@@ -49,6 +54,9 @@ import {
   hasSnapshots,
   loadBoundaryStamps,
   loadDerivedVersions,
+  loadDataVersions,
+  historySince,
+  loadWeeklyBuilt,
   type BoundaryStamps,
   loadEventFeed,
   loadEventState,
@@ -56,6 +64,7 @@ import {
   loadWeekly,
   saveWeekly,
   loadObservations,
+  rebuildDerivedPublic,
   loadPublicBoundaries,
   loadPublicRow,
   loadPublicState,
@@ -72,9 +81,10 @@ import {
   savePublicState,
   stampOf,
   saveUpload,
-  takeTurns,
   type D1Like,
+  WRITER,
 } from "./store.ts";
+import { parseResult, parseTurnRequest, reportResult, takeTurn } from "./holds.ts";
 
 export interface Env {
   DB: D1Like;
@@ -100,10 +110,9 @@ const MAX_BODY_BYTES = 1_000_000;
  * Export nothing but functions from this entry module (Workers reads named exports of the entry as functions or handler definitions and won't start otherwise)
  */
 const HISTORY_MS = (24 * 60 + 30) * 60_000;
-const PROVIDERS: readonly ProviderId[] = ["claude", "codex"];
 /** Derived-value format version. 2: added rate_pace */
 // 3: recomputed after rows an earlier Worker accepted are held to today's rules (observations ahead of their receipt, markers)
-const METRICS_FORMAT = 3;
+const METRICS_FORMAT = 4;
 
 function json(status: number, body: unknown): Response {
   return new Response(body === null ? null : JSON.stringify(body), {
@@ -186,10 +195,18 @@ export async function refreshDerived(db: D1Like, env: Env, at: Date): Promise<vo
   const stored = await loadDerivedVersions(db);
   // Read boundaries before observations. If a boundary moves mid-computation, the stamp is saved stale and the next Cron recomputes
   const boundaries = await loadBoundaryStamps(db);
+  // The history boundaries of every provider's observations, from the same read (fewer D1 calls per Cron)
+  const history = historySince(boundaries);
+  // Every provider's counter, then the latest value, once each: a counter read before the value it is saved with (an upload meanwhile
+  // advances it, and the next Cron computes again)
+  const versions = await loadDataVersions(db);
+  const row = await loadPublicRow(db);
+  let anySaved = false;
+  // Every provider due is computed in this run, each reading at most its equal share of the run's rows (CPU; nothing is cut short or
+  // left for a later Cron)
   for (const id of PROVIDERS) {
-    const version = await readDataVersion(db, id);
+    const version = versions.get(id) ?? 0;
     const saved = stored.get(id);
-    const row = await loadPublicRow(db);
     const merged = row?.snapshot;
     const p = merged?.providers[id];
     if (!row || !merged || !p) continue;
@@ -203,10 +220,14 @@ export async function refreshDerived(db: D1Like, env: Env, at: Date): Promise<vo
     if (version <= (saved?.version ?? 0) && !stale) continue;
     const times = p.windows.map((w) => Date.parse(w.fetched_at ?? "")).filter(Number.isFinite);
     const oldest = Math.min(at.getTime(), ...times);
-    const observations = await loadObservations(db, id, new Date(oldest - HISTORY_MS));
+    const observations = await loadObservations(db, id, new Date(oldest - HISTORY_MS), history);
     const metrics = computeMetrics(merged, observations, { collectorPriority: priority(env) }, [id])[id] ?? {};
     await saveDerived(db, id, metrics, version, at, stampOf(boundaries, id), basis, row.version, generation);
+    anySaved = true;
   }
+  // The read endpoint's row is rebuilt by each save; without one this run it is rebuilt here (an earlier Worker saved derived values
+  // only, or it was left behind)
+  if (!anySaved) await rebuildDerivedPublic(db);
 }
 
 /** Runs within the D1 budget. Reserves the per-run maximum before starting and settles with actual usage afterwards */
@@ -220,7 +241,9 @@ async function withinBudget<T>(
   // A run starting just before 00:00 UTC also reserves the next day
   const days = daysToReserve(at);
   // Refusals aren't metered (only the few rows the reserve statement reads; even at Workers' 100k requests/day that's a few hundred thousand rows, within the margin outside the write-side budget)
-  const reservation = await reserve(env.DB, days, amount, budgetLimit(env.D1_BUDGET_PERCENT));
+  // The reserve statement's own usage is measured, and settled with the run's
+  const r = metered(env.DB);
+  const reservation = await reserve(r.db, days, amount, budgetLimit(env.D1_BUDGET_PERCENT));
   if (reservation !== "reserved") return { ok: false, reason: reservation };
   // Once past the reserved day, abort without starting D1 statements
   const m = metered(env.DB, { clock, until: endOfDays(days) });
@@ -230,7 +253,8 @@ async function withinBudget<T>(
     if (e instanceof BudgetDeadline) return { ok: false, reason: "unavailable" };
     throw e;
   } finally {
-    await settle(env.DB, days, amount, m.usage, clock());
+    const used = { reads: m.usage.reads + r.usage.reads, writes: m.usage.writes + r.usage.writes, uncertain: m.usage.uncertain };
+    await settle(env.DB, days, amount, used, clock());
   }
 }
 
@@ -239,18 +263,6 @@ const refused = (reason: "exhausted" | "unavailable", at: Date) =>
   reason === "exhausted"
     ? json(503, { error: "d1_budget", retry_after_s: secondsUntilReset(at) })
     : json(503, { error: "unavailable" });
-
-/** Turn body { "claude": minutes, "codex": minutes }. Minutes are 0-1440 (0 releases; the upper bound is clamped in store) */
-function parseTurns(body: unknown): Map<ProviderId, number> | null {
-  if (typeof body !== "object" || body === null || Array.isArray(body)) return null;
-  const out = new Map<ProviderId, number>();
-  for (const [key, value] of Object.entries(body)) {
-    if (!PROVIDERS.includes(key as ProviderId)) return null;
-    if (typeof value !== "number" || !Number.isFinite(value) || value < 0 || value > 1440) return null;
-    out.set(key as ProviderId, value);
-  }
-  return out.size === 0 ? null : out;
-}
 
 /**
  * Reads the JSON body, at most MAX_BODY_BYTES. The size is counted while reading, so a larger body (with or without
@@ -291,9 +303,10 @@ export async function handle(request: Request, env: Env, now: () => Date = () =>
   if (url.hostname !== allowedHost) return problem(404, "not_found");
   const put = /^\/v2\/snapshots\/([^/]+)$/.exec(url.pathname);
   const turn = /^\/v2\/turns\/([^/]+)$/.exec(url.pathname);
+  const result = /^\/v2\/turns\/([^/]+)\/result$/.exec(url.pathname);
   const isRead = ["/v2/snapshot", "/v2/view", "/v2/events", "/v2/history"].includes(url.pathname);
-  if (!put && !turn && !isRead) return problem(404, "not_found");
-  if ((put && request.method !== "PUT") || (turn && request.method !== "POST") || (isRead && request.method !== "GET")) {
+  if (!put && !turn && !result && !isRead) return problem(404, "not_found");
+  if ((put && request.method !== "PUT") || ((turn || result) && request.method !== "POST") || (isRead && request.method !== "GET")) {
     return problem(405, "method_not_allowed");
   }
 
@@ -301,9 +314,9 @@ export async function handle(request: Request, env: Env, now: () => Date = () =>
   if (!token) return problem(401, "unauthorized");
   // Writes come only from agents of this protocol: an older agent's upload (one sent before an upgrade and arriving after it) is refused
   // before D1 is touched, so the one-time cleanup can't be undone by it
-  if ((put || turn) && request.headers.get("headroom-protocol") !== AGENT_PROTOCOL) return json(426, { error: "agent_outdated" });
+  if ((put || turn || result) && request.headers.get("headroom-protocol") !== AGENT_PROTOCOL) return json(426, { error: "agent_outdated" });
 
-  const writer = put ?? turn;
+  const writer = put ?? turn ?? result;
   let collector = "";
   if (writer) {
     try {
@@ -315,22 +328,34 @@ export async function handle(request: Request, env: Env, now: () => Date = () =>
     if (token.role !== "write" || token.collector !== collector) return problem(403, "forbidden");
   }
 
-  if (turn) {
+  if (turn || result) {
     let body: unknown;
     try {
       body = await readBody(request);
     } catch (e) {
       return e instanceof RangeError ? problem(413, "too_large") : problem(400, "invalid_json");
     }
-    const requests = parseTurns(body);
-    if (!requests) return problem(400, "invalid_turns");
     const at = now();
-    // No turn for a PC that can't deliver because registrable PC names are used up (don't delay fetching by PCs that can deliver)
-    const result = await withinBudget(env, at, RESERVE.turn, async (db) =>
-      (await mayWrite(db, collector)) ? takeTurns(db, collector, requests, at) : null, now);
-    if (result.ok && result.value !== null) return json(200, result.value);
-    // On days without budget, or for PCs that can't deliver, no turn is decided (each PC fetches on its own; uploads are refused too, so D1 is untouched)
-    return json(200, Object.fromEntries([...requests.keys()].map((id) => [id, { go: true, wait_s: 0 }])));
+    if (turn) {
+      const parsed = parseTurnRequest(body);
+      if (!parsed) return problem(400, "invalid_turns");
+      const { provider, req } = parsed;
+      // A PC that can't deliver (registrable PC names are used up) is granted nothing; a PC whose request can't be decided now (no
+      // budget, a race) is granted nothing either: it waits and asks again (a sharing PC never fetches without a go)
+      const decided = await withinBudget(env, at, RESERVE.turn, (db) => takeTurn(db, collector, provider, req, at, (name) => mayWrite(db, name)), now);
+      const answer = decided.ok && decided.value !== null
+        ? decided.value
+        : { go: false, kind: req.kind, attempt: req.attempt, reason: "unavailable" as const };
+      return json(200, { [provider]: answer });
+    }
+    const parsed = parseResult(body);
+    if (!parsed) return problem(400, "invalid_result");
+    const { provider, rep } = parsed;
+    // Accepted for the PC's own pending attempt also when its name could no longer be registered (it was granted before). One that can't
+    // be applied now is not acknowledged: the PC sends it again
+    const applied = await withinBudget(env, at, RESERVE.turn, (db) => reportResult(db, collector, provider, rep, at, WRITER), now);
+    if (!applied.ok || applied.value === null) return json(503, { error: "unavailable" });
+    return json(200, { [provider]: { ack: true, ...applied.value } });
   }
 
   if (put) {
@@ -376,7 +401,7 @@ export async function handle(request: Request, env: Env, now: () => Date = () =>
   // not response creation time, so a late old response doesn't revert a newer display)
   // boundaries: per-provider history boundary stamps (only accepted time and sequence number; no account info). Clients compare with
   // /v2/history's boundary and, if different (an account switch happened between reads), don't use that series
-  const boundaries = { claude: stampOf(stamps, "claude"), codex: stampOf(stamps, "codex") };
+  const boundaries = Object.fromEntries(PROVIDERS.map((id) => [id, stampOf(stamps, id)]));
   return json(200, { ...toView(snapshot, now(), { timeZone, metrics, collectorPriority: priority(env) }), data_version: row.dataVersion, boundaries });
 }
 
@@ -461,9 +486,10 @@ export async function refreshWeekly(db: D1Like, at: Date): Promise<void> {
   const hour = at.toISOString().slice(0, 13);
   // Read only WEEKLY_HOURS hours (including the current hour)
   const from = new Date(at.getTime() - (WEEKLY_HOURS - 1) * 3_600_000);
+  const built = await loadWeeklyBuilt(db);
   for (const provider of PROVIDERS) {
     const stamp = stampOf(boundaries, provider);
-    const saved = await loadWeekly(db, provider);
+    const saved = built.get(provider);
     if (saved && saved.builtHour === hour && saved.boundary === stamp) continue;
   // A boundary stamp is "accepted time#seq". Observations before that time (previous account) are not used
     const since = stamp.split("#")[0] ?? "";
@@ -491,6 +517,8 @@ export async function judge(db: D1Like, env: Env, at: Date): Promise<void> {
     const pending: string[] = [];
     for (const id of PROVIDERS) {
       for (const w of snapshot.providers[id]?.windows ?? []) {
+        // A window shown in details only is never judged, so it never waits
+        if (isDetailOnly(id, w.id)) continue;
         // Even with the same fetch time, a change in the chosen observation (PC priority) changes the value. Compare value and reset time too
         const c = metrics[id]?.[w.id];
         if (!c || c.fetched_at !== w.fetched_at || c.used_percent !== w.used_percent || c.resets_at !== w.resets_at) {
@@ -500,7 +528,7 @@ export async function judge(db: D1Like, env: Env, at: Date): Promise<void> {
     }
     const view = toView(snapshot, at, { metrics, collectorPriority: priority(env) });
     // The account-switch boundaries the view was built under (a switch starts the provider's notification state afresh)
-    const boundaries = { claude: stampOf(stamps, "claude"), codex: stampOf(stamps, "codex") };
+    const boundaries = Object.fromEntries(PROVIDERS.map((id) => [id, stampOf(stamps, id)])) as Record<ProviderId, string>;
     const judged = judgeEvents(view, state, { last_received_at: view.last_received_at }, at, { pending, boundaries });
     if (judged.changed) await recordEvents(db, token, judged.state, judged.events, at);
   }

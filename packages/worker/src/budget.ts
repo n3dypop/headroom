@@ -46,7 +46,8 @@ export function budgetLimit(percent: unknown): Usage {
 /** Estimated maximum per run. If less than this remains, don't start (never cross the limit mid-run) */
 export const RESERVE = {
   put: { reads: 5_000, writes: 1_500 },
-  turn: { reads: 50, writes: 20 },
+  // OVERHEAD_MAX and the turn's own statements (at most 9 reads and 9 writes as D1 counts them)
+  turn: { reads: 50, writes: 30 },
   // Max writes is CRON_WRITE_BOUND (deleting observations and events, recording events with the max number of windows; includes index updates)
   cron: { reads: 25_000, writes: 10_000 },
 } satisfies Record<string, Usage>;
@@ -150,8 +151,15 @@ export const utcDay = (now: Date) => now.toISOString().slice(0, 10);
 const changes = (result: unknown) =>
   Number((result as { meta?: { changes?: number } } | null)?.meta?.changes ?? 0);
 
-/** Usage of the reserve/settle statements themselves (reserve: insert/update a row and delete older days; settle: update) */
-const OVERHEAD: Usage = { reads: 8, writes: 8 };
+/** The most one settle statement uses: a d1_budget row read and written by its key, and that key's index entry */
+const SETTLE_STATEMENT: Usage = { reads: 2, writes: 2 };
+/**
+ * The most the reserve and settle statements use together, as D1 counts them (index writes included). The reserve statement's own
+ * usage is measured and settled; at most 9 reads and 12 writes (two new day rows, and the three rows an earlier two-day reservation
+ * kept deleted). Settle counts SETTLE_STATEMENT for each of its statements: three at most (a run that ends past its one reserved day).
+ * A run's own statements may use its reservation less this
+ */
+export const OVERHEAD_MAX: Usage = { reads: 16, writes: 16 };
 /** Max time one run can take (Cron's 15-minute limit). If 00:00 UTC is closer than this, also reserve for the next day */
 export const MAX_RUN_MS = 15 * 60_000;
 
@@ -200,7 +208,8 @@ export async function reserve(
 }
 
 /**
- * Corrects the reserved amount to the actual usage (including the reserve/settle statements). Reserved days up to the day the run
+ * Corrects the reserved amount to the actual usage (`used`: the run's statements and the reserve statement, as measured; settle's own
+ * statements are added here). Reserved days up to the day the run
  * ended get the actual amount; days not yet reached get 0 (the reservation is returned). If the end day was not reserved, it gets the full amount too.
  * The D1 free tier counts by execution day, so a run spanning days is counted in full on both (never underestimate).
  * The reservation is the per-run maximum so this normally won't exceed it, but cap at the limit anyway (so the constraint never fails settlement)
@@ -214,9 +223,12 @@ export async function settle(
 ): Promise<void> {
   // After a failure with unknown outcome, count no less than the reservation (don't return what may have run)
   const floor = used.uncertain ? reserved : { reads: 0, writes: 0 };
-  const reads = Math.ceil(Math.max(used.reads + OVERHEAD.reads, floor.reads));
-  const writes = Math.ceil(Math.max(used.writes + OVERHEAD.writes, floor.writes));
-  const end = utcDay(endedAt);
+  // The settle batch runs a moment after this time was read: the day it may run in is counted too, never only the day before
+  const end = utcDay(new Date(endedAt.getTime() + STATEMENT_GUARD_MS));
+  // Settle's own statements: one for each reserved day, two more for an end day not reserved
+  const own = days.length + (days.includes(end) ? 0 : 2);
+  const reads = Math.ceil(Math.max(used.reads + own * SETTLE_STATEMENT.reads, floor.reads));
+  const writes = Math.ceil(Math.max(used.writes + own * SETTLE_STATEMENT.writes, floor.writes));
   const adjust = (day: string, r: number, w: number) =>
     db
       .prepare(

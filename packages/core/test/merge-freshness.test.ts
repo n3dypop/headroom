@@ -12,14 +12,15 @@ import {
 const NOW = new Date("2026-11-16T12:00:00Z");
 const minutesAgo = (m: number) => new Date(NOW.getTime() - m * 60_000).toISOString();
 
-test("freshnessOf: within 15 minutes normal, within 60 caution, beyond that old", () => {
-  assert.deepEqual(freshnessOf(minutesAgo(15), NOW), { level: "fresh", age_minutes: 15, message: null });
-  assert.deepEqual(freshnessOf(minutesAgo(16), NOW), {
+test("freshnessOf: within 20 minutes normal, within 75 caution, beyond that old", () => {
+  assert.deepEqual(freshnessOf(minutesAgo(20), NOW), { level: "fresh", age_minutes: 20, message: null });
+  assert.deepEqual(freshnessOf(minutesAgo(21), NOW), {
     level: "caution",
-    age_minutes: 16,
-    message: "⚠ Value from 16m ago",
+    age_minutes: 21,
+    message: "⚠ Value from 21m ago",
   });
-  assert.equal(freshnessOf(minutesAgo(61), NOW).level, "old");
+  assert.equal(freshnessOf(minutesAgo(75), NOW).level, "caution");
+  assert.equal(freshnessOf(minutesAgo(76), NOW).level, "old");
   assert.equal(freshnessOf(minutesAgo(3 * 60), NOW).message, "⚠ Value from 3h ago (old)");
   assert.equal(freshnessOf(minutesAgo(3 * 24 * 60), NOW).message, "⚠ Value from 3d ago (old)");
   assert.equal(freshnessOf(null, NOW).level, "unknown");
@@ -90,6 +91,20 @@ test("mergeSnapshots: within 2 minutes of fetch time, collector priority decides
   const options = { collectorPriority: ["win", "mac"] };
   assert.equal(mergeSnapshots([mac, win], options)?.providers.claude?.blocked, true);
   assert.equal(mergeSnapshots([win, mac], { ...options, simultaneousMinutes: 0 })?.providers.claude?.collector, "mac");
+});
+
+test("within 2 minutes, a value its PC marked stale (a rate limit after it) gives way to a current one, whatever the priority", () => {
+  const limited = snap("win", 2, { claude: provider({ fetched_at: minutesAgo(1.5), blocked: false, status: "stale", error_code: "fetch_failed" }) });
+  const current = snap("mac", 0, { claude: provider({ fetched_at: minutesAgo(0), blocked: false }) });
+  const options = { collectorPriority: ["win", "mac"] };
+  assert.equal(mergeSnapshots([limited, current], options)?.providers.claude?.collector, "mac");
+  assert.equal(mergeSnapshots([limited, current], options)?.providers.claude?.status, "ok");
+  // the control: both current, the priority decides
+  const both = snap("win", 2, { claude: provider({ fetched_at: minutesAgo(1.5), blocked: false }) });
+  assert.equal(mergeSnapshots([both, current], options)?.providers.claude?.collector, "win");
+  // only stale ones: still chosen among them as before
+  const stale2 = snap("mac", 0, { claude: provider({ fetched_at: minutesAgo(0), blocked: false, status: "stale" }) });
+  assert.equal(mergeSnapshots([limited, stale2], options)?.providers.claude?.collector, "win");
 });
 
 test("mergeSnapshots: after an observed reset, the new cycle wins over a higher-priority previous-cycle value", () => {

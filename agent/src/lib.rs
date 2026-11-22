@@ -7,6 +7,7 @@ pub mod config;
 pub mod install;
 pub mod providers;
 pub mod push;
+pub mod requests;
 pub mod schedule;
 pub mod schema;
 pub mod statusline;

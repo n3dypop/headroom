@@ -14,7 +14,7 @@
 //! - 409 (observations stored, but `seq` was not above the stored one, so the latest value was not replaced) is not a success. Resend once
 //!   with a number above the stored `seq` from the reply (so the latest value arrives even after losing local state or fixing the clock).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -27,16 +27,22 @@ pub use crate::clock::{
 use crate::clock::{advance_locked, ensure_locked, save_locked, try_clock_lock};
 use crate::config::{Config, explicit_collector_id};
 use crate::providers::claude::STALE_AFTER_MS;
-use crate::schedule::{TurnAsker, TurnReply};
+use crate::schedule::{Ack, Answer, Ask, Kind, Reason, Reported, Shared, TurnAsker};
 use crate::schema::{
-    ErrorCode, ProviderSnapshot, ProviderStatus, Snapshot, is_collision_id, sendable_scope,
+    ErrorCode, ProviderSnapshot, ProviderStatus, Snapshot, is_collision_id, sendable_scope_in,
 };
 use crate::store::{Logger, backoff_ms, next_send_seq, read_json, write_json_atomic};
 use crate::time::{MINUTE_MS, iso_from_ms};
 
 pub const OUTBOX_FILE: &str = "outbox.json";
 /// Protocol of this agent's writes (header Headroom-Protocol). A Worker of a later protocol refuses it with 426
-const AGENT_PROTOCOL: &str = "2";
+const AGENT_PROTOCOL: &str = "3";
+/// An agent the destination refused as outdated (426) sends again this often, with no fetch (the destination may have been updated)
+const OUTDATED_RECHECK_MS: i64 = 60 * 60 * 1000;
+/// While outbox.json can't be read, how soon it is read again
+const UNREADABLE_RECHECK_MS: i64 = 60 * 1000;
+/// The longest wait (seconds) a service may name that is kept as it is (366 days, the destination's limit too)
+pub const MAX_WAIT_S: i64 = 366 * 86_400;
 /// Outbox format. 1: queued observations of collision ids are known to be windows that are sent. 2: each queued observation carries
 /// the clock epoch it was taken in (one without is never sent)
 const OUTBOX_VERSION: u32 = 2;
@@ -396,9 +402,13 @@ pub struct Outbox {
     pub version: u32,
     /// Written by earlier versions: the destination refused the clock. Read only by the first start of the clock state (clock.rs)
     pub clock_skewed: bool,
-    /// The destination answered 426 to this protocol (the agent must be updated): nothing is sent or fetched until the agent writes another
+    /// The destination answered 426 to this protocol (the agent must be updated): nothing is fetched until the agent writes another,
+    /// or until a send (made only now and then meanwhile, with no fetch) is taken: the destination was updated since
     #[serde(default)]
     pub outdated_protocol: Option<String>,
+    /// When that 426 came (this PC's clock)
+    #[serde(default)]
+    pub outdated_at_ms: Option<i64>,
     /// Values stamped at or before this time (ms) are not sent: they were stamped by a clock the destination refused (everything
     /// before the first send accepted after the refusal). Kept across restarts, so values a provider restores from its cache can't
     /// pass either
@@ -657,6 +667,13 @@ pub struct Pusher {
     /// outbox.json exists but couldn't be read: it is neither replaced nor sent from until it can be (its send number and marks
     /// would be lost)
     outbox_unreadable: bool,
+    /// While outbox.json can't be read: when it is read again (the agent wakes then, not every second), and when that was last logged
+    unreadable_retry_at: Option<i64>,
+    unreadable_logged_at: Option<i64>,
+    /// Providers whose queued observations stay queued (not sent) for now: turned off, or waiting for the user's choice on them
+    held: BTreeSet<String>,
+    /// When the destination said to try a turn request again (a 503 that named its wait; this PC's clock)
+    turn_retry_at: Option<i64>,
 }
 
 impl Pusher {
@@ -702,9 +719,19 @@ impl Pusher {
             credentials,
             outbox: read.unwrap_or_else(Outbox::empty),
             outbox_unreadable: unreadable,
+            unreadable_retry_at: None,
+            unreadable_logged_at: None,
+            turn_retry_at: None,
             dirty: true,
             unsettled: None,
+            held: BTreeSet::new(),
         }
+    }
+
+    /// The providers whose queued observations stay queued from the next send on (until set again). An earlier destination refuses
+    /// a whole request that carries a provider it doesn't know, the others' observations with it
+    pub fn hold_queued(&mut self, providers: BTreeSet<String>) {
+        self.held = providers;
     }
 
     /// Extracts new observations from the latest values and queues them. If the latest value changed, it is sent next
@@ -747,7 +774,11 @@ impl Pusher {
             if snap.error_code == Some(ErrorCode::AccountChanged) {
                 continue;
             }
-            for w in snap.windows.iter().filter_map(|w| w.for_upload()) {
+            for w in snap
+                .windows
+                .iter()
+                .filter_map(|w| w.for_upload_in(provider))
+            {
                 let Some(at) = &w.fetched_at else { continue };
                 let key = format!("{provider}.{}", w.id);
                 let last = self.outbox.last_observed.get(&key);
@@ -782,18 +813,29 @@ impl Pusher {
         let cutoff = iso_from_ms(now - KEEP_MS);
         // ISO 8601 UTC in the same format, so string comparison gives time order
         self.outbox.observations.retain(|o| o.observed_at >= cutoff);
+        // The oldest go first (a send moves held observations behind the others: the time order is restored here)
+        self.outbox
+            .observations
+            .sort_by(|a, b| a.observed_at.cmp(&b.observed_at));
         let extra = self.outbox.observations.len().saturating_sub(MAX_QUEUED);
         self.outbox.observations.drain(..extra);
     }
 
     fn save(&self) {
+        self.save_ok();
+    }
+
+    /// Saves the outbox; false if it couldn't be (logged)
+    fn save_ok(&self) -> bool {
         if self.outbox_unreadable {
-            return;
+            return false;
         }
         if write_json_atomic(&self.home.join(OUTBOX_FILE), &self.outbox).is_err() {
             self.log
                 .log("Cannot write outbox.json (unsent observations may be lost on restart)");
+            return false;
         }
+        true
     }
 
     /// Whether the clock is refused now (or might be: a send's result pending, or a state that can't be read). Nothing is fetched,
@@ -876,10 +918,20 @@ impl Pusher {
         Ok(Some(state))
     }
 
-    /// Next send time. With nothing to send, 15 minutes after the last success (liveness resend; i64::MAX if never succeeded)
+    /// Next send time. With nothing to send, 15 minutes after the last success (liveness resend; i64::MAX if never succeeded).
+    /// Held observations count as nothing to send
     pub fn due_ms(&self) -> i64 {
+        // A push state that can't be read is read again a minute on
+        if self.outbox_unreadable {
+            return self.unreadable_retry_at.unwrap_or(0);
+        }
         let after_retry = self.outbox.retry_at_ms.unwrap_or(0);
-        let idle = !self.dirty && self.outbox.observations.is_empty();
+        let idle = !self.dirty
+            && self
+                .outbox
+                .observations
+                .iter()
+                .all(|o| self.held.contains(&o.provider));
         let due = match (self.outbox.last_attempt_ms, self.outbox.last_success_ms) {
             // After a failure, back off, including for the liveness resend
             (Some(last), _) if self.outbox.failures > 0 => {
@@ -948,17 +1000,34 @@ impl Pusher {
     }
 
     /// Sends when due; queued observations go out in chunks of the per-request limit.
-    // Every branch ends with return so each reply's result is written the same way
-    #[allow(clippy::needless_return)]
     pub fn push(&mut self, snapshot: &Snapshot, now: i64) {
+        if !self.prepare(now) || self.due_ms() > now {
+            return;
+        }
+        self.send(snapshot, now);
+    }
+
+    /// What every send does first, also in a manual collect that sends no value: a send's result left unsaved is saved, and an
+    /// agent refused as outdated checks now and then whether it is taken again. false while nothing may be sent
+    pub fn prepare(&mut self, now: i64) -> bool {
         // Times saved while the clock ran ahead (it has since been set back) don't hold the next send back
         self.outbox.last_attempt_ms = self.outbox.last_attempt_ms.map(|t| t.min(now));
         self.outbox.last_success_ms = self.outbox.last_success_ms.map(|t| t.min(now));
         if !self.readable() {
-            self.log
-                .log("Push: outbox.json can't be read; nothing is sent until it can be");
-            return;
+            // Read again a minute on, and said at most every 10 minutes
+            self.unreadable_retry_at = Some(now.saturating_add(UNREADABLE_RECHECK_MS));
+            if self
+                .unreadable_logged_at
+                .is_none_or(|t| now - t >= 10 * MINUTE_MS || now < t)
+            {
+                self.unreadable_logged_at = Some(now);
+                self.log
+                    .log("Push: outbox.json can't be read; nothing is sent until it can be");
+            }
+            return false;
         }
+        self.unreadable_retry_at = None;
+        self.unreadable_logged_at = None;
         // A result not saved yet (saving it failed): saved first, also when this agent is outdated (a send's result left pending
         // would hold values back here); until then nothing more is sent
         if let Some((epoch, outcome)) = self.unsettled {
@@ -967,16 +1036,61 @@ impl Pusher {
                 Err(e) => {
                     self.log
                         .log(&format!("Push: couldn't save the last send's result: {e}"));
-                    return;
+                    return false;
                 }
             }
         }
+        // Refused as outdated: nothing is sent or fetched; now and then a peek of the shared state (it carries no value, no observation
+        // and no send number, and the queue stays as it is) checks whether the destination takes this protocol again. A 426 to a turn
+        // request is counted from this round
         if self.outdated() {
-            return;
+            // Counted from the 426, or from the last check (whatever came of it), saved before the check so a restart or a failure
+            // doesn't move it
+            let since = *self.outbox.outdated_at_ms.get_or_insert(now);
+            if now - since < OUTDATED_RECHECK_MS {
+                if since == now {
+                    self.save();
+                }
+                return false;
+            }
+            self.outbox.outdated_at_ms = Some(now);
+            if !self.save_ok() {
+                return false;
+            }
+            let url = self.turns_endpoint();
+            let provider = crate::providers::PROVIDER_IDS[0];
+            self.turn_retry_at = None;
+            let peek = self.post_turns(&url, json!({ provider: { "kind": "peek" } }));
+            // Taken again only on a peek's answer as this protocol has it: no go, no attempt, no reason, the shared state whole
+            let taken = peek.is_some_and(|v| {
+                let a = &v[provider];
+                a["kind"] == "peek"
+                    && a["go"] == false
+                    && a.get("attempt").is_some_and(serde_json::Value::is_null)
+                    && a.get("reason").is_none()
+                    && shared_of(&a["state"]).is_some()
+            });
+            if !taken && let Some(at) = self.turn_retry_at.take() {
+                // A longer wait the destination named counts too (the next check is the later of the two)
+                self.outbox.outdated_at_ms = Some(at.saturating_sub(OUTDATED_RECHECK_MS).max(now));
+                self.save();
+            }
+            if taken {
+                self.outbox.outdated_protocol = None;
+                self.outbox.outdated_at_ms = None;
+                self.save();
+                self.log
+                    .log("Push: the destination takes this agent's protocol again");
+            }
+            return false;
         }
-        if self.due_ms() > now {
-            return;
-        }
+        true
+    }
+
+    /// The send itself, once due
+    // Every branch ends with return so each reply's result is written the same way
+    #[allow(clippy::needless_return)]
+    fn send(&mut self, snapshot: &Snapshot, now: i64) {
         let started = Instant::now();
         let headers = match self.auth_headers() {
             Ok(h) => h,
@@ -1000,12 +1114,12 @@ impl Pusher {
                 .flat_map(|(p, s)| {
                     s.windows
                         .iter()
-                        .filter(|w| w.for_upload().is_none())
+                        .filter(|w| w.for_upload_in(p).is_none())
                         .map(move |w| (p.clone(), w.id.clone()))
                 })
                 .collect();
             self.outbox.observations.retain(|o| {
-                sendable_scope(&o.window_id).is_some()
+                sendable_scope_in(&o.provider, &o.window_id).is_some()
                     && !refused
                         .iter()
                         .any(|(p, id)| *p == o.provider && *id == o.window_id)
@@ -1045,10 +1159,21 @@ impl Pusher {
             let mut upload = snapshot.for_upload();
             upload.generated_at = iso_from_ms(sent_at);
             strip_untrusted(&mut upload.providers, skewed, distrust, &stamps, sent_at);
+            // Held observations stay queued behind the others (the order within each part is kept)
+            let held = &self.held;
+            self.outbox
+                .observations
+                .sort_by_key(|o| held.contains(&o.provider));
+            let sendable = self
+                .outbox
+                .observations
+                .iter()
+                .take_while(|o| !held.contains(&o.provider))
+                .count();
             let count = if skewed {
                 0
             } else {
-                self.outbox.observations.len().min(MAX_PER_REQUEST)
+                sendable.min(MAX_PER_REQUEST)
             };
             let seq = next_send_seq(self.outbox.last_seq, now);
             self.outbox.last_seq = Some(seq);
@@ -1104,6 +1229,12 @@ impl Pusher {
                     self.outbox.observations.drain(..count);
                     self.dirty = false;
                     self.outbox.retry_at_ms = None;
+                    // Taken: the destination doesn't refuse this protocol (any more)
+                    if self.outbox.outdated_protocol.take().is_some() {
+                        self.outbox.outdated_at_ms = None;
+                        self.log
+                            .log("Push: the destination takes this agent's protocol again");
+                    }
                     return self.finish(sent_at, true, "Sent");
                 }
                 Ok((409, text)) => {
@@ -1168,9 +1299,10 @@ impl Pusher {
                     return self.finish(sent_at, false, "Destination URL not found (404)");
                 }
                 Ok((426, _)) => {
-                    // The Worker takes writes only from a newer agent. Keep the observations (a newer agent sends them), and send or fetch
-                    // nothing more with this protocol
+                    // The Worker takes writes only from a newer agent. Keep the observations (a newer agent sends them), fetch nothing,
+                    // and send only now and then to check again
                     self.outbox.outdated_protocol = Some(AGENT_PROTOCOL.to_string());
+                    self.outbox.outdated_at_ms = Some(sent_at);
                     return self.finish(
                         sent_at,
                         false,
@@ -1257,48 +1389,183 @@ fn parse_ms(iso: &str) -> Option<i64> {
         .map(|t| t.as_millisecond())
 }
 
-impl TurnAsker for Pusher {
-    /// Asks the destination for the turn. None if unreachable, no credentials, or the answer is unreadable (this PC fetches itself).
-    /// Not counted in the push state (failure count, backoff)
-    fn ask_turn(&mut self, provider: &str, minutes: i64) -> Option<TurnReply> {
-        // An outdated agent takes no turn and doesn't fetch on its own either
-        if self.outdated() {
-            return Some(TurnReply {
-                go: false,
-                wait_ms: 60 * 60 * 1000,
-            });
-        }
-        // While the destination refuses this PC's clock, it takes no turn (it can still hand one back)
-        if minutes > 0 && usable_epoch(&self.home).is_none() {
-            return None;
-        }
+impl Pusher {
+    /// A request to the turn endpoint (`url`): the answer's JSON, only from a 200. A 426 marks this agent outdated (its sends check it
+    /// again). Never counted in the push state (failure count, backoff); nothing of it is logged
+    fn post_turns(&mut self, url: &str, body: serde_json::Value) -> Option<serde_json::Value> {
         let headers = self.auth_headers().ok()?;
         let headers: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (*k, v.as_str())).collect();
-        let body = json!({ provider: minutes }).to_string();
-        let url = self.turns_endpoint();
-        let (status, text) = self.transport.post(&url, &headers, &body).ok()?;
-        // The destination takes writes only from a newer agent: this PC doesn't fetch on its own either (its values couldn't be sent)
+        let (status, text) = self.transport.post(url, &headers, &body.to_string()).ok()?;
         if status == 426 {
-            // Kept like a 426 to an upload: also after a restart this agent sends and fetches nothing more
-            if self.readable() {
+            // Kept like a 426 to an upload: also after a restart this agent fetches nothing until a send is taken. The hourly check
+            // counts from now
+            if self.readable() && !self.outdated() {
                 self.outbox.outdated_protocol = Some(AGENT_PROTOCOL.to_string());
+                // Timed now (with the OS clock; without one, by the next round's time)
+                self.outbox.outdated_at_ms = self.clock.map(|c| c());
                 self.save();
             }
-            return Some(TurnReply {
-                go: false,
-                wait_ms: 60 * 60 * 1000,
-            });
+            return None;
+        }
+        if status == 503 {
+            self.turn_retry_at = serde_json::from_str::<serde_json::Value>(&text)
+                .ok()
+                .and_then(|v| v["retry_after_s"].as_i64())
+                .filter(|w| (0..=MAX_WAIT_S).contains(w))
+                .map(|w| {
+                    self.clock
+                        .map_or_else(crate::time::now_ms, |c| c())
+                        .saturating_add(w * 1000)
+                });
+            return None;
         }
         if status != 200 {
             return None;
         }
-        let v: serde_json::Value = serde_json::from_str(&text).ok()?;
-        let go = v[provider]["go"].as_bool()?;
-        let wait_s = v[provider]["wait_s"].as_i64()?;
-        Some(TurnReply {
+        serde_json::from_str(&text).ok()
+    }
+}
+
+/// The provider's shared state in an answer (None if it isn't there whole, with the row's version)
+fn shared_of(v: &serde_json::Value) -> Option<Shared> {
+    let wait = v["rate_wait_s"]
+        .as_i64()
+        .filter(|w| (0..=MAX_WAIT_S).contains(w))?;
+    Some(Shared {
+        denied: v["denied"].as_bool()?,
+        denied_gen: v["denied_gen"].as_u64()?,
+        rate_stage: v["rate_stage"].as_u64().filter(|s| *s <= 4)? as u32,
+        rate_wait_ms: wait * 1000,
+        version: v["version"].as_u64()?,
+    })
+}
+
+impl TurnAsker for Pusher {
+    /// Asks the destination for the turn of one attempt. None (the fetch waits): an outdated agent, a clock the destination refuses
+    /// (nothing is granted to it; a lease can still be handed back and the state read), no credentials, unreachable, an earlier
+    /// destination (426, or an answer of another form), an answer without the shared state, or one for another kind or attempt than
+    /// asked
+    fn ask(&mut self, provider: &str, ask: Ask<'_>) -> Option<Answer> {
+        if self.outdated() {
+            return None;
+        }
+        let kind = ask.kind;
+        if !matches!(kind, Kind::Release | Kind::Peek) && usable_epoch(&self.home).is_none() {
+            return None;
+        }
+        let mut entry = serde_json::Map::new();
+        entry.insert("kind".into(), json!(kind.as_str()));
+        if let Some(a) = ask.attempt {
+            entry.insert("attempt".into(), json!(a));
+        }
+        if let Some(g) = ask.stop {
+            entry.insert("gen".into(), json!(g));
+        }
+        if let Some(b) = ask.base {
+            entry.insert("base".into(), json!(b));
+        }
+        if let Some(r) = ask.replace {
+            entry.insert("replace".into(), json!(r));
+        }
+        if ask.again {
+            entry.insert("again".into(), json!(true));
+        }
+        let url = self.turns_endpoint();
+        let v = self.post_turns(&url, json!({ provider: entry }))?;
+        let a = &v[provider];
+        if a["kind"].as_str() != Some(kind.as_str()) || a["attempt"].as_str() != ask.attempt {
+            return None;
+        }
+        let reason = match a.get("reason") {
+            Some(r) => Some(Reason::parse(r.as_str()?)?),
+            None => None,
+        };
+        let go = a["go"].as_bool()?;
+        // Every answer carries the shared state whole, with the row's version
+        let shared = shared_of(&a["state"])?;
+        let wait_s = match a.get("wait_s") {
+            Some(w) => w.as_i64().filter(|w| (0..=MAX_WAIT_S).contains(w))?,
+            None => 0,
+        };
+        // A go is only one with no reason against it, no wait, no stop (a resume: the stop asked for still standing), on a row
+        // written since the version asked against (a grant writes it)
+        if go
+            && (reason.is_some()
+                || ask.base.is_some_and(|b| shared.version <= b)
+                || wait_s > 0
+                || shared.rate_wait_ms > 0
+                || matches!(kind, Kind::Peek | Kind::Release)
+                || if kind == Kind::Resume {
+                    !(shared.denied && Some(shared.denied_gen) == ask.stop)
+                } else {
+                    shared.denied
+                })
+        {
+            return None;
+        }
+        Some(Answer {
             go,
-            wait_ms: wait_s.clamp(0, 70 * 60) * 1000,
+            reason,
+            wait_ms: wait_s * 1000,
+            shared: Some(shared),
         })
+    }
+
+    /// Reports the attempt's result. Some once the destination acknowledged it for this attempt and kind (None: sent again later)
+    fn report(
+        &mut self,
+        provider: &str,
+        attempt: &str,
+        kind: Kind,
+        outcome: Reported,
+        interval_min: i64,
+        lease_min: i64,
+    ) -> Option<Ack> {
+        if self.outdated() {
+            return None;
+        }
+        let mut entry = json!({
+            "attempt": attempt,
+            "kind": kind.as_str(),
+            "outcome": outcome.as_str(),
+            "interval_s": interval_min.clamp(crate::config::MIN_INTERVAL_MIN, 1_440) * 60,
+            "minutes": lease_min.clamp(0, 1_440),
+        });
+        if let Reported::RateLimited { retry_ms: Some(ms) } = outcome {
+            entry["retry_s"] = json!(((ms + 999) / 1000).clamp(0, MAX_WAIT_S));
+        }
+        let url = format!("{}/result", self.turns_endpoint());
+        let v = self.post_turns(&url, json!({ provider: entry }))?;
+        let a = &v[provider];
+        // Acknowledged for this attempt and kind only, with whether it was applied and the shared state whole
+        if a["ack"].as_bool() != Some(true)
+            || a["attempt"].as_str() != Some(attempt)
+            || a["kind"].as_str() != Some(kind.as_str())
+        {
+            return None;
+        }
+        let applied = a["applied"].as_bool()?;
+        let shared = shared_of(&a["state"])?;
+        // An applied result shows in the shared state it returns: a stop started, a wait at least as long as named, a resume's end
+        let shows = match outcome {
+            Reported::AccessDenied => shared.denied,
+            // A stage begun, and a wait at least the first stage's and the one named
+            // (at least as long as the destination gives it: its stage's, the interval reported and the one named, the longest)
+            Reported::RateLimited { retry_ms } => {
+                let stages = crate::schedule::RATE_STAGES_MIN;
+                let stage = shared.rate_stage.clamp(1, stages.len() as u32) as usize;
+                let wait = (stages[stage - 1] * MINUTE_MS)
+                    .max(interval_min.clamp(crate::config::MIN_INTERVAL_MIN, 1_440) * MINUTE_MS)
+                    .max(retry_ms.unwrap_or(0).min(MAX_WAIT_S * 1000));
+                shared.rate_stage >= 1 && shared.rate_wait_ms + MINUTE_MS >= wait
+            }
+            Reported::Ok if kind == Kind::Resume => !shared.denied,
+            _ => true,
+        };
+        if applied && !shows {
+            return None;
+        }
+        Some(Ack { applied, shared })
     }
 }
 
@@ -1320,6 +1587,8 @@ mod tests {
         /// POST (turn) targets and bodies, and their replies (unreachable if none)
         posts: Vec<(String, serde_json::Value)>,
         post_replies: Vec<(u16, String)>,
+        /// With no reply queued, every turn asked for is granted (instead of the destination being unreachable)
+        turns_granted: bool,
         /// Run once a PUT has arrived, before its reply (a fault right after the request went out)
         on_put: Option<Box<dyn FnMut() + Send>>,
     }
@@ -1364,12 +1633,28 @@ mod tests {
             body: &str,
         ) -> Result<(u16, String), SendError> {
             let mut s = self.0.lock().unwrap();
-            s.posts
-                .push((url.to_string(), serde_json::from_str(body).unwrap()));
-            if s.post_replies.is_empty() {
-                Err(SendError::Network)
-            } else {
+            let asked: serde_json::Value = serde_json::from_str(body).unwrap();
+            s.posts.push((url.to_string(), asked.clone()));
+            if !s.post_replies.is_empty() {
                 Ok(s.post_replies.remove(0))
+            } else if s.turns_granted {
+                let state = json!({"denied": false, "denied_gen": 0, "rate_stage": 0, "rate_wait_s": 0, "version": s.posts.len()});
+                let granted: serde_json::Map<String, serde_json::Value> = asked
+                    .as_object()
+                    .unwrap()
+                    .iter()
+                    .map(|(k, v)| {
+                        let answer = if url.ends_with("/result") {
+                            json!({"ack": true, "attempt": v["attempt"], "kind": v["kind"], "applied": true, "state": state})
+                        } else {
+                            json!({"go": v["kind"] != "peek" && v["kind"] != "release", "kind": v["kind"], "attempt": v["attempt"], "state": state})
+                        };
+                        (k.clone(), answer)
+                    })
+                    .collect();
+                Ok((200, serde_json::Value::Object(granted).to_string()))
+            } else {
+                Err(SendError::Network)
             }
         }
     }
@@ -1427,6 +1712,75 @@ mod tests {
 
     fn snapshot(l: &BTreeMap<String, ProviderSnapshot>) -> Snapshot {
         crate::schema::build_snapshot(l.clone(), NOW, "mac")
+    }
+
+    #[test]
+    fn a_held_providers_observations_stay_queued_until_released_or_dropped_on_a_boundary() {
+        let h = home("held");
+        let t = FakeTransport::default();
+        let mut p = pusher(&h, &t, Ok(creds()));
+        let mut l = latest(10.0, NOW, None);
+        let gemini = l["claude"].clone();
+        l.insert("gemini".into(), gemini);
+        let providers = |body: &serde_json::Value| -> Vec<String> {
+            body["observations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|o| o["provider"].as_str().unwrap().to_string())
+                .collect()
+        };
+        // held (waiting for the user's choice, or turned off): the others go, its own stay queued
+        p.hold_queued(BTreeSet::from(["gemini".to_string()]));
+        p.record(&l, true, NOW);
+        p.push(&snapshot(&l), NOW);
+        assert_eq!(providers(&t.0.lock().unwrap().bodies[0]), ["claude"]);
+        assert_eq!(p.outbox.observations.len(), 1);
+        // held ones are nothing to send: no send a minute later for them
+        assert!(p.due_ms() >= NOW + LIVENESS_INTERVAL_MS - MINUTE_MS);
+        // released (the same account): they go
+        p.hold_queued(BTreeSet::new());
+        p.push(&snapshot(&l), NOW + 2 * MINUTE_MS);
+        assert_eq!(providers(&t.0.lock().unwrap().bodies[1]), ["gemini"]);
+        assert!(p.outbox.observations.is_empty());
+        // held again, then accepted as another account (a boundary): they are dropped, never sent
+        let mut later = latest(20.0, NOW + 5 * MINUTE_MS, None);
+        later.insert("gemini".into(), later["claude"].clone());
+        p.hold_queued(BTreeSet::from(["gemini".to_string()]));
+        p.record(&later, true, NOW + 5 * MINUTE_MS);
+        assert_eq!(p.outbox.observations.len(), 2);
+        let mut accepted = later.clone();
+        let g = accepted.get_mut("gemini").unwrap();
+        g.history_since = Some(iso_from_ms(NOW + 6 * MINUTE_MS));
+        g.windows.clear();
+        p.hold_queued(BTreeSet::new());
+        p.record(&accepted, true, NOW + 6 * MINUTE_MS);
+        assert!(p.outbox.observations.iter().all(|o| o.provider == "claude"));
+        let _ = std::fs::remove_dir_all(h);
+    }
+
+    #[test]
+    fn over_the_queue_limit_the_oldest_go_first_also_after_held_ones_were_moved_behind() {
+        let h = home("prune-order");
+        let t = FakeTransport::default();
+        let mut p = pusher(&h, &t, Ok(creds()));
+        let obs = |provider: &str, at: i64| Observation {
+            provider: provider.into(),
+            window_id: "five_hour".into(),
+            resets_at: None,
+            used_percent: 1.0,
+            observed_at: iso_from_ms(at),
+            epoch: None,
+        };
+        // as a send leaves them: newer Claude ones first, the older held Gemini ones behind
+        p.outbox.observations = (0..MAX_QUEUED as i64)
+            .map(|i| obs("claude", NOW + 10_000 + i))
+            .chain((0..10).map(|i| obs("gemini", NOW + i)))
+            .collect();
+        p.prune(NOW + 20_000);
+        assert_eq!(p.outbox.observations.len(), MAX_QUEUED);
+        assert!(p.outbox.observations.iter().all(|o| o.provider == "claude"));
+        let _ = std::fs::remove_dir_all(h);
     }
 
     #[test]
@@ -1743,8 +2097,8 @@ mod tests {
         assert_eq!(p.outbox.failures, 1);
         let result = p.outbox.last_result.clone().unwrap();
         assert!(result.contains("about 7 min behind"), "{result}");
-        // No turn is taken while refused (handing one back still goes out)
-        assert!(p.ask_turn("claude", 7).is_none());
+        // Nothing is granted while refused (handing a lease back still goes out)
+        assert!(p.ask("claude", FETCH_ASK).is_none());
         assert!(t.0.lock().unwrap().posts.is_empty());
         // The clock was an hour ahead when it was refused; once set back, the next send isn't held back by that time
         p.outbox.last_attempt_ms = Some(NOW + 60 * MINUTE_MS);
@@ -2124,51 +2478,273 @@ mod tests {
         assert_eq!(body, r#"{"seq":1}"#);
     }
 
+    const ATTEMPT: &str = "0123456789abcdef";
+    const FETCH_ASK: Ask<'static> = Ask {
+        kind: Kind::Fetch,
+        attempt: Some(ATTEMPT),
+        stop: None,
+        base: Some(0),
+        replace: None,
+        again: false,
+    };
+
     #[test]
-    fn turns_are_asked_at_the_turns_endpoint_and_bad_replies_mean_fetch_yourself() {
+    fn turns_are_asked_for_one_attempt_and_only_an_answer_for_it_counts() {
         let h = home("turns");
         let t = FakeTransport::default();
         let mut p = pusher(&h, &t, Ok(creds()));
+        let state =
+            r#""state":{"denied":false,"denied_gen":2,"rate_stage":1,"rate_wait_s":0,"version":7}"#;
+        let waiting = r#""state":{"denied":false,"denied_gen":2,"rate_stage":1,"rate_wait_s":90,"version":7}"#;
+        // a grant writes the row: its version moves on from the one asked against
+        let granted =
+            r#""state":{"denied":false,"denied_gen":2,"rate_stage":1,"rate_wait_s":0,"version":8}"#;
+        let fetch = Ask {
+            kind: Kind::Fetch,
+            attempt: Some(ATTEMPT),
+            base: Some(7),
+            ..Ask::peek()
+        };
         t.0.lock().unwrap().post_replies = vec![
-            (200, r#"{"claude":{"go":false,"wait_s":120}}"#.into()),
+            (
+                200,
+                format!(
+                    r#"{{"claude":{{"go":false,"kind":"fetch","attempt":"{ATTEMPT}","reason":"turn","wait_s":120,{state}}}}}"#
+                ),
+            ),
+            (
+                200,
+                format!(
+                    r#"{{"claude":{{"go":true,"kind":"fetch","attempt":"{ATTEMPT}",{granted}}}}}"#
+                ),
+            ),
+            // a go on the row as it was asked against (nothing was written for it): none
+            (
+                200,
+                format!(
+                    r#"{{"claude":{{"go":true,"kind":"fetch","attempt":"{ATTEMPT}",{state}}}}}"#
+                ),
+            ),
+            // for another attempt, another kind, or of the earlier form: no answer
+            (
+                200,
+                format!(
+                    r#"{{"claude":{{"go":true,"kind":"fetch","attempt":"fedcba9876543210",{state}}}}}"#
+                ),
+            ),
+            (
+                200,
+                format!(r#"{{"claude":{{"go":true,"kind":"own","attempt":"{ATTEMPT}",{state}}}}}"#),
+            ),
             (200, r#"{"claude":{"go":true,"wait_s":0}}"#.into()),
-            (404, String::new()),
+            // a go without the shared state (or without its version), with a reason against it, with a wait, or beside a rate limit
+            (
+                200,
+                format!(r#"{{"claude":{{"go":true,"kind":"fetch","attempt":"{ATTEMPT}"}}}}"#),
+            ),
+            (
+                200,
+                format!(
+                    r#"{{"claude":{{"go":true,"kind":"fetch","attempt":"{ATTEMPT}","state":{{"denied":false,"denied_gen":2,"rate_stage":1,"rate_wait_s":0}}}}}}"#
+                ),
+            ),
+            (
+                200,
+                format!(
+                    r#"{{"claude":{{"go":true,"kind":"fetch","attempt":"{ATTEMPT}","reason":"turn",{state}}}}}"#
+                ),
+            ),
+            (
+                200,
+                format!(
+                    r#"{{"claude":{{"go":true,"kind":"fetch","attempt":"{ATTEMPT}","wait_s":5,{state}}}}}"#
+                ),
+            ),
+            (
+                200,
+                format!(
+                    r#"{{"claude":{{"go":true,"kind":"fetch","attempt":"{ATTEMPT}",{waiting}}}}}"#
+                ),
+            ),
+            // a negative wait isn't taken as none
+            (
+                200,
+                format!(
+                    r#"{{"claude":{{"go":false,"kind":"fetch","attempt":"{ATTEMPT}","reason":"turn","wait_s":-5,{state}}}}}"#
+                ),
+            ),
+            // an earlier destination, the destination's own refusal (credentials), an unreadable answer
+            (400, r#"{"error":"invalid_turns"}"#.into()),
+            (403, r#"{"error":"forbidden"}"#.into()),
             (200, "not json".into()),
         ];
+        let shared = Shared {
+            denied: false,
+            denied_gen: 2,
+            rate_stage: 1,
+            rate_wait_ms: 0,
+            version: 7,
+        };
         assert_eq!(
-            p.ask_turn("claude", 7),
-            Some(TurnReply {
+            p.ask("claude", fetch),
+            Some(Answer {
                 go: false,
-                wait_ms: 120_000
+                reason: Some(Reason::Turn),
+                wait_ms: 120_000,
+                shared: Some(shared)
             })
         );
-        assert_eq!(
-            p.ask_turn("claude", 7),
-            Some(TurnReply {
-                go: true,
-                wait_ms: 0
-            })
-        );
-        assert_eq!(
-            p.ask_turn("claude", 7),
-            None,
-            "older destination (no turns)"
-        );
-        assert_eq!(p.ask_turn("claude", 7), None);
-        assert_eq!(p.ask_turn("claude", 7), None, "unreachable");
+        assert_eq!(p.ask("claude", fetch).map(|a| a.go), Some(true));
+        for _ in 0..13 {
+            assert_eq!(p.ask("claude", fetch), None);
+        }
+        assert_eq!(p.ask("claude", fetch), None, "unreachable");
+        assert!(!p.outdated(), "the destination's own refusals mark nothing");
         let s = t.0.lock().unwrap();
         assert_eq!(s.posts[0].0, "https://x.example/v2/turns/mac");
-        assert_eq!(s.posts[0].1, json!({"claude": 7}));
+        assert_eq!(
+            s.posts[0].1,
+            json!({"claude": {"kind": "fetch", "attempt": ATTEMPT, "base": 7}})
+        );
         assert!(
             s.bodies.is_empty(),
             "turn requests do not count toward the push state"
         );
         drop(s);
+        // a resume names its stop and the attempt it replaces; one asked again says so; a peek has no attempt
+        t.0.lock().unwrap().post_replies = vec![
+            (
+                200,
+                format!(
+                    r#"{{"gemini":{{"go":true,"kind":"resume","attempt":"{ATTEMPT}","state":{{"denied":true,"denied_gen":2,"rate_stage":0,"rate_wait_s":0,"version":8}}}}}}"#
+                ),
+            ),
+            (
+                200,
+                format!(r#"{{"codex":{{"go":false,"kind":"peek","attempt":null,{state}}}}}"#),
+            ),
+        ];
+        let resume = Ask {
+            kind: Kind::Resume,
+            attempt: Some(ATTEMPT),
+            stop: Some(2),
+            base: Some(7),
+            replace: Some("fedcba9876543210"),
+            again: true,
+        };
+        assert!(p.ask("gemini", resume).unwrap().go);
+        assert_eq!(p.ask("codex", Ask::peek()).unwrap().shared, Some(shared));
+        let s = t.0.lock().unwrap();
+        assert_eq!(
+            s.posts[s.posts.len() - 2].1,
+            json!({"gemini": {"kind": "resume", "attempt": ATTEMPT, "gen": 2, "base": 7, "replace": "fedcba9876543210", "again": true}})
+        );
+        assert_eq!(
+            s.posts[s.posts.len() - 1].1,
+            json!({"codex": {"kind": "peek"}})
+        );
+        drop(s);
         // Does not ask without credentials
         let t2 = FakeTransport::default();
         let mut p2 = pusher(&h, &t2, Err("none".into()));
-        assert_eq!(p2.ask_turn("codex", 7), None);
+        assert_eq!(p2.ask("codex", fetch), None);
         assert!(t2.0.lock().unwrap().posts.is_empty());
+    }
+
+    #[test]
+    fn a_result_is_reported_once_and_counts_only_when_acknowledged() {
+        let h = home("results");
+        let t = FakeTransport::default();
+        let mut p = pusher(&h, &t, Ok(creds()));
+        t.0.lock().unwrap().post_replies = vec![
+            (200, format!(r#"{{"claude":{{"ack":true,"attempt":"{ATTEMPT}","kind":"fetch","applied":true,"state":{{"denied":false,"denied_gen":0,"rate_stage":2,"rate_wait_s":21600,"version":4}}}}}}"#)),
+            // an acknowledgement of another attempt, of another kind, or without whether it was applied is none
+            (200, r#"{"claude":{"ack":true,"attempt":"fedcba9876543210","kind":"fetch","applied":true,"state":{"denied":false,"denied_gen":0,"rate_stage":0,"rate_wait_s":0,"version":4}}}"#.into()),
+            (200, format!(r#"{{"claude":{{"ack":true,"attempt":"{ATTEMPT}","kind":"own","applied":true,"state":{{"denied":false,"denied_gen":0,"rate_stage":0,"rate_wait_s":0,"version":4}}}}}}"#)),
+            (200, format!(r#"{{"claude":{{"ack":true,"attempt":"{ATTEMPT}","kind":"fetch","state":{{"denied":false,"denied_gen":0,"rate_stage":0,"rate_wait_s":0,"version":4}}}}}}"#)),
+            (503, r#"{"error":"unavailable"}"#.into()),
+            // not applied (replaced, or applied before): over, with no lease
+            (200, format!(r#"{{"claude":{{"ack":true,"attempt":"{ATTEMPT}","kind":"fetch","applied":false,"state":{{"denied":false,"denied_gen":0,"rate_stage":0,"rate_wait_s":0,"version":5}}}}}}"#)),
+        ];
+        let got = p.report(
+            "claude",
+            ATTEMPT,
+            Kind::Fetch,
+            Reported::RateLimited {
+                retry_ms: Some(21_600_000),
+            },
+            15,
+            0,
+        );
+        assert_eq!(
+            got,
+            Some(Ack {
+                shared: Shared {
+                    denied: false,
+                    denied_gen: 0,
+                    rate_stage: 2,
+                    rate_wait_ms: 21_600_000,
+                    version: 4,
+                },
+                applied: true,
+            })
+        );
+        for why in [
+            "another attempt",
+            "another kind",
+            "no applied",
+            "not acknowledged",
+        ] {
+            assert_eq!(
+                p.report("claude", ATTEMPT, Kind::Fetch, Reported::Ok, 15, 18),
+                None,
+                "{why}"
+            );
+        }
+        assert_eq!(
+            p.report("claude", ATTEMPT, Kind::Fetch, Reported::Ok, 15, 18)
+                .map(|a| a.applied),
+            Some(false)
+        );
+        let s = t.0.lock().unwrap();
+        assert_eq!(s.posts[0].0, "https://x.example/v2/turns/mac/result");
+        assert_eq!(
+            s.posts[0].1,
+            json!({"claude": {"attempt": ATTEMPT, "kind": "fetch", "outcome": "rate_limited", "retry_s": 21_600, "interval_s": 900, "minutes": 0}})
+        );
+        assert_eq!(s.posts[2].1["claude"]["minutes"], 18);
+    }
+
+    #[test]
+    fn a_rate_limit_s_acknowledgement_shows_a_stage_begun_and_its_first_wait() {
+        let h = home("rate-ack");
+        let t = FakeTransport::default();
+        let mut p = pusher(&h, &t, Ok(creds()));
+        let ack = |stage: u32, wait_s: i64| {
+            (
+                200,
+                format!(
+                    r#"{{"claude":{{"ack":true,"attempt":"{ATTEMPT}","kind":"fetch","applied":true,"state":{{"denied":false,"denied_gen":0,"rate_stage":{stage},"rate_wait_s":{wait_s},"version":4}}}}}}"#
+                ),
+            )
+        };
+        // no stage, or a wait shorter than the first stage's: not the destination's answer to it
+        t.0.lock().unwrap().post_replies =
+            vec![ack(0, 0), ack(0, 1_800), ack(1, 600), ack(1, 1_800)];
+        let rate = Reported::RateLimited { retry_ms: None };
+        let report =
+            |p: &mut Pusher, interval| p.report("claude", ATTEMPT, Kind::Fetch, rate, interval, 0);
+        assert_eq!(report(&mut p, 15), None);
+        assert_eq!(report(&mut p, 15), None, "no stage");
+        assert_eq!(report(&mut p, 15), None);
+        assert!(report(&mut p, 15).is_some());
+        // an interval of 60 minutes: the wait is at least that; the second stage's is 60 minutes
+        t.0.lock().unwrap().post_replies =
+            vec![ack(1, 1_800), ack(1, 3_600), ack(2, 1_800), ack(2, 3_600)];
+        assert_eq!(report(&mut p, 60), None, "shorter than the interval");
+        assert!(report(&mut p, 60).is_some());
+        assert_eq!(report(&mut p, 15), None, "shorter than its stage");
+        assert!(report(&mut p, 15).is_some());
     }
 
     #[test]
@@ -2754,8 +3330,8 @@ mod tests {
         assert!(shown["claude"].windows.is_empty());
         assert!(shown["claude"].fetched_at.is_none());
         assert_eq!(shown["claude"].status, ProviderStatus::Stale);
-        // a stale window held back, a 20-minute-old one left: the text says 20m
-        let mut l = latest(40.0, NOW - 20 * MINUTE_MS, None);
+        // a stale window held back, a 25-minute-old one left (stale after 20): the text says 25m
+        let mut l = latest(40.0, NOW - 25 * MINUTE_MS, None);
         let c = l.get_mut("claude").unwrap();
         c.windows.push(
             make_window("seven_day", 7.0, Some(NOW + 3 * 24 * 60 * MINUTE_MS))
@@ -2767,7 +3343,7 @@ mod tests {
         let shown = p.shown(&l, NOW);
         assert_eq!(
             shown["claude"].error.as_deref(),
-            Some("Not updated for 20m")
+            Some("Not updated for 25m")
         );
         let _ = std::fs::remove_dir_all(h);
     }
@@ -2919,6 +3495,8 @@ mod tests {
     struct Cache {
         value: Option<(i64, u64)>,
         fetches: u32,
+        /// What the last collect did upstream (a provider says it)
+        run: Option<crate::providers::Run>,
     }
 
     struct Caching(std::rc::Rc<std::cell::RefCell<Cache>>, PathBuf);
@@ -2933,15 +3511,20 @@ mod tests {
         fn collect(&mut self, now: i64, _force: bool) -> ProviderSnapshot {
             let epoch = usable_epoch(&self.1).expect("collected only under a usable epoch");
             let mut c = self.0.borrow_mut();
+            c.run = Some(crate::providers::Run::NotRun);
             let at = match c.value {
                 Some((at, e)) if e == epoch => at,
                 _ => {
                     c.fetches += 1;
                     c.value = Some((now, epoch));
+                    c.run = Some(crate::providers::Run::Ran(crate::providers::Outcome::Ok));
                     now
                 }
             };
             latest(40.0, at, None).remove("claude").unwrap()
+        }
+        fn take_run(&mut self) -> Option<crate::providers::Run> {
+            self.0.borrow_mut().run.take()
         }
     }
 
@@ -2956,6 +3539,7 @@ mod tests {
             s.reply_bodies = vec![r#"{"error":"clock_skew","offset_s":3600}"#.into()];
         }
         let cache = std::rc::Rc::new(std::cell::RefCell::new(Cache::default()));
+        t.0.lock().unwrap().turns_granted = true;
         let providers = || -> Vec<Box<dyn crate::providers::Provider>> {
             vec![Box::new(Caching(cache.clone(), h.to_path_buf()))]
         };
@@ -3029,6 +3613,7 @@ mod tests {
     fn g1_h_nothing_is_fetched_while_the_push_state_cant_be_read() {
         let h = home("fetch-unreadable");
         let t = FakeTransport::default();
+        t.0.lock().unwrap().turns_granted = true;
         std::fs::create_dir(h.join(OUTBOX_FILE)).unwrap();
         let mut p = pusher(&h, &t, Ok(creds()));
         let cache = std::rc::Rc::new(std::cell::RefCell::new(Cache::default()));
@@ -3048,6 +3633,49 @@ mod tests {
         std::fs::remove_dir(h.join(OUTBOX_FILE)).unwrap();
         round.run(&mut list, Some(&mut p));
         assert_eq!(cache.borrow().fetches, 1);
+    }
+
+    #[test]
+    fn g2_a_provider_turned_off_after_a_run_with_it_sends_nothing_of_its_own_and_keeps_its_queue() {
+        // Installed with the default config: Gemini is off
+        let mut cfg = crate::config::Config::default();
+        assert!(!crate::agent::provider_enabled(&cfg, "gemini"));
+        cfg.push.url = "https://x.example/v2/snapshots/mac".into();
+        let h = home("g2-rollback");
+        crate::test_util::trust_clock(&h);
+        let t = FakeTransport::default();
+        // An earlier run with Gemini on queued its observations (not sent yet)
+        {
+            let mut p = pusher(&h, &t, Ok(creds()));
+            let mut l = latest(10.0, NOW, None);
+            l.insert("gemini".into(), l["claude"].clone());
+            p.record(&l, true, NOW);
+            assert!(p.outbox.observations.iter().any(|o| o.provider == "gemini"));
+        }
+        // Turned off and started again (as before a Worker without Gemini is put back): only the others go
+        let mut p = pusher(&h, &t, Ok(creds()));
+        let cache = std::rc::Rc::new(std::cell::RefCell::new(Cache::default()));
+        let mut list: Vec<Box<dyn crate::providers::Provider>> =
+            vec![Box::new(Caching(cache.clone(), h.to_path_buf()))];
+        let mut round = crate::agent::Round::new(&cfg, "mac", Logger::stderr(), round_clock, &h);
+        ROUND_MS.store(NOW + MINUTE_MS, std::sync::atomic::Ordering::SeqCst);
+        round.run(&mut list, Some(&mut p));
+        let bodies = t.0.lock().unwrap().bodies.clone();
+        assert!(!bodies.is_empty(), "sent");
+        for b in &bodies {
+            assert!(b["snapshot"]["providers"].get("gemini").is_none(), "{b}");
+            let providers: Vec<&str> = b["observations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|o| o["provider"].as_str().unwrap())
+                .collect();
+            assert!(providers.iter().all(|p| *p != "gemini"), "{providers:?}");
+        }
+        assert!(
+            p.outbox.observations.iter().any(|o| o.provider == "gemini"),
+            "kept queued for when it is turned on again"
+        );
     }
 
     #[test]
@@ -3303,7 +3931,8 @@ mod tests {
         assert_eq!(usable_epoch(&h), None);
         t.0.lock().unwrap().on_put = None;
         std::fs::remove_dir(&lock).unwrap();
-        p.push(&snapshot(&latest(40.0, NOW, None)), NOW + 60 * MINUTE_MS);
+        // within the hour (no send checks the protocol again yet)
+        p.push(&snapshot(&latest(40.0, NOW, None)), NOW + 30 * MINUTE_MS);
         assert_eq!(p.unsettled, None);
         assert!(usable_epoch(&h).is_some(), "the send isn't pending anymore");
         assert_eq!(t.0.lock().unwrap().bodies.len(), 1, "nothing more sent");
@@ -3315,9 +3944,11 @@ mod tests {
         let t = FakeTransport::default();
         t.0.lock().unwrap().post_replies = vec![(426, String::new())];
         let mut p = pusher(&h, &t, Ok(creds()));
-        assert!(!p.ask_turn("claude", 5).unwrap().go);
+        assert_eq!(p.ask("claude", FETCH_ASK), None);
         let mut again = pusher(&h, &t, Ok(creds()));
         assert!(again.outdated(), "kept in the outbox");
+        assert!(!again.may_fetch());
+        assert_eq!(again.ask("claude", FETCH_ASK), None, "nothing more asked");
         again.push(&snapshot(&latest(40.0, NOW, None)), NOW);
         let sent = t.0.lock().unwrap();
         assert_eq!((sent.bodies.len(), sent.posts.len()), (0, 1));
@@ -3401,7 +4032,8 @@ mod tests {
     }
 
     #[test]
-    fn g1_h_after_a_426_this_agent_sends_and_fetches_nothing_more_also_after_a_restart() {
+    fn g1_h_after_a_426_this_agent_sends_nothing_and_checks_hourly_with_a_peek_until_the_protocol_is_taken()
+     {
         let h = home("outdated");
         let t = FakeTransport::default();
         t.0.lock().unwrap().replies = vec![Ok(426)];
@@ -3410,24 +4042,141 @@ mod tests {
         p.push(&snapshot(&latest(40.0, NOW, None)), NOW);
         assert!(p.outdated());
         let seq = p.outbox.last_seq;
-        // long after any backoff, and after a restart: no request, the queue and its number kept
+        // within the hour, and after a restart: no request, nothing granted, the queue and its number kept
         let mut again = pusher(&h, &t, Ok(creds()));
-        again.push(
-            &snapshot(&latest(40.0, NOW, None)),
-            NOW + 24 * 60 * MINUTE_MS,
+        again.push(&snapshot(&latest(40.0, NOW, None)), NOW + 59 * MINUTE_MS);
+        assert_eq!(again.ask("claude", FETCH_ASK), None);
+        assert!(!again.may_fetch(), "no fetch either");
+        let counts = |t: &FakeTransport| {
+            let s = t.0.lock().unwrap();
+            (s.bodies.len(), s.posts.len())
+        };
+        assert_eq!(counts(&t), (1, 0));
+        // an hour on, a peek checks again (no value, no observation, no send number): refused still
+        t.0.lock().unwrap().post_replies = vec![(426, String::new())];
+        again.push(&snapshot(&latest(40.0, NOW, None)), NOW + 61 * MINUTE_MS);
+        assert_eq!(counts(&t), (1, 1));
+        assert_eq!(
+            t.0.lock().unwrap().posts[0].1,
+            json!({"claude": {"kind": "peek"}})
         );
-        let reply = again.ask_turn("claude", 5).unwrap();
-        let sent = t.0.lock().unwrap();
-        assert_eq!((sent.bodies.len(), sent.posts.len()), (1, 0));
-        drop(sent);
-        assert!(!reply.go, "no fetch on its own either");
+        assert!(again.outdated());
+        // that check's time is kept: after a restart, and also when the check fails otherwise (unreachable), the next is an hour on
+        let mut again = pusher(&h, &t, Ok(creds()));
+        again.push(&snapshot(&latest(40.0, NOW, None)), NOW + 100 * MINUTE_MS);
+        assert_eq!(
+            counts(&t),
+            (1, 1),
+            "not before an hour after the last check"
+        );
+        again.push(&snapshot(&latest(40.0, NOW, None)), NOW + 121 * MINUTE_MS);
+        assert_eq!(counts(&t), (1, 2));
+        again.push(&snapshot(&latest(40.0, NOW, None)), NOW + 122 * MINUTE_MS);
+        assert_eq!(
+            counts(&t),
+            (1, 2),
+            "a failed check isn't tried again at once"
+        );
+        // the destination updated: the next hourly peek is answered, nothing was sent meanwhile, and sending and fetching go on
+        t.0.lock().unwrap().turns_granted = true;
+        again.push(&snapshot(&latest(40.0, NOW, None)), NOW + 182 * MINUTE_MS);
+        assert_eq!(counts(&t), (1, 3));
+        assert!(!again.outdated() && again.may_fetch());
         assert_eq!(
             (again.outbox.observations.len(), again.outbox.last_seq),
-            (1, seq)
+            (1, seq),
+            "the queue as it was"
         );
-        // the control: an agent of another protocol (updated) sends again
+        // the control: an agent of another protocol (updated) isn't held by a 426 to an earlier one
         again.outbox.outdated_protocol = Some("1".into());
         assert!(!again.outdated());
+    }
+
+    #[test]
+    fn a_long_wait_named_to_the_hourly_check_holds_the_next_one_as_long() {
+        static AT: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+        fn at() -> i64 {
+            AT.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        let set = |t: i64| AT.store(t, std::sync::atomic::Ordering::SeqCst);
+        let h = home("outdated-503");
+        let t = FakeTransport::default();
+        t.0.lock().unwrap().replies = vec![Ok(426)];
+        let mut p = pusher(&h, &t, Ok(creds()));
+        p.clock = Some(at);
+        set(NOW);
+        p.record(&latest(40.0, NOW, None), true, NOW);
+        p.push(&snapshot(&latest(40.0, NOW, None)), NOW);
+        assert!(p.outdated());
+        let posts = |t: &FakeTransport| t.0.lock().unwrap().posts.len();
+        // the hourly check is told to wait 3 hours
+        t.0.lock().unwrap().post_replies =
+            vec![(503, r#"{"error":"d1_budget","retry_after_s":10800}"#.into())];
+        let check = NOW + 61 * MINUTE_MS;
+        set(check);
+        p.push(&snapshot(&latest(40.0, NOW, None)), check);
+        assert_eq!(posts(&t), 1);
+        // none before then: not in the next rounds, nor after a restart
+        for later in [
+            check + MINUTE_MS,
+            check + 90 * MINUTE_MS,
+            check + 179 * MINUTE_MS,
+        ] {
+            set(later);
+            let mut again = pusher(&h, &t, Ok(creds()));
+            again.clock = Some(at);
+            again.push(&snapshot(&latest(40.0, NOW, None)), later);
+            assert_eq!(posts(&t), 1, "{} minutes on", (later - check) / MINUTE_MS);
+        }
+        // then it checks again
+        let due = check + 181 * MINUTE_MS;
+        set(due);
+        p.push(&snapshot(&latest(40.0, NOW, None)), due);
+        assert_eq!(posts(&t), 2);
+    }
+
+    #[test]
+    fn a_push_state_that_can_t_be_read_is_read_again_a_minute_on_not_every_second() {
+        let h = home("unreadable-wake");
+        std::fs::create_dir_all(&*h).unwrap();
+        std::fs::write(h.join(OUTBOX_FILE), b"{broken").unwrap();
+        let t = FakeTransport::default();
+        let mut p = pusher(&h, &t, Ok(creds()));
+        p.push(&snapshot(&latest(40.0, NOW, None)), NOW);
+        assert_eq!(p.due_ms(), NOW + 60_000);
+        assert!(t.0.lock().unwrap().bodies.is_empty());
+        // readable again (removed): sending goes on
+        std::fs::remove_file(h.join(OUTBOX_FILE)).unwrap();
+        p.record(&latest(40.0, NOW, None), true, NOW + 61_000);
+        p.push(&snapshot(&latest(40.0, NOW, None)), NOW + 61_000);
+        assert_eq!(t.0.lock().unwrap().bodies.len(), 1);
+    }
+
+    #[test]
+    fn only_a_peek_s_answer_with_no_attempt_takes_the_protocol_again() {
+        let h = home("outdated-peek");
+        let t = FakeTransport::default();
+        t.0.lock().unwrap().replies = vec![Ok(426)];
+        let mut p = pusher(&h, &t, Ok(creds()));
+        p.record(&latest(40.0, NOW, None), true, NOW);
+        p.push(&snapshot(&latest(40.0, NOW, None)), NOW);
+        assert!(p.outdated());
+        let state =
+            r#""state":{"denied":false,"denied_gen":0,"rate_stage":0,"rate_wait_s":0,"version":3}"#;
+        // an answer of the earlier form (no attempt at all): still outdated
+        t.0.lock().unwrap().post_replies = vec![(
+            200,
+            format!(r#"{{"claude":{{"go":false,"kind":"peek",{state}}}}}"#),
+        )];
+        p.push(&snapshot(&latest(40.0, NOW, None)), NOW + 61 * MINUTE_MS);
+        assert!(p.outdated());
+        // as this protocol has it: taken again
+        t.0.lock().unwrap().post_replies = vec![(
+            200,
+            format!(r#"{{"claude":{{"go":false,"kind":"peek","attempt":null,{state}}}}}"#),
+        )];
+        p.push(&snapshot(&latest(40.0, NOW, None)), NOW + 122 * MINUTE_MS);
+        assert!(!p.outdated());
     }
 
     static CLOCK_MS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);

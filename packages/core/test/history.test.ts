@@ -10,7 +10,7 @@ const observation = (offset: number, percent: number, reset = 180): UsageObserva
   used_percent: percent, observed_at: at(offset),
 });
 
-test("a Mac observation from 60 minutes ago and the current Windows value give an exact result", () => {
+test("a Mac observation from 60 minutes ago and the current Windows value give an exact result (a 60-minute gap is continuous)", () => {
   const snapshot = buildSnapshot({
     claude: { ...emptyProvider("ok", null), collector: "win", windows: [window(26)] },
   });
@@ -18,7 +18,19 @@ test("a Mac observation from 60 minutes ago and the current Windows value give a
   const metrics = actual.claude?.windows.five_hour;
   assert.equal(metrics?.recent_consumed_percent, 6);
   assert.equal(metrics?.recent_quality, "exact");
-  assert.equal(metrics?.eta_minutes, null);
+  // fetches stretched to 60 minutes while nothing changes stay one history: a rate, though from two points only
+  assert.equal(metrics?.eta_minutes, 740);
+  assert.equal(metrics?.confidence, "low");
+});
+
+test("the gap: 18, 72 and 75 minutes are continuous, beyond 75 a break; the exact start is within 20 minutes", () => {
+  for (const [gap, continuous] of [[18, true], [72, true], [75, true], [76, false]] as const) {
+    const m = windowMetrics(window(30), [observation(-gap, 20)]);
+    assert.equal(m.rate_24h !== null, continuous, `${gap} minutes`);
+  }
+  // the recent hour starts at -60: an observation 20 minutes off it is exact, 21 minutes off (inside the hour) approx
+  assert.equal(windowMetrics(window(30), [observation(-80, 10), observation(-40, 20)]).recent_quality, "exact");
+  assert.equal(windowMetrics(window(30), [observation(-39, 20)]).recent_quality, "approx");
 });
 
 test("observations from two PCs 1 minute apart: only the one chosen by priority and recency is used", () => {

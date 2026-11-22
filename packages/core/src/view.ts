@@ -5,12 +5,15 @@
 // by path alone, e.g. `claude.windows.five_hour.used_percent`.
 // Every provider has the same keys; values that don't apply are null (so paths don't break).
 
-import { freshnessOf } from "./freshness.ts";
+import { formatAge, freshnessOf } from "./freshness.ts";
 import { windowMetrics, type WindowMetrics } from "./history.ts";
 import { RESET_TOLERANCE_MS, type CollectorSelection } from "./collector-selection.ts";
 import { effectiveUsedPercent } from "./normalize.ts";
 import {
+  PROVIDERS,
+  PROVIDER_NAMES,
   SCHEMA_VERSION,
+  isDetailOnly,
   type ProviderId,
   type ProviderSnapshot,
   type Snapshot,
@@ -28,6 +31,8 @@ export interface WindowView extends WindowMetrics {
   label: string;
   kind: UsageWindow["kind"];
   scope: string | null;
+  /** Shown in details only (told from the provider and the window id): never the top window, in a summary or in events */
+  detail_only: boolean;
   /** 0 (estimated) once the reset time has passed. Use this for display */
   used_percent: number;
   remaining_percent: number;
@@ -107,6 +112,7 @@ export interface SnapshotView {
   summary: string;
   claude: ProviderView | null;
   codex: ProviderView | null;
+  gemini: ProviderView | null;
 }
 
 export interface PcView {
@@ -173,7 +179,7 @@ export function computeMetrics(
   s: Snapshot,
   observations: readonly UsageObservation[],
   opts: CollectorSelection & { recentMinutes?: Partial<Record<WindowKind, number>> } = {},
-  providers: readonly ProviderId[] = ["claude", "codex"],
+  providers: readonly ProviderId[] = PROVIDERS,
 ): MetricsCache {
   const out: MetricsCache = {};
   for (const id of providers) {
@@ -260,6 +266,7 @@ export function windowView(
     label: w.label,
     kind: w.kind,
     scope: w.scope,
+    detail_only: isDetailOnly(provider, w.id),
     used_percent: effective,
     remaining_percent: Math.round((100 - effective) * 100) / 100,
     used_percent_int: Math.round(effective),
@@ -320,7 +327,12 @@ export function providerView(
   timeZone: string = DEFAULT_TIME_ZONE,
   options: ViewOptions = {},
 ): ProviderView {
-  const fresh = freshnessOf(p.fetched_at, now);
+  // By its time; a value its PC marked old (its next fetch failed, as a rate limit's, or its limits changed) isn't fresh whatever its
+  // time. Each window keeps its own time (the statusLine may refresh some)
+  const byTime = freshnessOf(p.fetched_at, now);
+  const fresh = p.status === "stale" && byTime.level === "fresh"
+    ? { level: "caution" as const, age_minutes: byTime.age_minutes, message: `⚠ Value from ${formatAge(byTime.age_minutes ?? 0)} ago` }
+    : byTime;
   const history = new Map<string, UsageObservation[]>();
   for (const row of options.observations ?? []) {
     if (row.provider !== provider) continue;
@@ -332,9 +344,11 @@ export function providerView(
     provider, w, now, timeZone, p.fetched_at, history.get(w.id), options.recentMinutes?.[w.kind], options,
     options.metrics === undefined ? undefined : options.metrics[provider]?.[w.id] ?? null,
   ));
-  const main = list.filter((w) => w.scope === null);
+  // Windows shown in details only stay in `windows`, but nothing else is chosen from them
+  const shown = list.filter((w) => !w.detail_only);
+  const main = shown.filter((w) => w.scope === null);
   // Prefer overall windows. Pick from per-model / per-group windows only when there is no overall window
-  const top = (main.length > 0 ? main : list).reduce<WindowView | null>(
+  const top = (main.length > 0 ? main : shown).reduce<WindowView | null>(
     (a, b) => (a === null || b.used_percent > a.used_percent ? b : a),
     null,
   );
@@ -373,7 +387,7 @@ export function providerView(
     eta_minutes: limiting?.eta_minutes ?? null,
     eta_at: limiting?.eta_at ?? null,
     eta_at_local: limiting?.eta_at_local ?? null,
-    status_text: statusText(list),
+    status_text: statusText(shown),
   };
 }
 
@@ -384,12 +398,11 @@ export function toView(s: Snapshot, now: Date = new Date(), opts: ViewOptions = 
     const p = s.providers[id];
     return p ? providerView(id, p, now, timeZone, opts) : null;
   };
-  const claude = pv("claude");
-  const codex = pv("codex");
-  const summary = [
-    claude && claude.summary ? `Claude ${claude.summary}` : null,
-    codex && codex.summary ? `Codex ${codex.summary}` : null,
-  ]
+  const views = Object.fromEntries(PROVIDERS.map((id) => [id, pv(id)])) as Record<ProviderId, ProviderView | null>;
+  const summary = PROVIDERS.map((id) => {
+    const v = views[id];
+    return v && v.summary ? `${PROVIDER_NAMES[id]} ${v.summary}` : null;
+  })
     .filter(Boolean)
     .join(" / ");
   const pcs = Object.fromEntries((s.collectors ?? []).map((c) => [c.id, pcView(c.received_at ?? null, now)]));
@@ -407,7 +420,8 @@ export function toView(s: Snapshot, now: Date = new Date(), opts: ViewOptions = 
     pcs,
     time_zone: timeZone,
     summary,
-    claude,
-    codex,
+    claude: views.claude,
+    codex: views.codex,
+    gemini: views.gemini,
   };
 }

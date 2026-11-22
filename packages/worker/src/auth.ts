@@ -72,4 +72,4 @@ export async function authenticate(request: Request, tokens: readonly TokenEntry
 }
 
 /** Protocol of the agents that may write (header Headroom-Protocol). Older agents are refused with 426 */
-export const AGENT_PROTOCOL = "2";
+export const AGENT_PROTOCOL = "3";

@@ -8,7 +8,8 @@ import { handle as handleRequest, refreshDerived, repairPublicState, runCron, ty
 import { DAILY_BUDGET, MIN_BUDGET_PERCENT, RESERVE, budgetLimit, daysToReserve, endOfDays, reserve, settle } from "../src/budget.ts";
 import { MAX_WINDOWS, WITHHELD_ERROR } from "../src/sanitize.ts";
 import { sanitizeUpload } from "../src/sanitize.ts";
-import { EVENT_FEED_SQL, MAX_STORED_COLLECTORS, PRUNE_EVENTS, PRUNE_ROWS, dataVersionOf, loadObservations, loadPublicRow, prune, rebuildEventFeed, saveDerived, savePublicState, saveUpload, saveWeekly, loadWeekly, type D1Like } from "../src/store.ts";
+import { PROVIDERS } from "../../core/src/index.ts";
+import { CRON_HISTORY_ROWS, DERIVED_PUBLIC_SQL, EVENT_FEED_SQL, HISTORY_ROW_LIMIT, MAX_STORED_COLLECTORS, PRUNE_EVENTS, PRUNE_ROWS, dataVersionOf, loadObservations, loadPublicRow, prune, rebuildEventFeed, saveDerived, savePublicState, saveUpload, saveWeekly, loadWeekly, type D1Like } from "../src/store.ts";
 import { sqliteD1 } from "./d1-sqlite.ts";
 
 /** The Worker's handler, as reached by an agent of this protocol (a test that sets the header itself keeps its value) */
@@ -867,40 +868,6 @@ test("derived values don't mix in other providers' observations", async () => {
   assert.equal(v.claude.windows.five_hour?.recent_consumed_percent, 2);
 });
 
-test("one fetch turn holder per provider; it rotates on expiry or release, and PC names are not returned", async () => {
-  const { call } = await setup();
-  const at = (m: number) => new Date(NOW.getTime() + m * 60_000);
-  const ask = async (token: string, pc: string, body: unknown, m: number) => {
-    const res = await call("POST", `/v2/turns/${pc}`, token, body, at(m));
-    assert.equal(res.status, 200);
-    const text = await res.text();
-    assert.equal(/mac|win-desktop/.test(text), false, "PC names are not returned");
-    return JSON.parse(text) as Record<string, { go: boolean; wait_s: number }>;
-  };
-  assert.deepEqual(await ask(MAC, "mac", { claude: 7, codex: 7 }, 0), { claude: { go: true, wait_s: 0 }, codex: { go: true, wait_s: 0 } });
-  assert.deepEqual(await ask(WIN, "win-desktop", { claude: 7 }, 1), { claude: { go: false, wait_s: 360 } });
-  // The turn can be extended (up to 70 minutes, for the long interval while at the limit)
-  assert.deepEqual(await ask(MAC, "mac", { claude: 600 }, 5), { claude: { go: true, wait_s: 0 } });
-  assert.deepEqual(await ask(WIN, "win-desktop", { claude: 7 }, 6), { claude: { go: false, wait_s: 69 * 60 } });
-  // On release another PC takes the turn. A release by a PC not holding the turn changes nothing
-  assert.deepEqual(await ask(WIN, "win-desktop", { codex: 0 }, 6), { codex: { go: false, wait_s: 60 } });
-  assert.deepEqual(await ask(MAC, "mac", { claude: 0 }, 7), { claude: { go: false, wait_s: 0 } });
-  assert.deepEqual(await ask(WIN, "win-desktop", { claude: 7 }, 7), { claude: { go: true, wait_s: 0 } });
-  // On expiry the turn rotates
-  assert.deepEqual(await ask(WIN, "win-desktop", { codex: 7 }, 7), { codex: { go: true, wait_s: 0 } });
-});
-
-test("turn requests need a write credential for the PC's own name; invalid bodies return 400", async () => {
-  const { call } = await setup();
-  assert.equal((await call("POST", "/v2/turns/mac", READ, { claude: 7 })).status, 403);
-  assert.equal((await call("POST", "/v2/turns/mac", WIN, { claude: 7 })).status, 403);
-  assert.equal((await call("POST", "/v2/turns/mac")).status, 401);
-  assert.equal((await call("GET", "/v2/turns/mac", MAC)).status, 405);
-  for (const body of [{}, [], { claude: -1 }, { claude: "7" }, { other: 7 }, { claude: 2000 }, "x"]) {
-    assert.equal((await call("POST", "/v2/turns/mac", MAC, body)).status, 400, JSON.stringify(body));
-  }
-});
-
 test("with overlapping Crons, derived values computed from older observations and written later don't roll back", async () => {
   const { call, env } = await setup();
   const snap = fixture();
@@ -944,7 +911,7 @@ test("Cron doesn't read history for providers whose merged value, observations a
   assert.equal(historyReads(), 1, "only codex, which has observations");
 });
 
-test("if the daily D1 budget doesn't fit, uploads are refused without touching D1 and turns are left to each PC", async () => {
+test("if the daily D1 budget doesn't fit, uploads are refused without touching D1 and no turn is granted", async () => {
   const { call, raw } = await setup();
   assert.equal((await call("PUT", "/v2/snapshots/win-desktop", WIN, upload(1, fixture(), [obs("five_hour", 1, "2026-11-16T12:00:00.000Z")]))).status, 204);
   const used = raw.prepare("SELECT day, reads, writes FROM d1_budget").get() as { day: string; reads: number; writes: number };
@@ -958,9 +925,10 @@ test("if the daily D1 budget doesn't fit, uploads are refused without touching D
   assert.equal(res.status, 503);
   assert.deepEqual(await res.json(), { error: "d1_budget", retry_after_s: 11 * 3600 });
   assert.equal((raw.prepare("SELECT COUNT(*) AS n FROM observations").get() as { n: number }).n, before);
-  const turn = await call("POST", "/v2/turns/mac", MAC, { claude: 7 });
-  assert.deepEqual(await turn.json(), { claude: { go: true, wait_s: 0 } });
-  assert.equal((raw.prepare("SELECT COUNT(*) AS n FROM fetch_turns").get() as { n: number }).n, 0);
+  // A sharing PC never fetches without a go: it waits and asks again
+  const turn = await call("POST", "/v2/turns/mac", MAC, { claude: { kind: "fetch", attempt: "0123456789abcdef", base: 0 } });
+  assert.deepEqual(await turn.json(), { claude: { go: false, kind: "fetch", attempt: "0123456789abcdef", reason: "unavailable" } });
+  assert.equal((raw.prepare("SELECT COUNT(*) AS n FROM provider_holds").get() as { n: number }).n, 0);
   assert.equal((await call("GET", "/v2/view", READ)).status, 200, "client reads continue");
 
   // Restored on the next UTC day
@@ -999,7 +967,7 @@ test("even an upload that creates a boundary stays within one run's estimated D1
   assert.equal((await loadObservations(env.DB, "claude", new Date(0))).length, 0, "filtered on read");
   // One Cron run deletes up to the limit
   assert.equal(await runCron(env, new Date("2026-11-16T12:35:00Z")), true);
-  assert.equal((raw.prepare("SELECT COUNT(*) AS n FROM observations").get() as { n: number }).n, 6000 - 300);
+  assert.equal((raw.prepare("SELECT COUNT(*) AS n FROM observations").get() as { n: number }).n, 6000 - PRUNE_ROWS);
 });
 
 test("budget check and reservation happen in one statement, so concurrent requests don't use the same remainder", async () => {
@@ -1253,12 +1221,14 @@ test("a run starting just before 00:00 UTC reserves two days and doesn't exceed 
   // Even overlapping a run started on the next day, the reserved amount is counted
   const rows = () => raw.prepare("SELECT day, writes FROM d1_budget ORDER BY day").all().map((r) => ({ ...r })) as { day: string; writes: number }[];
   assert.deepEqual(rows().map((r) => r.writes), [RESERVE.put.writes, RESERVE.put.writes]);
+  // what the run used (the reserve statement included), and settle's own two statements
+  const settled = 600 + 2 * 2;
   await settle(env.DB, days, RESERVE.put, { reads: 10, writes: 600 }, new Date("2026-11-17T00:00:10Z"));
-  assert.deepEqual(rows().map((r) => r.writes), [608, 608]);
+  assert.deepEqual(rows().map((r) => r.writes), [settled, settled]);
   // If it ends on the same day, the next day's reservation is returned
   assert.equal(await reserve(env.DB, days, RESERVE.put), "reserved");
   await settle(env.DB, days, RESERVE.put, { reads: 10, writes: 600 }, new Date("2026-11-16T23:55:00Z"));
-  assert.deepEqual(rows().map((r) => r.writes), [608 * 2, 608]);
+  assert.deepEqual(rows().map((r) => r.writes), [settled * 2, settled]);
 });
 
 test("D1_BUDGET_PERCENT gives this D1 a share of the daily budget, and a bad value gives none", async () => {
@@ -1432,13 +1402,13 @@ function countQueries(db: D1Like): { db: D1Like; queries: () => number } {
   };
 }
 
-test("Cloudflare free plan: at most 50 D1 queries per invocation (heavy cases of upload, turn, GET, Cron)", async () => {
+test("Cloudflare free plan: at most 50 D1 queries per invocation (heavy cases of upload, turn, GET, Cron), with three providers", async () => {
   const { raw, env } = await setup();
-  // Give both providers history beyond the computation limit (5,000 items) and old observations to be deleted
+  // Give every provider history (as much as lets all three be computed in one Cron) and old observations to be deleted
   const ins = raw.prepare("INSERT INTO observations (provider, window_id, collector, observed_at, first_received_at, resets_at, used_percent) VALUES (?,?,?,?,?,?,?)");
   raw.exec("BEGIN");
-  for (const p of ["claude", "codex"]) {
-    for (let i = 0; i < 6000; i++) {
+  for (const p of PROVIDERS) {
+    for (let i = 0; i < 1500; i++) {
       const t = new Date(NOW.getTime() - 60_000 - i * 14_000).toISOString();
       ins.run(p, i % 2 ? "five_hour" : "seven_day", "mac", t, t, "2026-11-16T16:00:00.000Z", i % 100);
     }
@@ -1464,13 +1434,91 @@ test("Cloudflare free plan: at most 50 D1 queries per invocation (heavy cases of
     assert.ok(used <= limit, `${label}: ${used} queries`);
   };
   const many = Array.from({ length: 200 }, (_, i) =>
-    obs("five_hour", 50, new Date(NOW.getTime() - 50_000 + i * 100).toISOString(), i % 2 ? "claude" : "codex"));
-  await measure("upload (200 observations)", async () => assert.equal((await req("PUT", "/v2/snapshots/mac", MAC, upload(1, fixture(), many))).status, 204));
-  await measure("turn", async () => assert.equal((await req("POST", "/v2/turns/mac", MAC, { claude: 7, codex: 7 })).status, 200));
+    obs("five_hour", 50, new Date(NOW.getTime() - 50_000 + i * 100).toISOString(), PROVIDERS[i % PROVIDERS.length]));
+  // Gemini's value beside the other two (its overall windows)
+  const three = fixture();
+  three.providers.gemini = { ...three.providers.claude!, windows: three.providers.claude!.windows.filter((w) => w.scope === null) };
+  await measure("upload (200 observations)", async () => assert.equal((await req("PUT", "/v2/snapshots/mac", MAC, upload(1, three, many))).status, 204));
+  await measure("peek", async () => assert.equal((await req("POST", "/v2/turns/mac", MAC, { claude: { kind: "peek" } })).status, 200));
+  await measure("turn", async () => assert.equal((await req("POST", "/v2/turns/mac", MAC, { claude: { kind: "fetch", attempt: "0123456789abcdef", base: 0 } })).status, 200));
+  // the heaviest result: an access denial (the row, the counter, the public mark and the event in one batch)
+  await measure("result", async () => assert.equal((await req("POST", "/v2/turns/mac/result", MAC,
+    { claude: { attempt: "0123456789abcdef", kind: "fetch", outcome: "access_denied", interval_s: 900, minutes: 18 } })).status, 200));
   await measure("GET", async () => assert.equal((await req("GET", "/v2/view", READ)).status, 200));
   await measure("GET events", async () => assert.equal((await req("GET", "/v2/events", READ)).status, 200));
-  await measure("Cron (compute both providers, delete old observations)", async () => assert.equal(await runCron(e, NOW), true));
+  await measure("Cron (compute every provider, delete old observations)", async () => assert.equal(await runCron(e, NOW), true));
+  assert.deepEqual((raw.prepare("SELECT provider FROM derived_metrics ORDER BY provider").all() as { provider: string }[]).map((r) => r.provider), [...PROVIDERS].sort(), "every provider computed in that Cron");
   await measure("GET history", async () => assert.equal((await req("GET", "/v2/history?provider=claude", READ)).status, 200));
+});
+
+test("at most 50 D1 queries also for a Cron that repairs the public row while it computes all three, builds the weekly series and adds events", async () => {
+  for (const repair of ["counter behind", "merged otherwise"] as const) {
+    const { raw, env, call } = await setup();
+    const three = fixture();
+    // Claude's 5-hour at 85% and Codex's weekly at 96%: two visible events
+    three.providers.claude!.windows[0]!.used_percent = 85;
+    three.providers.codex!.windows[0]!.used_percent = 96;
+    three.providers.gemini = { ...three.providers.claude!, windows: three.providers.claude!.windows.filter((w) => w.scope === null).map((w) => ({ ...w, used_percent: 40 })) };
+    const week = (p: string) => obs("seven_day", 10, "2026-11-16T12:59:00.000Z", p);
+    assert.equal((await call("PUT", "/v2/snapshots/win-desktop", WIN, upload(1, three, PROVIDERS.map(week)))).status, 204);
+    const ins = raw.prepare("INSERT INTO observations (provider, window_id, collector, observed_at, first_received_at, resets_at, used_percent) VALUES (?,?,?,?,?,?,?)");
+    for (const p of PROVIDERS) for (let i = 0; i < 300; i++) {
+      const t = new Date(NOW.getTime() - 20 * 86_400_000 - i * 60_000).toISOString();
+      ins.run(p, "five_hour", "mac", t, t, null, 1);
+    }
+    if (repair === "counter behind") raw.exec("UPDATE data_versions SET version = version + 1 WHERE provider = 'all'");
+    else {
+      const row = raw.prepare("SELECT body FROM public_state WHERE id = 1").get() as { body: string };
+      raw.prepare("UPDATE public_state SET body = ? WHERE id = 1").run(JSON.stringify({ ...JSON.parse(row.body), generated_at: "2026-11-16T12:00:00.000Z" }));
+    }
+    const counted = countQueries(env.DB);
+    assert.equal(await runCron({ ...env, DB: counted.db }, NOW), true);
+    assert.ok(counted.queries() <= 50, `${repair}: ${counted.queries()} queries`);
+    assert.equal((raw.prepare("SELECT count(*) AS n FROM derived_metrics").get() as { n: number }).n, 3, "every provider computed");
+    assert.equal((raw.prepare("SELECT count(*) AS n FROM derived_weekly").get() as { n: number }).n, 3, "every weekly series built");
+    assert.equal((raw.prepare("SELECT count(*) AS n FROM events WHERE visible = 1").get() as { n: number }).n, 2, "the events added");
+    const version = (raw.prepare("SELECT version FROM data_versions WHERE provider = 'all'").get() as { version: number }).version;
+    assert.equal((raw.prepare("SELECT version FROM public_state WHERE id = 1").get() as { version: number }).version, version, `${repair}: put again`);
+    const body = JSON.parse((raw.prepare("SELECT body FROM public_state WHERE id = 1").get() as { body: string }).body) as Snapshot;
+    assert.notEqual(body.generated_at, "2026-11-16T12:00:00.000Z", `${repair}: today's merge`);
+  }
+});
+
+test("one Cron reads each provider's equal share of the observations (3,333 of 10,000) and computes every provider due in that run", async () => {
+  const { raw, env, call } = await setup();
+  const three = fixture();
+  three.providers.gemini = { ...three.providers.claude!, windows: three.providers.claude!.windows.filter((w) => w.scope === null) };
+  assert.equal((await call("PUT", "/v2/snapshots/win-desktop", WIN, upload(1, three))).status, 204);
+  const ins = raw.prepare("INSERT INTO observations (provider, window_id, collector, observed_at, first_received_at, resets_at, used_percent) VALUES (?,?,?,?,?,?,?)");
+  raw.exec("BEGIN");
+  for (const p of PROVIDERS) for (let i = 0; i < 5_000; i++) {
+    const t = new Date(NOW.getTime() - 60_000 - i * 14_000).toISOString();
+    ins.run(p, i % 2 ? "five_hour" : "seven_day", "mac", t, t, "2026-11-16T16:00:00.000Z", i % 100);
+  }
+  raw.exec("COMMIT");
+  assert.equal(HISTORY_ROW_LIMIT, 3_333);
+  assert.ok(HISTORY_ROW_LIMIT * PROVIDERS.length <= CRON_HISTORY_ROWS);
+  const original = env.DB;
+  const read: number[] = [];
+  const reading: D1Like = {
+    prepare: (sql) => {
+      const wrap = (s: ReturnType<D1Like["prepare"]>): ReturnType<D1Like["prepare"]> => ({
+        ...s,
+        bind: (...v: unknown[]) => wrap(s.bind(...v)),
+        all: async <T>() => {
+          const r = await s.all<T>();
+          if (sql.includes("FROM observations WHERE provider = ?")) read.push(r.results.length);
+          return r;
+        },
+      });
+      return wrap(original.prepare(sql));
+    },
+    batch: (s) => original.batch(s),
+  };
+  assert.equal(await runCron({ ...env, DB: reading }, NOW), true);
+  assert.deepEqual(read, [HISTORY_ROW_LIMIT, HISTORY_ROW_LIMIT, HISTORY_ROW_LIMIT]);
+  const computed = (raw.prepare("SELECT provider FROM derived_metrics WHERE computed_at = ? ORDER BY provider").all(NOW.toISOString()) as { provider: string }[]).map((r) => r.provider);
+  assert.deepEqual(computed, ["claude", "codex", "gemini"]);
 });
 
 test("Workers entry: index.ts has only function named exports (exporting a number etc. keeps the Workers runtime from starting)", async () => {
@@ -1712,13 +1760,17 @@ test("events past retention are not shown even if an old list is written later",
 });
 
 test("Cron's maximum writes (max windows with records and deletes overlapping, including indexes and sequence) fit the reservation", () => {
-  const observationPrune = 2 * 2 * PRUNE_ROWS * 3; // provider x (retention and boundary) x (row and 2 indexes)
+  const P = PROVIDERS.length;
+  const observationPrune = P * 2 * PRUNE_ROWS * 3; // provider x (retention and boundary) x (row and 2 indexes)
+  const hourlyPrune = P * PRUNE_ROWS; // observation_hourly is WITHOUT ROWID (no separate index)
   const eventPrune = PRUNE_EVENTS * 4; // row, key, keep-until, visible-events indexes
   // Max events per window: at limit + 2 thresholds, or 2 thresholds + 3 near-limit + 1 sudden usage, plus 1 reset of the previous cycle
   const perWindow = 7;
-  const newEvents = (2 * MAX_WINDOWS * perWindow + 2 /* stop reasons */ + 2 /* at limit */ + 1 /* collection */) * 5; // row, 3 indexes, sequence
-  const rest = 2 * 2 * 2 /* derived values and series */ + 2 /* state */ + 2 /* list */ + 2 * 100 /* deleting PC latest values */ + 10 /* budget */;
-  const bound = observationPrune + eventPrune + newEvents + rest;
+  const newEvents = (P * MAX_WINDOWS * perWindow + P /* stop reasons */ + P /* at limit */ + 1 /* collection */) * 5; // row, 3 indexes, sequence
+  const rest = P * 2 * 2 /* derived values and series */ + P /* the read endpoint's derived row, rebuilt with each save */
+    + 4 /* repairing the public row: version and body */ + 1 /* data_versions after deletes */
+    + 2 /* state */ + 2 /* list */ + 2 * 100 /* deleting PC latest values */ + 10 /* budget */;
+  const bound = observationPrune + hourlyPrune + eventPrune + newEvents + rest;
   assert.ok(bound <= RESERVE.cron.writes, `${bound} > ${RESERVE.cron.writes}`);
 });
 
@@ -2226,8 +2278,10 @@ test("old-format derived values (without rate_pace) are recomputed by the next C
     if (v && typeof v === "object") return Object.fromEntries(Object.entries(v).filter(([k]) => k !== "rate_pace").map(([k, x]) => [k, drop(x)]));
     return v;
   };
-  assert.match(row.basis, /^3:/, "format version in the basis");
+  assert.match(row.basis, /^4:/, "format version in the basis");
   raw.prepare("UPDATE derived_metrics SET body = ?, basis = ? WHERE provider = 'claude'").run(JSON.stringify(drop(JSON.parse(row.body))), row.basis.replace(/^\d+:/, ""));
+  // (the read endpoint's row taken from it, as this version's Cron does with a row an earlier Worker saved)
+  raw.exec(DERIVED_PUBLIC_SQL);
   const view = async () => ((await (await call("GET", "/v2/view", READ)).json()) as { claude: { windows: Record<string, Record<string, unknown>> } }).claude.windows.five_hour!;
   assert.equal("rate_pace" in (await view()), false, "still the old format");
   await runCron(env, new Date("2026-11-16T13:05:00Z"));
@@ -2557,32 +2611,6 @@ test("if the same name gets registered right after seeing the names full, the up
   assert.equal(injected, true);
   assert.deepEqual(result, { seq: 5, applied: true });
   assert.equal((raw.prepare("SELECT count(*) AS n FROM observations WHERE collector = 'mac'").get() as { n: number }).n, 1);
-});
-
-test("a PC name that can't be registered gets no turn (it fetches on its own and doesn't block turns for PCs that can deliver)", async () => {
-  const { call, raw } = await setup();
-  const register = raw.prepare("INSERT INTO collector_names (name, slot) VALUES (?, ?)");
-  register.run("win-desktop", 0);
-  for (let i = 1; i < MAX_STORED_COLLECTORS; i++) register.run(`old-${i}`, i);
-  const mac = await call("POST", "/v2/turns/mac", MAC, { claude: 300 });
-  assert.equal(mac.status, 200);
-  assert.deepEqual(await mac.json(), { claude: { go: true, wait_s: 0 } });
-  assert.equal((raw.prepare("SELECT count(*) AS n FROM fetch_turns").get() as { n: number }).n, 0, "doesn't take the turn");
-  const win = (await (await call("POST", "/v2/turns/win-desktop", WIN, { claude: 300 })).json()) as Record<string, { go: boolean }>;
-  assert.equal(win.claude!.go, true, "the registered PC takes the turn");
-});
-
-test("a turn held by a PC that can no longer write after the names filled up is taken over by a writable PC even before expiry", async () => {
-  const { call, raw } = await setup();
-  const register = raw.prepare("INSERT INTO collector_names (name, slot) VALUES (?, ?)");
-  for (let i = 0; i < MAX_STORED_COLLECTORS - 1; i++) register.run(`old-${i}`, i);
-  // While there is room, mac (not yet registered) takes the turn
-  assert.deepEqual(await (await call("POST", "/v2/turns/mac", MAC, { claude: 10 })).json(), { claude: { go: true, wait_s: 0 } });
-  // win registers in the last slot, and mac can no longer write
-  assert.equal((await call("PUT", "/v2/snapshots/win-desktop", WIN, upload(1))).status, 204);
-  assert.equal((await call("PUT", "/v2/snapshots/mac", MAC, upload(1))).status, 403);
-  assert.deepEqual(await (await call("POST", "/v2/turns/win-desktop", WIN, { claude: 10 })).json(), { claude: { go: true, wait_s: 0 } });
-  assert.deepEqual({ ...(raw.prepare("SELECT collector FROM fetch_turns WHERE provider = 'claude'").get() as object) }, { collector: "win-desktop" });
 });
 
 test("the 24-hour series (derived_history) is removed: no table, and GET /v2/history returns only the weekly 7-day series", async () => {
@@ -2947,7 +2975,7 @@ test("G1-h: an upload or a turn from an older agent is refused before D1 is touc
     if (protocol === null) request.headers.delete("headroom-protocol");
     return handleRequest(request, env, () => NOW);
   };
-  for (const protocol of [null, "1"]) {
+  for (const protocol of [null, "1", "2"]) {
     const put = await send("/v2/snapshots/win-desktop", "PUT", sentAt(upload(1, fixture()), NOW), protocol);
     assert.equal(put.status, 426, String(protocol));
     assert.deepEqual(await put.json(), { error: "agent_outdated" });
@@ -2967,6 +2995,7 @@ test("G1-d: a speed of an older generation is not shown and is replaced by the n
   // an earlier Worker's row: counter 7, no provider counters at all, a speed the kept observations don't give
   raw.exec("DELETE FROM data_versions WHERE provider IN ('claude', 'codex')");
   raw.exec(`UPDATE derived_metrics SET version = 7, generation = 0, body = json_set(body, '$.five_hour.metrics.rate_60m', 76.6) WHERE provider = 'claude'`);
+  raw.exec(DERIVED_PUBLIC_SQL);
   assert.equal(await rateOf(call), null, "of another generation: not shown");
   await runCron(env, NOW);
   assert.equal(await rateOf(call), expected, "computed again in this generation, whatever its counter");

@@ -25,12 +25,14 @@ interface Options {
   error?: "login_required" | "safety_stop" | "fetch_failed" | null;
   received?: number | null;
   boundaries?: Record<string, string>;
+  /** The provider the windows belong to (default Claude) */
+  provider?: "claude" | "codex" | "gemini";
 }
 
 function judge(windows: UsageWindow[], state: EventState, o: Options = {}) {
   const now = new Date(at(o.now ?? 1));
   const snapshot = buildSnapshot({
-    claude: { ...emptyProvider("ok", null), collector: "win", windows, blocked: o.blocked ?? null, error_code: o.error ?? null },
+    [o.provider ?? "claude"]: { ...emptyProvider("ok", null), collector: "win", windows, blocked: o.blocked ?? null, error_code: o.error ?? null },
   });
   const received = o.received === undefined ? (o.now ?? 1) : o.received;
   snapshot.collectors = [{ id: "win", generated_at: at(0), received_at: received === null ? null : at(received) }];
@@ -64,11 +66,19 @@ test("limit: an overall window at 100% also marks thresholds done; a per-model w
   assert.equal(hidden(result.events).length, 2);
   assert.equal(result.state.cycles["claude.seven_day_fable"]?.alerted, false);
 
-  // The PC confirmed blocked but no window is at 100%: limit on the most-used overall window
-  const blocked = judge([session(70)], emptyEventState(), { blocked: true });
+  // Codex's API confirmed blocked but no window is at 100%: limit on the most-used overall window
+  const blocked = judge([session(70)], emptyEventState(), { blocked: true, provider: "codex" });
   const limit = blocked.events.find((e) => e.body.kind === "limit");
-  assert.equal(limit?.key, `limit:claude:five_hour:${at(180)}`);
+  assert.equal(limit?.key, `limit:codex:five_hour:${at(180)}`);
   assert.equal(limit?.body.blocked, true);
+  // Claude's and Gemini's flag follows from an overall window at 100%: with none now, nothing stands in for it
+  for (const provider of ["claude", "gemini"] as const) {
+    const r = judge([session(70)], emptyEventState(), { blocked: true, provider });
+    assert.equal(r.events.some((e) => e.body.kind === "limit"), false, provider);
+  }
+  // Claude's without any window (an earlier agent reported it so) is still told; Gemini's isn't
+  assert.equal(judge([], emptyEventState(), { blocked: true }).events.filter((e) => e.body.kind === "limit").length, 1);
+  assert.equal(judge([], emptyEventState(), { blocked: true, provider: "gemini" }).events.filter((e) => e.body.kind === "limit").length, 0);
 });
 
 test("reset: when a notified cycle ends and a new one is observed, one confirmed reset; none if not notified", () => {
@@ -240,16 +250,17 @@ test("same fetch time but a different value from a newly chosen observation is j
 
 test("with windows whose derived values are behind, blocked isn't notified as windowless; the window limit is notified once they catch up", () => {
   const now = new Date(at(1));
-  const snapshot = buildSnapshot({ claude: { ...emptyProvider("ok", null), collector: "win", windows: [session(70)], blocked: true } });
+  // Codex: its limit comes from its API, so it stands in on a window
+  const snapshot = buildSnapshot({ codex: { ...emptyProvider("ok", null), collector: "win", windows: [session(70)], blocked: true } });
   snapshot.collectors = [{ id: "win", generated_at: at(0), received_at: at(1) }];
   const view = toView(snapshot, now);
   const live = { last_received_at: at(1) };
-  const waiting = judgeEvents(view, emptyEventState(), live, now, { pending: ["claude.five_hour"] });
+  const waiting = judgeEvents(view, emptyEventState(), live, now, { pending: ["codex.five_hour"] });
   assert.equal(waiting.events.length, 0, "no windowless limit");
   const ready = judgeEvents(view, waiting.state, live, now);
-  assert.deepEqual(ready.events.filter((e) => e.visible).map((e) => e.key), [`limit:claude:five_hour:${at(180)}`]);
+  assert.deepEqual(ready.events.filter((e) => e.visible).map((e) => e.key), [`limit:codex:five_hour:${at(180)}`]);
   // That cycle was notified, so a reset is notified on the new cycle
-  const after = judge([session(3, 480, 200)], ready.state, { now: 201 });
+  const after = judge([session(3, 480, 200)], ready.state, { now: 201, provider: "codex" });
   assert.ok(after.events.some((e) => e.body.kind === "reset"));
 });
 

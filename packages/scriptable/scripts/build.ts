@@ -2,14 +2,14 @@
 //
 //   node packages/scriptable/scripts/build.ts
 //
-// If packages/scriptable/icons/claude.png and codex.png exist, they are base64-encoded into ICONS in Headroom.js
+// If packages/scriptable/icons/claude.png, codex.png and gemini.png exist, they are base64-encoded into ICONS in Headroom.js
 // and written to packages/scriptable/dist/Headroom.js (paste this one into the iPhone). The icons are the vendors' logos, so icons/ and dist/
 // are kept out of the repository (.gitignore). Without a PNG, that provider is shown with SF Symbols.
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 
 const root = new URL("../", import.meta.url);
 const source = readFileSync(new URL("Headroom.js", root), "utf8");
-const MARKER = /^const ICONS = \{ claude: "", codex: "" \}; \/\/ @icons$/m;
+const MARKER = /^const ICONS = \{ claude: "", codex: "", gemini: "" \}; \/\/ @icons$/m;
 if (!MARKER.test(source)) {
   console.error("ICONS line (// @icons) not found in Headroom.js");
   process.exit(1);
@@ -48,7 +48,7 @@ function icon(provider: string): string {
   return bytes.toString("base64");
 }
 
-const icons = { claude: icon("claude"), codex: icon("codex") };
+const icons = { claude: icon("claude"), codex: icon("codex"), gemini: icon("gemini") };
 const out = source.replace(MARKER, () => `const ICONS = ${JSON.stringify(icons)};`);
 mkdirSync(new URL("dist/", root), { recursive: true });
 writeFileSync(new URL("dist/Headroom.js", root), out);

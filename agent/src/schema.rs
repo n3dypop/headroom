@@ -32,6 +32,8 @@ pub enum ErrorCode {
     SafetyStop,
     /// The PC detected an account switch and has stopped fetching / pushing for that provider
     AccountChanged,
+    /// The service denied access (403): fetching stopped on every PC until the user resumes it
+    AccessDenied,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
@@ -184,6 +186,24 @@ pub const KNOWN_SCOPES: &[(&str, &str)] = &[
     ("codex_bengalfox", "Codex extra"),
 ];
 
+/// Names only one provider's windows may carry: (provider, slug, display name). Another provider's window with such a name stays
+/// on the PC (an unknown Codex group named "partner" is not sent)
+pub const PROVIDER_SCOPES: &[(&str, &str, &str)] = &[
+    // Gemini: a model with limits of its own, and the Claude and GPT models one uses through Antigravity (shown in details only)
+    ("gemini", "argon", "Argon"),
+    ("gemini", "partner", "Claude and GPT"),
+];
+
+/// The names a provider's windows may carry: the shared ones, then its own
+fn scopes_of(provider: &str) -> impl Iterator<Item = (&'static str, &'static str)> + '_ {
+    KNOWN_SCOPES.iter().copied().chain(
+        PROVIDER_SCOPES
+            .iter()
+            .filter(move |(p, _, _)| *p == provider)
+            .map(|(_, slug, name)| (*slug, *name)),
+    )
+}
+
 /// Plan names that may be sent (keep in sync with KNOWN_PLANS in TS). Anything else is sent as null
 pub const KNOWN_PLANS: &[&str] = &[
     "free",
@@ -251,24 +271,29 @@ pub fn is_collision_id(id: &str) -> bool {
 
 /// Whether a window id may leave the PC, and its scope's display name (same rule as `parseWindowId` in the Worker).
 /// None: not sent (not a length form or known id, or a model/group name that isn't known).
-/// Some(None): an overall limit. Some(Some(name)): a per-model / per-group limit with a known name
+/// Some(None): an overall limit. Some(Some(name)): a per-model / per-group limit with a known name. Only the shared names: a
+/// provider's own ones count through `sendable_scope_in`
 pub fn sendable_scope(id: &str) -> Option<Option<&'static str>> {
+    sendable_scope_in("", id)
+}
+
+/// `sendable_scope` for a window of `provider`: the shared names and the provider's own
+pub fn sendable_scope_in(provider: &str, id: &str) -> Option<Option<&'static str>> {
     if !is_window_id(id) {
         return None;
     }
     if known_window(id).is_some() && !is_base_window(id) {
         return Some(
-            KNOWN_SCOPES
-                .iter()
+            scopes_of(provider)
                 .find(|(s, _)| id.strip_suffix(s).is_some_and(|r| r.ends_with('_')))
-                .map(|(_, name)| *name),
+                .map(|(_, name)| name),
         );
     }
     for core in [id, strip_collision_suffix(id)] {
         if is_base_window(core) {
             return Some(None);
         }
-        for (slug, name) in KNOWN_SCOPES {
+        for (slug, name) in scopes_of(provider) {
             let prefixed = core.strip_prefix(slug).and_then(|r| r.strip_prefix('_'));
             let suffixed = core.strip_suffix(slug).and_then(|r| r.strip_suffix('_'));
             if prefixed.is_some_and(is_base_window) || suffixed.is_some_and(is_base_window) {
@@ -283,7 +308,12 @@ impl UsageWindow {
     /// The window as sent to the destination. None if the destination would not store it, including a per-model /
     /// per-group limit without a known name. The label and scope are rebuilt from known names, so no text from a CLI leaves the PC
     pub fn for_upload(&self) -> Option<UsageWindow> {
-        let scope = sendable_scope(&self.id)?;
+        self.for_upload_in("")
+    }
+
+    /// `for_upload` for a window of `provider` (its own names count too)
+    pub fn for_upload_in(&self, provider: &str) -> Option<UsageWindow> {
+        let scope = sendable_scope_in(provider, &self.id)?;
         // A per-model / per-group window must carry the same known name its id has (an unknown group whose id happens to
         // contain a known name, such as `codex_other_five_hour_primary` with scope `codex_other_five_hour`, is not sent)
         match (&self.scope, scope) {
@@ -310,6 +340,11 @@ impl ProviderSnapshot {
     /// The provider's value as sent to the destination: windows through `UsageWindow::for_upload`, the error message
     /// replaced with fixed text and only known plan names
     pub fn for_upload(&self) -> ProviderSnapshot {
+        self.for_upload_in("")
+    }
+
+    /// `for_upload` for the value of `provider` (its own names count too)
+    pub fn for_upload_in(&self, provider: &str) -> ProviderSnapshot {
         ProviderSnapshot {
             error: self.error.as_ref().map(|_| WITHHELD_ERROR.to_string()),
             plan: self
@@ -320,7 +355,7 @@ impl ProviderSnapshot {
             windows: self
                 .windows
                 .iter()
-                .filter_map(UsageWindow::for_upload)
+                .filter_map(|w| w.for_upload_in(provider))
                 .collect(),
             ..self.clone()
         }
@@ -334,7 +369,7 @@ impl Snapshot {
             providers: self
                 .providers
                 .iter()
-                .map(|(k, p)| (k.clone(), p.for_upload()))
+                .map(|(k, p)| (k.clone(), p.for_upload_in(k)))
                 .collect(),
             ..self.clone()
         }

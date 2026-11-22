@@ -63,14 +63,31 @@ test("toView: values are reachable by path alone, and display-time values are co
 test("toView: staleness is judged by each window's fetch time (when statusLine refreshes only some)", async () => {
   const merged = mergeSnapshots([await load()]);
   assert.ok(merged);
-  const v = toView(merged, new Date("2026-11-16T13:14:00Z"));
-  // The provider time is the oldest window (12:58) -> 16 minutes, caution
+  const v = toView(merged, new Date("2026-11-16T13:18:40Z"));
+  // The provider time is the oldest window (12:58) -> 20 minutes 40 seconds, caution
   assert.equal(v.claude?.freshness, "caution");
-  // Only the 5-hour window was refreshed by statusLine at 12:59:30
+  // Only the 5-hour window was refreshed by statusLine at 12:59:30 (19 minutes 10 seconds: fresh)
   assert.equal(v.claude?.windows.five_hour?.freshness, "fresh");
   assert.equal(v.claude?.windows.five_hour?.fetched_at, "2026-11-16T12:59:30.000Z");
   assert.equal(v.claude?.windows.seven_day_fable?.freshness, "caution");
-  assert.equal(v.claude?.windows.seven_day_fable?.age_minutes, 16);
+  assert.equal(v.claude?.windows.seven_day_fable?.age_minutes, 20);
+});
+
+test("a value its PC marked stale (a rate limit after it) isn't fresh, whatever its time; its windows keep their own time", async () => {
+  const s = await load();
+  const claude = s.providers.claude!;
+  s.providers.claude = { ...claude, status: "stale", error: "Could not fetch", error_code: "fetch_failed" };
+  const merged = mergeSnapshots([s]);
+  assert.ok(merged);
+  // 5 minutes after its fetch: fresh by time, old as the PC marked it
+  const v = toView(merged, new Date(Date.parse(claude.fetched_at!) + 5 * 60_000));
+  assert.equal(v.claude?.freshness, "caution");
+  assert.equal(v.claude?.stale, true);
+  assert.equal(v.claude?.freshness_message, "⚠ Value from 5m ago");
+  assert.equal(v.claude?.windows.five_hour?.freshness, "fresh");
+  // the control: as sent (ok)
+  const ok = toView(mergeSnapshots([await load()])!, new Date(Date.parse(claude.fetched_at!) + 5 * 60_000));
+  assert.equal(ok.claude?.freshness, "fresh");
 });
 
 test("toView: resets_at_local uses the given time zone, time only if today", async () => {

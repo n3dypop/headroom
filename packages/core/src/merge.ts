@@ -34,7 +34,10 @@ function pickProvider(entries: ProviderSnapshot[], options: CollectorSelection):
   const within = simultaneousMs(options);
   const nearLatest = latest ? withData.filter((p) => latest.at - p.at <= within
     && overlapsCycle(p.snapshot, latest.snapshot)) : [];
-  const selected = preferCollector(nearLatest, (p) => p, options.collectorPriority);
+  // Among those, a value its PC marked old (its next fetch failed, as a rate limit's) gives way to a current one; the PCs' priority
+  // then picks among what is left: the current ones, or all of them when every one is marked old
+  const current = nearLatest.filter((p) => p.snapshot.status !== "stale");
+  const selected = preferCollector(current.length > 0 ? current : nearLatest, (p) => p, options.collectorPriority);
   if (selected) return selected.snapshot;
   // If none has values, pick by status severity (show error rather than unavailable)
   return [...entries].sort((a, b) => STATUS_PRIORITY[b.status] - STATUS_PRIORITY[a.status])[0];

@@ -1,0 +1,28 @@
+{
+  "description": "Synthetic account RPC failures. The structured envelopes and wait metadata are test inputs, not captures from Codex.",
+  "denied": {
+    "id": 2,
+    "error": {
+      "code": -32603,
+      "message": "synthetic-private-marker",
+      "data": { "codexErrorInfo": { "httpConnectionFailed": { "httpStatusCode": 403 } } }
+    }
+  },
+  "limited": {
+    "id": 3,
+    "error": {
+      "code": -32603,
+      "message": "synthetic-private-marker",
+      "data": { "codexErrorInfo": { "httpConnectionFailed": {
+        "httpStatusCode": 429, "headers": { "Retry-After": "21600" }
+      } } }
+    }
+  },
+  "backend": {
+    "id": 3,
+    "error": {
+      "code": -32603,
+      "message": "failed to fetch codex rate limits: GET https://chatgpt.com/backend-api/wham/usage failed: 429 Too Many Requests; content-type=text/plain; body=synthetic-private-marker 403 Forbidden"
+    }
+  }
+}

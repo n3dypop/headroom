@@ -1,8 +1,11 @@
 // D1 reads and writes. Only the parts of the Worker's D1 binding we use are typed (no external type definitions).
+import { DENIED_TEXT, type Holds } from "./holds.ts";
+
+/** Fixed text of a provider whose access denial ended, while its values are of before (until its next fetch) */
+const RESUMED_TEXT = "Access was restored; waiting for the next fetch";
 import {
   EVENT_RETENTION_MS,
   BOUNDARY_GUARD_MS,
-  effectiveObservedAt,
   emptyEventState,
   observationKey,
   type EventBody,
@@ -16,6 +19,7 @@ import {
   type Snapshot,
   type UsageObservation,
 } from "../../core/src/index.ts";
+import { PROVIDERS } from "../../core/src/index.ts";
 import { heldToClock, settleLimits, withinClock, withoutUnstored, type CleanUpload } from "./sanitize.ts";
 
 export interface D1Statement {
@@ -41,10 +45,22 @@ export const SNAPSHOT_RETENTION_MS = 30 * DAY_MS;
  */
 export const WRITER = 2;
 
-/** Max observations read per provider for derived values (newest first; bounds D1 reads) */
-export const HISTORY_ROW_LIMIT = 5_000;
-/** Max observations deleted per Cron run (per provider and kind; deletes count as writes: 3 rows per item, the row and 2 indexes) */
-export const PRUNE_ROWS = 300;
+/**
+ * Max observations one Cron reads for derived values, all providers together. Turning them into values and computing takes the Cron's
+ * CPU (10 ms on the free plan)
+ */
+export const CRON_HISTORY_ROWS = 10_000;
+/** Max observations read per provider for derived values (newest first): an equal share of the run's rows, so every provider due is
+ * computed in one run (with heavy use the 24-hour rate covers a shorter span) */
+export const HISTORY_ROW_LIMIT = Math.floor(CRON_HISTORY_ROWS / PROVIDERS.length);
+/** Rows deleted per kind and provider per Cron (deletes count as writes: 3 rows per item, the row and 2 indexes; 3 providers fit the
+ * Cron's write reserve with 200; the rest go next Cron) */
+export const PRUNE_ROWS = 200;
+
+/** Whether a stored provider name is one of the providers */
+export function isProvider(p: string): p is ProviderId {
+  return (PROVIDERS as readonly string[]).includes(p);
+}
 /** Windows aggregated hourly (the chart is fixed to the weekly limit's 7 days) */
 export const ROLLUP_WINDOWS: readonly string[] = ["seven_day"];
 /**
@@ -148,7 +164,7 @@ export async function saveUpload(
   }
   // Look up only this PC's acceptance records by primary key (don't read all PCs)
   const accepted = await db
-    .prepare("SELECT provider, source FROM boundary_sources WHERE provider IN ('claude', 'codex') AND collector = ?")
+    .prepare(`SELECT provider, source FROM boundary_sources WHERE provider IN (${PROVIDERS.map((p) => `'${p}'`).join(", ")}) AND collector = ?`)
     .bind(collector)
     .all<{ provider: string; source: string }>();
   const acceptedSource = new Map(accepted.results.map((r) => [r.provider, r.source]));
@@ -308,7 +324,7 @@ export async function saveUpload(
   );
   // A provider's counter advances only if it has observations in this upload or this PC's latest value for it is replaced
   // (Cron doesn't re-read history of unchanged providers). Replacement is judged against the row before the save
-  for (const provider of ["claude", "codex"] as const) {
+  for (const provider of PROVIDERS) {
     const path = `$.providers.${provider}`;
     const observed = rows.some((o) => o.provider === provider) ? 1 : 0;
     statements.push(
@@ -382,6 +398,9 @@ export async function namesFull(db: D1Like): Promise<boolean> {
 }
 
 /** In SQL, whether the PC name (expression) can write (registered, or still registrable; one row each of primary key and number index) */
+/** SQL that is true while the PC name (a bound parameter or a column) can write: registered, or still registrable */
+export const writableSql = (name: string) => writable(name);
+
 const writable = (name: string) =>
   `(EXISTS (SELECT 1 FROM collector_names WHERE name = ${name})
     OR coalesce((SELECT slot FROM collector_names ORDER BY slot DESC LIMIT 1), -1) + 1 < ${MAX_STORED_COLLECTORS})`;
@@ -429,12 +448,12 @@ export function belowMarks(snapshot: Snapshot, collector: string, marks: Map<str
   for (const [id, p] of Object.entries(snapshot.providers) as [string, Snapshot["providers"][keyof Snapshot["providers"]]][]) {
     const until = marks.get(pcKey(id, collector));
     if (!p || until === undefined) {
-      if (p) providers[id as "claude" | "codex"] = p;
+      if (p) providers[id as ProviderId] = p;
       continue;
     }
     const windows = p.windows.filter((w) => w.fetched_at !== null && w.fetched_at > until);
     const fetchedOk = p.fetched_at !== null && p.fetched_at > until;
-    providers[id as "claude" | "codex"] = windows.length === p.windows.length && fetchedOk ? p : {
+    providers[id as ProviderId] = windows.length === p.windows.length && fetchedOk ? p : {
       ...p, windows, fetched_at: windows.map((w) => w.fetched_at as string).sort()[0] ?? (fetchedOk ? p.fetched_at : null), blocked: null,
     };
   }
@@ -444,7 +463,7 @@ export function belowMarks(snapshot: Snapshot, collector: string, marks: Map<str
 export function applyBoundaries(snapshot: Snapshot, receivedAt: string, boundaries: Boundaries): Snapshot {
   const providers: Snapshot["providers"] = {};
   const collector = snapshot.collector ?? "";
-  for (const id of ["claude", "codex"] as const) {
+  for (const id of PROVIDERS) {
     const p = snapshot.providers[id];
     if (p === undefined) continue;
     const since = boundaries.since.get(id);
@@ -489,7 +508,7 @@ export async function loadObservations(
   db: D1Like,
   provider: UsageObservation["provider"],
   since: Date,
-  boundaries?: Boundaries,
+  boundaries?: Pick<Boundaries, "since">,
 ): Promise<UsageObservation[]> {
   const b = boundaries ?? await loadBoundaries(db);
   // Newest first, up to the limit (walks the (provider, first_received_at) index backwards, so rows read stay within the limit)
@@ -510,20 +529,18 @@ export async function loadObservations(
     }>();
   const cut = b.since.get(provider);
   const guard = cut === undefined ? "" : guarded(cut);
-  return results.flatMap((r) => {
-    if (cut !== undefined && (r.first_received_at < cut || r.observed_at < guard)) return [];
-    const at = effectiveObservedAt(r.observed_at, r.first_received_at);
-    return at === null
-      ? []
-      : [{
-        provider,
-        window_id: r.window_id,
-        collector: r.collector,
-        resets_at: r.resets_at,
-        used_percent: Number(r.used_percent),
-        observed_at: at,
-      }];
-  });
+  // Both times are stored as toISOString strings only (the Worker writes no other form), so the earlier one is the smaller string, as the
+  // hourly aggregation takes it in SQL. No dates are parsed per row: the Cron's CPU with three providers of 5,000 rows each
+  return results
+    .filter((r) => cut === undefined || (r.first_received_at >= cut && r.observed_at >= guard))
+    .map((r) => ({
+      provider,
+      window_id: r.window_id,
+      collector: r.collector,
+      resets_at: r.resets_at,
+      used_percent: Number(r.used_percent),
+      observed_at: r.observed_at < r.first_received_at ? r.observed_at : r.first_received_at,
+    }));
 }
 
 /** Counter of the merged latest value. public_state compares with this; derived values compare with per-provider counters */
@@ -582,24 +599,47 @@ const STAMPS_SQL = `SELECT p.provider, coalesce(b.since, '') || '#' || coalesce(
 /** JSON of the current boundaries ({"claude":"…"}, ordered by provider). Same string as JSON.stringify(loadBoundaryStamps()) */
 const CURRENT_BOUNDARIES_SQL = `SELECT json_group_object(provider, stamp) FROM (${STAMPS_SQL})`;
 
-/** Current history boundaries (one row per provider, at most 2 rows) */
+/** Current history boundaries (one row per provider, at most one per provider) */
 export async function loadBoundaryStamps(db: D1Like): Promise<BoundaryStamps> {
   const { results } = await db.prepare(STAMPS_SQL).all<{ provider: string; stamp: string }>();
   const out: BoundaryStamps = {};
-  for (const r of results) if (r.provider === "claude" || r.provider === "codex") out[r.provider] = r.stamp;
+  for (const r of results) if (isProvider(r.provider)) out[r.provider] = r.stamp;
   return out;
 }
 
 export const stampOf = (stamps: BoundaryStamps | null | undefined, provider: ProviderId) => stamps?.[provider] ?? "";
 
+/** The history boundaries (provider -> since) the stamps were read with: a stamp is "since#epoch", "" before "#" when there is none */
+export function historySince(stamps: BoundaryStamps): Pick<Boundaries, "since"> {
+  const since = new Map<string, string>();
+  for (const [provider, stamp] of Object.entries(stamps)) {
+    const at = (stamp ?? "").split("#")[0] ?? "";
+    if (at !== "") since.set(provider, at);
+  }
+  return { since };
+}
+
+/** Every provider's change counter in one read (0 for one never counted) */
+export async function loadDataVersions(db: D1Like): Promise<Map<ProviderId, number>> {
+  const { results } = await db
+    .prepare(`SELECT provider, version FROM data_versions WHERE provider IN (${PROVIDERS.map(() => "?").join(", ")})`)
+    .bind(...PROVIDERS)
+    .all<{ provider: string; version: number }>();
+  const out = new Map<ProviderId, number>(PROVIDERS.map((p) => [p, 0]));
+  for (const r of results) if (isProvider(r.provider)) out.set(r.provider, Number(r.version));
+  return out;
+}
+
 /** Per-provider saved derived-value counter and boundary stamp (decides whether Cron recomputes) */
 export async function loadDerivedVersions(
   db: D1Like,
-): Promise<Map<string, { version: number; boundary: string; basis: string | null; generation: number }>> {
+): Promise<Map<string, { version: number; boundary: string; basis: string | null; generation: number; computedAt: string }>> {
   const { results } = await db
-    .prepare("SELECT provider, version, boundary, basis, generation FROM derived_metrics")
-    .all<{ provider: string; version: number; boundary: string | null; basis: string | null; generation: number }>();
-  return new Map(results.map((r) => [r.provider, { version: Number(r.version), boundary: r.boundary ?? "", basis: r.basis, generation: Number(r.generation) }]));
+    .prepare("SELECT provider, version, boundary, basis, generation, computed_at FROM derived_metrics")
+    .all<{ provider: string; version: number; boundary: string | null; basis: string | null; generation: number; computed_at: string | null }>();
+  return new Map(results.map((r) => [r.provider, {
+    version: Number(r.version), boundary: r.boundary ?? "", basis: r.basis, generation: Number(r.generation), computedAt: r.computed_at ?? "",
+  }]));
 }
 
 /**
@@ -630,6 +670,8 @@ export async function savePublicState(
 export interface PublicRow {
   /** Global counter read before reading the body (put after confirming no save happened since) */
   version: number;
+  /** The shared stops (access denied) marked on the row: applied to the merged value it shows (holds.ts) */
+  holds?: Holds;
   snapshot: Snapshot;
   /** Boundaries when the body was merged. null for pre-migration rows */
   boundaries: BoundaryStamps | null;
@@ -657,11 +699,12 @@ export async function hasSnapshots(db: D1Like): Promise<boolean> {
 /** The merged latest value, the boundaries when it was put, and the current boundaries (one row) */
 export async function loadPublicRow(db: D1Like): Promise<PublicRow | null> {
   const row = await db
-    .prepare("SELECT version, body, boundaries, current_boundaries, current_version FROM public_state WHERE id = 1")
-    .first<{ version: number; body: string; boundaries: string | null; current_boundaries: string | null; current_version: number | null }>();
+    .prepare("SELECT version, body, boundaries, current_boundaries, current_version, holds FROM public_state WHERE id = 1")
+    .first<{ version: number; body: string; boundaries: string | null; current_boundaries: string | null; current_version: number | null; holds: string | null }>();
   return row
     ? {
       version: Number(row.version),
+      holds: JSON.parse(row.holds ?? "{}") as Holds,
       dataVersion: dataVersionOf(Number(row.version), Number(row.current_version ?? 0)),
       snapshot: JSON.parse(row.body) as Snapshot,
       boundaries: parseStamps(row.boundaries),
@@ -673,14 +716,38 @@ export async function loadPublicRow(db: D1Like): Promise<PublicRow | null> {
 /** Providers whose merge-time boundary differs from the current one (their latest value may belong to the previous account) */
 export function staleProviders(row: PublicRow): ProviderId[] {
   const current = row.current ?? row.boundaries ?? {};
-  return (["claude", "codex"] as const).filter((id) => stampOf(row.boundaries, id) !== stampOf(current, id));
+  return PROVIDERS.filter((id) => stampOf(row.boundaries, id) !== stampOf(current, id));
 }
 
-/** Latest value exposed by the read endpoint, and boundaries to compare computed values with (providers that may hold the previous account's values are removed) */
+/**
+ * Latest value exposed by the read endpoint, and boundaries to compare computed values with (providers that may hold the previous account's
+ * values are removed). A provider stopped by an access denial shows it, whatever value a PC sent (another PC's older success never hides
+ * it), with its windows as they were fetched; a safety stop is shown first (both need the user)
+ */
 export function publicSnapshot(row: PublicRow): { snapshot: Snapshot; stamps: BoundaryStamps } {
   const stale = staleProviders(row);
   const providers = { ...row.snapshot.providers };
   for (const id of stale) delete providers[id];
+  for (const id of PROVIDERS) {
+    if (!row.holds?.[id]) {
+      // The stop mark is the only word on a shared access denial: one a PC's own value still carries after the stop ended (a resume
+      // on another PC) shows its windows as old, or nothing
+      const p = providers[id];
+      if (p?.error_code === "access_denied") {
+        if (p.windows.length > 0) providers[id] = { ...p, status: "stale", error: RESUMED_TEXT, error_code: null };
+        else delete providers[id];
+      }
+      continue;
+    }
+    const p = providers[id];
+    if (p?.error_code === "safety_stop") continue;
+    providers[id] = {
+      ...(p ?? { fetched_at: null, collector: null, plan: null, blocked: null, history_since: null, windows: [] }),
+      status: "error",
+      error: DENIED_TEXT,
+      error_code: "access_denied",
+    };
+  }
   return { snapshot: { ...row.snapshot, providers }, stamps: row.current ?? row.boundaries ?? {} };
 }
 
@@ -701,16 +768,19 @@ export async function loadPublicState(db: D1Like): Promise<Snapshot | null> {
 export async function loadPublicView(db: D1Like): Promise<{ row: PublicRow; derived: { provider: string; body: string; boundary: string | null }[] } | null> {
   const r = await db
     .prepare(
-      `SELECT p.version, p.body, p.boundaries, p.current_boundaries, p.current_version,
-         (SELECT json_group_array(json_object('provider', d.provider, 'body', d.body, 'boundary', d.boundary)) FROM derived_metrics d
-           WHERE d.generation = (SELECT generation FROM data_generation WHERE id = 1)) AS derived
+      // Three rows by primary key: the public row, the one row of derived values, the generation (derived values of another
+      // generation are not used)
+      `SELECT p.version, p.body, p.boundaries, p.current_boundaries, p.current_version, p.holds,
+         (SELECT CASE WHEN x.generation = g.generation THEN x.body END
+           FROM derived_public x, data_generation g WHERE x.id = 1 AND g.id = 1) AS derived
        FROM public_state p WHERE p.id = 1`,
     )
-    .first<{ version: number; body: string; boundaries: string | null; current_boundaries: string | null; current_version: number | null; derived: string | null }>();
+    .first<{ version: number; body: string; boundaries: string | null; current_boundaries: string | null; current_version: number | null; holds: string | null; derived: string | null }>();
   if (!r) return null;
   return {
     row: {
       version: Number(r.version),
+      holds: JSON.parse(r.holds ?? "{}") as Holds,
       dataVersion: dataVersionOf(Number(r.version), Number(r.current_version ?? 0)),
       snapshot: JSON.parse(r.body) as Snapshot,
       boundaries: parseStamps(r.boundaries),
@@ -724,7 +794,7 @@ export async function loadPublicView(db: D1Like): Promise<{ row: PublicRow; deri
 export function metricsOf(rows: { provider: string; body: string; boundary: string | null }[], boundaries?: BoundaryStamps): MetricsCache {
   const out: MetricsCache = {};
   for (const r of rows) {
-    if (r.provider !== "claude" && r.provider !== "codex") continue;
+    if (!isProvider(r.provider)) continue;
     if (boundaries && (r.boundary ?? "") !== stampOf(boundaries, r.provider)) continue;
     out[r.provider] = JSON.parse(r.body);
   }
@@ -737,59 +807,9 @@ export async function loadDerived(db: D1Like, boundaries?: BoundaryStamps): Prom
     .all<{ provider: string; body: string; boundary: string | null }>();
   const out: MetricsCache = {};
   for (const r of results) {
-    if (r.provider !== "claude" && r.provider !== "codex") continue;
+    if (!isProvider(r.provider)) continue;
     if (boundaries && (r.boundary ?? "") !== stampOf(boundaries, r.provider)) continue;
     out[r.provider] = JSON.parse(r.body);
-  }
-  return out;
-}
-
-/** Max turn duration (60-minute fetch interval while at the limit, plus margin) */
-export const TURN_MAX_MINUTES = 70;
-
-export interface TurnReply {
-  /** This PC has the turn (may fetch) */
-  go: boolean;
-  /** Seconds until the turn expires (if not on turn, skip for this long). Relative so it's unaffected by clock skew between PC and endpoint */
-  wait_s: number;
-}
-
-/**
- * Fetch turn. Per provider, if there is no holder, it expired, or this PC holds it, take the turn and extend it (0 minutes releases it).
- * Decided by the condition of a single UPSERT, so concurrent requests yield one holder. PC names are not returned
- */
-export async function takeTurns(
-  db: D1Like,
-  collector: string,
-  requests: ReadonlyMap<ProviderId, number>,
-  now: Date,
-): Promise<Partial<Record<ProviderId, TurnReply>>> {
-  const at = now.toISOString();
-  const out: Partial<Record<ProviderId, TurnReply>> = {};
-  for (const [provider, minutes] of requests) {
-    const until = new Date(now.getTime() + Math.min(Math.max(minutes, 0), TURN_MAX_MINUTES) * 60_000).toISOString();
-    // Only writable PCs (registered, or still registrable) can take the turn. A turn held by a non-writable PC is replaced even before expiry
-    // (so a turn taken before the names filled up doesn't delay fetching by PCs that can deliver). Decided within the same statement
-    await db
-      .prepare(
-        `INSERT INTO fetch_turns (provider, collector, until) SELECT ?, ?, ? WHERE ${writable("?")}
-         ON CONFLICT (provider) DO UPDATE SET collector = excluded.collector, until = excluded.until
-         WHERE fetch_turns.collector = excluded.collector OR fetch_turns.until <= ?
-            OR NOT (${writable("fetch_turns.collector")})`,
-      )
-      .bind(provider, collector, until, collector, at)
-      .run();
-    const row = await db
-      .prepare("SELECT collector, until FROM fetch_turns WHERE provider = ?")
-      .bind(provider)
-      .first<{ collector: string; until: string }>();
-    const remaining = row ? Math.max(0, Math.ceil((Date.parse(row.until) - now.getTime()) / 1000)) : 0;
-    // If nobody holds the turn (this PC couldn't take it because it can't write), let it fetch on its own
-    out[provider] = row === null
-      ? { go: true, wait_s: 0 }
-      : row.collector === collector
-      ? { go: remaining > 0, wait_s: 0 }
-      : { go: false, wait_s: remaining };
   }
   return out;
 }
@@ -823,12 +843,9 @@ export async function prune(db: D1Like, now: Date): Promise<void> {
       )
       .bind(provider, ROLLUP_WINDOWS[0], provider, ROLLUP_WINDOWS[0], observationCutoff.slice(0, 13), PRUNE_ROWS);
   await db.batch([
-    oldHourly("claude"),
-    oldHourly("codex"),
-    old("claude"),
-    old("codex"),
-    beforeBoundary("claude"),
-    beforeBoundary("codex"),
+    ...PROVIDERS.map(oldHourly),
+    ...PROVIDERS.map(old),
+    ...PROVIDERS.map(beforeBoundary),
     db.prepare("DELETE FROM collector_snapshots WHERE received_at < ?").bind(snapshotCutoff),
     // A PC's latest value removed: the merged latest value is rebuilt by the next Cron (repairPublicState sees the counter move)
     db.prepare(`UPDATE data_versions SET version = version + 1 WHERE provider = '${ALL_VERSION}' AND changes() > 0`),
@@ -946,6 +963,21 @@ export async function loadEventFeed(db: D1Like): Promise<EventFeed> {
  * Puts derived values in one statement (if the save fails, the counter and boundary stamp stay as before, so the next Cron recomputes).
  * Does not overwrite if older than the counter read before computing
  */
+/**
+ * Rebuilds the one row the read endpoint reads (derived_public) from the derived_metrics rows actually stored for the current
+ * generation (never from values read before: a Cron finishing later can't drop another provider's newer values)
+ */
+export const DERIVED_PUBLIC_SQL = `INSERT INTO derived_public (id, generation, body)
+  SELECT 1, g.generation, (SELECT json_group_array(json_object('provider', d.provider, 'body', d.body, 'boundary', d.boundary))
+    FROM derived_metrics d WHERE d.generation = g.generation)
+  FROM data_generation g WHERE g.id = 1
+  ON CONFLICT (id) DO UPDATE SET generation = excluded.generation, body = excluded.body`;
+
+/** Rebuilds derived_public (Cron, when no save of this run did: e.g. an earlier Worker saved derived values only) */
+export async function rebuildDerivedPublic(db: D1Like): Promise<void> {
+  await db.prepare(DERIVED_PUBLIC_SQL).run();
+}
+
 export async function saveDerived(
   db: D1Like,
   provider: ProviderId,
@@ -964,8 +996,8 @@ export async function saveDerived(
   // An old computation never overwrites a newer one
   // Only a computation with neither counter below the saved ones replaces it. A computation whose two counters disagree in age (newer observations
   // but older latest value, etc.) doesn't replace. Both counters only increase, so the next Cron computing with the current counters always replaces
-  await db
-    .prepare(
+  await db.batch([
+    db.prepare(
       // Put only while the generation read before computing is current (a computation that read rows the cleanup removed never saves,
       // also as a first row). Within a generation, the counters decide; a row of an older generation is replaced whatever its counters
       `INSERT INTO derived_metrics (provider, computed_at, version, body, boundary, basis, public_version, generation)
@@ -977,8 +1009,18 @@ export async function saveDerived(
          OR (derived_metrics.generation = excluded.generation AND excluded.version >= derived_metrics.version
            AND coalesce(excluded.public_version, 0) >= coalesce(derived_metrics.public_version, 0))`,
     )
-    .bind(provider, computedAt.toISOString(), version, JSON.stringify(metrics), boundary, basis, publicVersion, generation, generation)
-    .run();
+      .bind(provider, computedAt.toISOString(), version, JSON.stringify(metrics), boundary, basis, publicVersion, generation, generation),
+    // The read endpoint's row, from what is now stored (in the same batch: a failed batch leaves both as they were)
+    db.prepare(DERIVED_PUBLIC_SQL),
+  ]);
+}
+
+/** For every provider, the boundary stamp and hour its weekly series of the current generation was built (one read; no series) */
+export async function loadWeeklyBuilt(db: D1Like): Promise<Map<string, { boundary: string; builtHour: string }>> {
+  const { results } = await db
+    .prepare(`SELECT provider, boundary, built_hour FROM derived_weekly WHERE generation = (SELECT generation FROM data_generation WHERE id = 1)`)
+    .all<{ provider: string; boundary: string; built_hour: string }>();
+  return new Map(results.map((r) => [r.provider, { boundary: r.boundary, builtHour: r.built_hour }]));
 }
 
 /** Weekly 7-day series (one row per provider), with the boundary stamp and time it was built */

@@ -1,15 +1,30 @@
 // Type definitions for snapshot schema v2 (source of truth).
 //
-// Policy: shape the values used to track and notify about usage limits into a form common to Claude and Codex.
+// Policy: shape the values used to track and notify about usage limits into a form common to every provider (Claude, Codex, Gemini).
 // Every provider has the same keys; values that don't apply are null (keys are never omitted).
 
 export const SCHEMA_VERSION = 2;
 
-export type ProviderId = "claude" | "codex";
+export type ProviderId = "claude" | "codex" | "gemini";
+
+/** Every provider, in a fixed order: the one source of every provider list (views, events, the server's lists and SQL) */
+export const PROVIDERS: readonly ProviderId[] = ["claude", "codex", "gemini"];
+
+/** Display names of the providers */
+export const PROVIDER_NAMES: Readonly<Record<ProviderId, string>> = { claude: "Claude", codex: "Codex", gemini: "Gemini" };
+
+/** Providers whose `blocked` follows from their overall windows (Codex's comes from its API and is kept as sent) */
+export const WINDOW_LIMIT_PROVIDERS: readonly ProviderId[] = ["claude", "gemini"];
+
+/** Of those, providers whose agent may report the limit without any window (an earlier Claude agent did): their flag stays then */
+export const LIMIT_WITHOUT_WINDOWS: readonly ProviderId[] = ["claude"];
 
 export type ProviderStatus = "ok" | "stale" | "error" | "unavailable";
-/** account_changed: the PC detected an account switch and stopped fetching/sending for that provider (a single account is assumed) */
-export type ErrorCode = "login_required" | "not_installed" | "fetch_failed" | "safety_stop" | "account_changed";
+/**
+ * account_changed: the PC detected an account switch and stopped fetching/sending for that provider (a single account is assumed).
+ * access_denied: the service denied access (403): fetching stopped on every PC until the user resumes it
+ */
+export type ErrorCode = "login_required" | "not_installed" | "fetch_failed" | "safety_stop" | "account_changed" | "access_denied";
 
 /** Window kind. Lets displays pick "only the 5-hour window" or "only the weekly window" */
 export type WindowKind = "session" | "weekly" | "monthly" | "other";
@@ -108,6 +123,32 @@ export const KNOWN_SCOPES: Readonly<Record<string, string>> = {
   codex_bengalfox: "Codex extra",
 };
 
+/**
+ * Names only one provider's windows may carry (slug -> display name), after the shared KNOWN_SCOPES (the same table as the agent's
+ * PROVIDER_SCOPES). Another provider's window with such a name isn't stored (an unknown Codex group named "partner" stays out)
+ */
+export const PROVIDER_SCOPES: Readonly<Partial<Record<ProviderId, Readonly<Record<string, string>>>>> = {
+  // A Gemini model with limits of its own, and the Claude and GPT models one uses through Antigravity
+  gemini: { argon: "Argon", partner: "Claude and GPT" },
+};
+
+/** The names a provider's windows may carry: the shared ones, then its own (the agent's scopes_of, in the same order) */
+export function scopesOf(provider: ProviderId): readonly (readonly [string, string])[] {
+  return [...Object.entries(KNOWN_SCOPES), ...Object.entries(PROVIDER_SCOPES[provider] ?? {})];
+}
+
+/** Slugs of windows shown in details only: never chosen for the normal display, the top window, summaries or events */
+const DETAIL_ONLY_SLUGS: Readonly<Partial<Record<ProviderId, readonly string[]>>> = { gemini: ["partner"] };
+
+/**
+ * Whether a provider's window is shown in details only: its id read as the Worker reads it when storing (the known name around the
+ * length, also before a collision suffix)
+ */
+export function isDetailOnly(provider: ProviderId, windowId: string): boolean {
+  const slug = parseWindowId(windowId, provider)?.slug;
+  return slug != null && (DETAIL_ONLY_SLUGS[provider] ?? []).includes(slug);
+}
+
 export const KNOWN_WINDOWS: Readonly<Record<string, KnownWindow>> = {
   five_hour: { label: "5h", kind: "session", window_seconds: 5 * 60 * 60 },
   seven_day: { label: "Weekly", kind: "weekly", window_seconds: WEEK },
@@ -115,3 +156,51 @@ export const KNOWN_WINDOWS: Readonly<Record<string, KnownWindow>> = {
   seven_day_opus: { label: "Weekly Opus", kind: "weekly", window_seconds: WEEK },
   seven_day_sonnet: { label: "Weekly Sonnet", kind: "weekly", window_seconds: WEEK },
 };
+
+const WINDOW_ID = /^[a-z0-9_]{1,64}$/;
+/** Base forms of a window id that express its length (primary / secondary are Codex limits of unknown duration) */
+const BASE_WINDOW = /^(five_hour|seven_day|monthly|window_(\d{1,6})m|primary|secondary)$/;
+/** Suffix Codex appends when the same id would collide (a number only follows _primary / _secondary) */
+const ID_SUFFIX = /(?:_(?:primary|secondary)(?:_\d{1,2})?)?$/;
+
+/** A parsed window id. scope is the display name of the known name (null for the overall limit) */
+export interface WindowIdParts {
+  base: string;
+  minutes: number | null;
+  scope: string | null;
+  /** The known name as it appears in the id (null for the overall limit) */
+  slug: string | null;
+}
+
+/**
+ * Parses a window id of `provider` (its names: the shared ones, then its own; without a provider, the shared ones only). null if it
+ * is not a shape that may be stored
+ */
+export function parseWindowId(id: unknown, provider?: ProviderId): WindowIdParts | null {
+  if (typeof id !== "string" || !WINDOW_ID.test(id)) return null;
+  const scopes = new Map(provider === undefined ? Object.entries(KNOWN_SCOPES) : scopesOf(provider));
+  if (Object.hasOwn(KNOWN_WINDOWS, id) && !BASE_WINDOW.test(id)) {
+    const slug = [...scopes.keys()].find((k) => id.endsWith(`_${k}`));
+    return { base: id, minutes: null, scope: slug === undefined ? null : scopes.get(slug)!, slug: slug ?? null };
+  }
+  const candidates = [id, id.replace(ID_SUFFIX, "")];
+  for (const core of candidates) {
+    const forms: [string, string | null][] = [[core, null]];
+    for (const slug of scopes.keys()) {
+      if (core.startsWith(`${slug}_`)) forms.push([core.slice(slug.length + 1), slug]);
+      if (core.endsWith(`_${slug}`)) forms.push([core.slice(0, -slug.length - 1), slug]);
+    }
+    for (const [rest, slug] of forms) {
+      const m = BASE_WINDOW.exec(rest);
+      if (m) {
+        return {
+          base: m[1]!,
+          minutes: m[2] === undefined ? null : Number(m[2]),
+          scope: slug === null ? null : scopes.get(slug)!,
+          slug,
+        };
+      }
+    }
+  }
+  return null;
+}

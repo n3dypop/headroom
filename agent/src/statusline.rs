@@ -13,6 +13,37 @@ use crate::store::{read_json, write_json_atomic};
 use crate::time::{iso_from_ms, ms_from_epoch, now_ms};
 
 pub const CAPTURE_FILE: &str = "claude-statusline.json";
+/// Claude's acceptance generation (a number), raised by each acceptance of an account switch under the writers' lock. A writer notes it
+/// before reading its input and saves only if it is unchanged under the lock: an input of the account before is never saved after
+const CLAUDE_GEN_FILE: &str = "claude-statusline.gen";
+const CLAUDE_LOCK_FILE: &str = "claude-statusline.lock";
+const CLAUDE_LOCK_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Claude's acceptance generation now (0: none yet, or unreadable: a writer then passes over its input after an acceptance)
+pub fn read_claude_gen(home: &Path) -> u64 {
+    std::fs::read_to_string(home.join(CLAUDE_GEN_FILE))
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+/// Claude's acceptance generation file written again when it isn't a number (store::repair_gen_file)
+pub fn repair_claude_gen(home: &Path, known: u64) -> bool {
+    crate::store::repair_gen_file(home, CLAUDE_GEN_FILE, CLAUDE_LOCK_FILE, known)
+}
+
+/// Raises Claude's acceptance generation under the writers' lock (held until the acceptance is saved, by the returned lock). The
+/// generation now, or an error (the acceptance isn't made)
+pub fn raise_claude_gen(
+    home: &Path,
+    at_least: u64,
+) -> std::io::Result<(u64, crate::store::FileLock)> {
+    let lock = crate::store::FileLock::acquire(home, CLAUDE_LOCK_FILE, CLAUDE_LOCK_WAIT * 10)
+        .ok_or_else(|| std::io::Error::other("the statusLine record is locked"))?;
+    let next = read_claude_gen(home).max(at_least) + 1;
+    std::fs::write(home.join(CLAUDE_GEN_FILE), next.to_string())?;
+    Ok((next, lock))
+}
 
 /// Values captured from statusLine (the shape of ~/.headroom/claude-statusline.json).
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -26,6 +57,9 @@ pub struct Capture {
     /// read (never used)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub epoch: Option<u64>,
+    /// Claude's acceptance generation read before the input was: a record of one before the last acceptance is never used
+    #[serde(default)]
+    pub accept_gen: u64,
 }
 
 pub fn run(args: &[String], home: &Path) -> i32 {
@@ -33,16 +67,20 @@ pub fn run(args: &[String], home: &Path) -> i32 {
         .windows(2)
         .find(|w| w[0] == "--then")
         .map(|w| w[1].clone());
+    if args.iter().any(|a| a == "--gemini") {
+        return run_gemini(home, then_cmd);
+    }
 
-    // The clock epoch first: a value read under it and saved late (after a refusal and its lifting) carries the epoch it came in
+    // The clock epoch and the acceptance generation first: a value read under them and saved late carries what it came in
     let epoch = crate::clock::usable_epoch(home);
+    let accept_gen = read_claude_gen(home);
     let mut input = Vec::new();
     let _ = std::io::stdin().read_to_end(&mut input);
     let parsed: Option<Value> = serde_json::from_slice(&input).ok();
 
     // rate_limits is absent until the session's first API response. When absent, keep the previous capture.
     if let Some(rl) = parsed.as_ref().and_then(|v| v.get("rate_limits")) {
-        let _ = save_capture_in(home, rl, now_ms(), epoch);
+        let _ = save_capture_gen(home, rl, now_ms(), epoch, accept_gen);
     }
 
     let out = match then_cmd {
@@ -53,6 +91,30 @@ pub fn run(args: &[String], home: &Path) -> i32 {
     let _ = stdout.write_all(out.as_bytes());
     if !out.ends_with('\n') {
         let _ = stdout.write_all(b"\n");
+    }
+    0
+}
+
+/// `headroom statusline --gemini`: called from the Antigravity CLI's statusLine. Keeps a hash of the account's email and the plan (never
+/// the email), then prints what the user's own command prints (`--then`), or nothing (Antigravity's own status line stays with
+/// `stack_with_default`). Always exits 0, so Antigravity never turns the command off
+fn run_gemini(home: &Path, then_cmd: Option<String>) -> i32 {
+    use crate::providers::gemini::{capture_from_input, read_accept_gen, save_capture};
+    // Both read before the input: an acceptance after this point makes the input one of the time before (not saved)
+    let epoch = crate::clock::usable_epoch(home);
+    let accept_gen = read_accept_gen(home);
+    let mut input = Vec::new();
+    let _ = std::io::stdin().read_to_end(&mut input);
+    if let Some(mut cap) = serde_json::from_slice::<Value>(&input)
+        .ok()
+        .and_then(|v| capture_from_input(&v, now_ms(), epoch))
+    {
+        cap.accept_gen = accept_gen;
+        let _ = save_capture(home, &cap);
+    }
+    if let Some(out) = then_cmd.and_then(|cmd| run_passthrough(&cmd, &input)) {
+        let mut stdout = std::io::stdout().lock();
+        let _ = stdout.write_all(out.as_bytes());
     }
     0
 }
@@ -82,6 +144,23 @@ pub fn save_capture(home: &Path, rate_limits: &Value, now: i64) -> std::io::Resu
     save_capture_in(home, rate_limits, now, crate::clock::usable_epoch(home))
 }
 
+/// save_capture_in under the writers' lock, only if the acceptance generation read before the input is still the one now (an input
+/// read before an acceptance is of the account before: not saved)
+pub fn save_capture_gen(
+    home: &Path,
+    rate_limits: &Value,
+    now: i64,
+    epoch: Option<u64>,
+    accept_gen: u64,
+) -> std::io::Result<bool> {
+    let _lock = crate::store::FileLock::acquire(home, CLAUDE_LOCK_FILE, CLAUDE_LOCK_WAIT)
+        .ok_or_else(|| std::io::Error::other("the statusLine record is locked"))?;
+    if read_claude_gen(home) != accept_gen {
+        return Ok(false);
+    }
+    save_capture_in(home, rate_limits, now, epoch)
+}
+
 /// Stores only `capture_fields`, with the clock epoch read before the input. Don't write if nothing is left or the value and its epoch are
 /// unchanged (keeps captured_at as "when this value appeared"; the same value in a new epoch is a new one)
 pub fn save_capture_in(
@@ -94,9 +173,11 @@ pub fn save_capture_in(
         return Ok(false);
     };
     let path = home.join(CAPTURE_FILE);
+    let accept_gen = read_claude_gen(home);
     if let Some(prev) = read_json::<Capture>(&path)
         && prev.rate_limits == rate_limits
         && prev.epoch == epoch
+        && prev.accept_gen == accept_gen
     {
         return Ok(false);
     }
@@ -105,6 +186,7 @@ pub fn save_capture_in(
         captured_at_ms: now,
         rate_limits,
         epoch,
+        accept_gen,
     };
     write_json_atomic(&path, &cap)?;
     Ok(true)
@@ -117,10 +199,19 @@ pub fn read_capture(home: &Path) -> Option<(i64, Vec<UsageWindow>)> {
 
 /// Read the capture, if it was taken in `epoch` (None: none is used)
 pub fn read_capture_in(home: &Path, epoch: Option<u64>) -> Option<(i64, Vec<UsageWindow>)> {
+    read_capture_since(home, epoch, 0)
+}
+
+/// read_capture_in, only of acceptance generation `min_gen` or later
+pub fn read_capture_since(
+    home: &Path,
+    epoch: Option<u64>,
+    min_gen: u64,
+) -> Option<(i64, Vec<UsageWindow>)> {
     let epoch = epoch?;
     let bytes = std::fs::read(home.join(CAPTURE_FILE)).ok()?;
     let cap: Capture = serde_json::from_slice(&bytes).ok()?;
-    if cap.epoch != Some(epoch) {
+    if cap.epoch != Some(epoch) || cap.accept_gen < min_gen {
         return None;
     }
     capture_from(&bytes)
@@ -257,6 +348,56 @@ mod tests {
         // the control: the same value read under the new epoch is a new one, and used
         assert!(save_capture(&home, &rl, 2_000).unwrap());
         assert_eq!(read_capture(&home).unwrap().0, 2_000);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn an_input_read_before_an_acceptance_is_never_saved_after_it() {
+        let home = temp_home("capture-gen");
+        let rl = json!({"five_hour": {"used_percentage": 5, "resets_at": 1}});
+        let epoch = crate::clock::usable_epoch(&home);
+        // a writer reads the generation, then its input; an acceptance raises the generation meanwhile
+        let before = read_claude_gen(&home);
+        let (raised, writers) = raise_claude_gen(&home, 0).unwrap();
+        assert_eq!(raised, before + 1);
+        // while the acceptance holds the writers' lock, no writer saves
+        assert!(save_capture_gen(&home, &rl, 1_000, epoch, raised).is_err());
+        drop(writers);
+        assert!(!save_capture_gen(&home, &rl, 1_000, epoch, before).unwrap());
+        assert!(read_capture(&home).is_none());
+        // the control: one read after it is saved, and read by the state accepted in it
+        assert!(save_capture_gen(&home, &rl, 2_000, epoch, raised).unwrap());
+        assert_eq!(read_capture_since(&home, epoch, raised).unwrap().0, 2_000);
+        assert!(read_capture_since(&home, epoch, raised + 1).is_none());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_broken_generation_file_is_written_again_with_the_generation_known() {
+        let home = temp_home("gen-broken");
+        let epoch = crate::clock::usable_epoch(&home);
+        let rl = json!({"five_hour": {"used_percentage": 5, "resets_at": 1}});
+        let (raised, lock) = raise_claude_gen(&home, 0).unwrap();
+        drop(lock);
+        std::fs::write(home.join(CLAUDE_GEN_FILE), b"x").unwrap();
+        // a writer meanwhile reads 0: its record is of a generation before, never taken
+        assert!(save_capture_gen(&home, &rl, 1_000, epoch, read_claude_gen(&home)).unwrap());
+        assert!(read_capture_since(&home, epoch, raised).is_none());
+        // the reader writes it again; the next input is taken
+        assert!(repair_claude_gen(&home, raised));
+        assert_eq!(read_claude_gen(&home), raised);
+        assert!(!repair_claude_gen(&home, raised), "once");
+        assert!(
+            save_capture_gen(
+                &home,
+                &json!({"five_hour": {"used_percentage": 6, "resets_at": 1}}),
+                2_000,
+                epoch,
+                read_claude_gen(&home)
+            )
+            .unwrap()
+        );
+        assert_eq!(read_capture_since(&home, epoch, raised).unwrap().0, 2_000);
         let _ = std::fs::remove_dir_all(&home);
     }
 

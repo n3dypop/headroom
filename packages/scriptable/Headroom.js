@@ -3,15 +3,15 @@
 // - Reads GET /v2/view from the server and draws 0-100% bars for the 5-hour, weekly and other limits. Recent consumption is gray inside the bar
 // - Credentials (the server origin and the Worker read token) are kept only in Scriptable's
 //   Keychain, never in the script body, URLs, logs or the saved view. On first use, run it in the app and enter them
-// - The widget parameter chooses which limits to show: empty (overall limits of both providers), claude, codex, top,
-//   claude.five_hour,codex.seven_day (a list of window keys)
+// - The widget parameter chooses which limits to show: empty (Codex and Claude, and any other provider with values), one to three
+//   providers (gemini; claude, gemini; codex, claude, gemini), top, claude.five_hour,codex.seven_day (a list of window keys)
 // - When fetching fails, shows the previous view (saved on the device; only the needed fields, no account info) marked as old
 // - Staleness and "reset (estimated)" are recomputed at draw time (the widget may be shown later than it was fetched)
 //
 // From here down to "Widget rendering below" everything is a pure function that doesn't use the Scriptable API (tested with Node).
 // Startup is at the end (main runs after all constants are defined)
 
-const HEADROOM_VERSION = 65;
+const HEADROOM_VERSION = 69;
 /** View version this script can read (VIEW_VERSION in packages/core) */
 const VIEW_VERSION = 1;
 /** Settings are stored as JSON in a single Keychain item (so the server and credentials are always read as a pair) */
@@ -36,8 +36,8 @@ const KEYCHAIN_LEGACY = {
 /** Desired refresh interval (iOS decides the actual interval) */
 const REFRESH_MINUTES = 15;
 /** Staleness thresholds for values (same as freshness.ts in packages/core) */
-const FRESH_MAX_MINUTES = 15;
-const CAUTION_MAX_MINUTES = 60;
+const FRESH_MAX_MINUTES = 20;
+const CAUTION_MAX_MINUTES = 75;
 /** Rows shown per provider group (two groups side by side / a single group) */
 const MAX_WINDOWS = { small: 2, medium: 2, large: 3, extraLarge: 3, accessoryRectangular: 2 };
 const MAX_WINDOWS_SINGLE = { small: 3, medium: 4, large: 6, extraLarge: 6 };
@@ -90,12 +90,39 @@ const SIZE_CONTENT = {
   large: { reset: true, marks: true, plan: true, pace: true, forecastTime: true, scoped: true, trend: true, freshness: true },
 };
 SIZE_CONTENT.extraLarge = SIZE_CONTENT.large;
-/** Provider colors (Claude orange, Codex blue-violet to match its icon). Fixed colors because they are also passed to DrawContext */
-const BRAND_COLORS = { claude: "#D97757", codex: "#6E7CF7" };
+/**
+ * Provider colors (Claude orange, Codex blue-violet to match its icon, Gemini a light blue apart from Codex's). Fixed colors because
+ * they are also passed to DrawContext
+ */
+const BRAND_COLORS = { claude: "#D97757", codex: "#6E7CF7", gemini: "#1A9FD6" };
 /** Wording when there is no 5-hour limit */
 const NOT_AVAILABLE = "Not available";
 /** Order of providers (from the left / top; Codex first) */
-const PROVIDER_ORDER = ["codex", "claude"];
+const PROVIDER_ORDER = ["codex", "claude", "gemini"];
+/** Shown when the parameter names none: these, then any other provider the view has values of (in PROVIDER_ORDER) */
+const DEFAULT_PROVIDERS = ["codex", "claude"];
+/** Providers shown side by side at most (the parameter names one to this many) */
+const MAX_PROVIDERS = 3;
+/**
+ * Providers the view has carried from its first version: a view without one of them is malformed. A later one may be absent (from an
+ * earlier Worker) and reads as no value
+ */
+const VIEW_PROVIDERS = ["claude", "codex"];
+/**
+ * Providers whose fetch isn't verified on a real machine yet: turned off on the PCs by default, so without values of theirs they are
+ * shown as not supported (not as missing data)
+ */
+const UNVERIFIED_PROVIDERS = ["gemini"];
+/** Short provider names for the lock screen's line when the names don't fit otherwise (three providers) */
+const SHORT_PROVIDER_NAMES = { codex: "Cx", claude: "Cl", gemini: "Gm" };
+/** Shown where the limits (and on the lock screen, the limit name) of a provider not supported yet would be */
+const NOT_SUPPORTED = "Not supported";
+/** Without an icon image: the SF Symbol, the letter drawn in the lock screen ring and the mark of the details screen */
+const FALLBACK_MARKS = {
+  claude: { symbol: "asterisk", letter: "C", css: "✳︎" },
+  codex: { symbol: "terminal", letter: "X", css: ">_" },
+  gemini: { symbol: "sparkle", letter: "G", css: "✦" },
+};
 /**
  * Usage warning mark. The only warning is "likely to run out before reset" (a low remaining amount is fine if it won't run out).
  * Conveyed with a monochrome ⚠ and text, not color (bars use only the provider color and gray). Medium, large and the lock screen rectangle show ⚠ and the run-out time
@@ -112,7 +139,7 @@ const RESET_MARK = "↻";
  * Icon images (base64 PNG). Not kept in the repository (they are the vendors' logos). scripts/build.ts embeds
  * packages/scriptable/icons/<provider>.png and writes dist/Headroom.js. If empty, SF Symbols are used instead
  */
-const ICONS = { claude: "", codex: "" }; // @icons
+const ICONS = { claude: "", codex: "", gemini: "" }; // @icons
 
 /** Accept only the server origin (https://host[:port]). No path, userinfo, query or fragment */
 function normalizeBaseUrl(raw) {
@@ -140,7 +167,7 @@ function validateSetup(input) {
   return { url, token };
 }
 
-const PROVIDER_NAMES = { claude: "Claude", codex: "Codex" };
+const PROVIDER_NAMES = { claude: "Claude", codex: "Codex", gemini: "Gemini" };
 /** Plan display names (KNOWN_PLANS in packages/core) */
 const PLAN_NAMES = {
   free: "Free", go: "Go", plus: "Plus", pro: "Pro", prolite: "Pro Lite", max: "Max", ultra: "Ultra",
@@ -149,10 +176,10 @@ const PLAN_NAMES = {
 /** Reasons for a missing value (ErrorCode in packages/core) */
 const ERROR_NAMES = {
   login_required: "Sign in required", not_installed: "Not installed", fetch_failed: "Couldn't fetch",
-  safety_stop: "Paused for safety", account_changed: "Account changed, paused",
+  safety_stop: "Paused for safety", account_changed: "Account changed, paused", access_denied: "Access denied",
 };
 /** Short display names for some scopes (names from KNOWN_SCOPES in packages/core) */
-const SCOPE_NAMES = { "Codex extra": "Extra", codex_other: "Other" };
+const SCOPE_NAMES = { "Codex extra": "Extra", codex_other: "Other", "Claude and GPT": "Claude/GPT" };
 /**
  * Display name of a scope: its short name if known, the scope itself if it is one plain word (letters, digits, . _ -, up to 24), otherwise
  * "Other" (what a notification or the lock screen shows never carries an unexpected string)
@@ -190,6 +217,9 @@ function sanitizeWindow(w) {
     rate_15m: num(w.rate_15m),
     // Rate used for the forecast (the server's rate_pace; undefined from older servers without the field)
     ...("rate_pace" in w ? { rate_pace: num(w.rate_pace) } : {}),
+    // Shown in the details only (e.g. Gemini's Claude and GPT models): never on the widget unless named, nor in reminders. Absent from
+    // older servers, which have no such window
+    detail_only: w.detail_only === true,
   };
 }
 
@@ -214,13 +244,16 @@ function sanitizeProvider(p) {
     new Set(list).size === list.length && list.length === expected.length && expected.every((id) => list.includes(id));
   const keys = Object.keys(windows);
   if (!sameSet(all, keys) || !sameSet(main, keys.filter((id) => windows[id].scope === null))) return undefined;
+  const error_code = oneOf(p.error_code, Object.keys(ERROR_NAMES));
+  // Stopped by an access denial: none of its values is shown (they would read as current), only the stop
+  const denied = error_code === "access_denied";
   return {
     status: oneOf(p.status, PROVIDER_STATUSES),
     plan: oneOf(p.plan, Object.keys(PLAN_NAMES)),
-    error_code: oneOf(p.error_code, Object.keys(ERROR_NAMES)),
+    error_code,
     // At its limit (true / false / unknown); the header dot turns red while values stop updating at the limit
     blocked: typeof p.blocked === "boolean" ? p.blocked : null,
-    main_window_ids: main, window_ids: all, windows,
+    main_window_ids: denied ? [] : main, window_ids: denied ? [] : all, windows: denied ? {} : windows,
   };
 }
 
@@ -230,23 +263,28 @@ function sanitizeProvider(p) {
  */
 function sanitizeView(body) {
   if (!body || typeof body !== "object" || body.view_version !== VIEW_VERSION) return null;
-  if (!("claude" in body) || !("codex" in body)) return null;
-  const claude = sanitizeProvider(body.claude);
-  const codex = sanitizeProvider(body.codex);
-  // A valid response with both null (no values, or the previous account's values were removed) is a success and replaces the previous view
-  if (claude === undefined || codex === undefined) return null;
+  if (!VIEW_PROVIDERS.every((p) => p in body)) return null;
+  // A valid response with every provider null (no values, or the previous account's values were removed) is a success and replaces the
+  // previous view. A provider the view may not carry (an earlier Worker's) reads as null
+  const providers = Object.fromEntries(PROVIDER_ORDER.map((p) => [p, sanitizeProvider(body[p])]));
+  if (Object.values(providers).some((p) => p === undefined)) return null;
   // Number of the data read (compared with the previous view to tell which is newer; the order of the data, not when the response was made)
   const dataVersion = body.data_version;
   if (!Number.isSafeInteger(dataVersion) || dataVersion < 0) return null;
-  return { view_version: VIEW_VERSION, data_version: dataVersion, boundaries: sanitizeBoundaries(body.boundaries), claude, codex };
+  return { view_version: VIEW_VERSION, data_version: dataVersion, boundaries: sanitizeBoundaries(body.boundaries), ...providers };
 }
 
-/** Per-provider boundary stamp (time and sequence number only). null if malformed (falls back to not showing the trend) */
+/**
+ * Per-provider boundary stamp (time and sequence number only). null if malformed (falls back to not showing the trend). A provider the
+ * stamps may not carry (an earlier Worker's, an earlier version's saved state) is null there: its stamp isn't known
+ */
 const STAMP = /^([0-9TZ:.\-]{0,40}#\d{1,15})?$/;
 function sanitizeBoundaries(b) {
   if (!b || typeof b !== "object") return null;
-  if (typeof b.claude !== "string" || typeof b.codex !== "string" || !STAMP.test(b.claude) || !STAMP.test(b.codex)) return null;
-  return { claude: b.claude, codex: b.codex };
+  const ok = (v) => typeof v === "string" && STAMP.test(v);
+  if (!VIEW_PROVIDERS.every((p) => ok(b[p]))) return null;
+  if (PROVIDER_ORDER.some((p) => b[p] !== undefined && b[p] !== null && !ok(b[p]))) return null;
+  return Object.fromEntries(PROVIDER_ORDER.map((p) => [p, ok(b[p]) ? b[p] : null]));
 }
 
 /** Minutes -> "13m", "2h 13m", "3d 4h" */
@@ -271,10 +309,12 @@ function atDisplayTime(w, now) {
   const reset = Date.parse(w.resets_at ?? "");
   const passed = Number.isFinite(reset) && reset <= now.getTime();
   const fetched = Date.parse(w.fetched_at ?? "");
-  const age = Number.isFinite(fetched) ? Math.max(0, Math.floor((now.getTime() - fetched) / 60000)) : null;
+  // Judged on the time itself; only the minutes shown are rounded down
+  const ms = Number.isFinite(fetched) ? Math.max(0, now.getTime() - fetched) : null;
+  const age = ms === null ? null : Math.floor(ms / 60000);
   const status = passed ? "reset_estimated"
-    : age === null ? null
-    : age <= FRESH_MAX_MINUTES ? "fresh" : age <= CAUTION_MAX_MINUTES ? "stale" : "old";
+    : ms === null ? null
+    : ms <= FRESH_MAX_MINUTES * 60000 ? "fresh" : ms <= CAUTION_MAX_MINUTES * 60000 ? "stale" : "old";
   const used = passed ? 0 : w.used_percent;
   // A limit at 100% can't be used further, so once the recent span has passed since the fetch, nothing was used in it
   const settledAt = recentSettledAt(w);
@@ -331,11 +371,33 @@ function lockWindow(view, provider, w, now) {
 }
 
 /**
+ * The providers a parameter names on its own, one to MAX_PROVIDERS in its order ("gemini", "claude, gemini", "codex claude gemini").
+ * null if it names anything else (empty, top, window keys)
+ */
+function providerList(parameter) {
+  const words = String(parameter ?? "").trim().toLowerCase().split(/[\s,]+/).filter(Boolean);
+  if (words.length === 0 || !words.every((w) => PROVIDER_ORDER.includes(w))) return null;
+  return [...new Set(words)].slice(0, MAX_PROVIDERS);
+}
+
+/** The providers shown when the parameter names none: the default ones, then any other the view has values of */
+function defaultProviders(view) {
+  return [...DEFAULT_PROVIDERS, ...PROVIDER_ORDER.filter((p) => !DEFAULT_PROVIDERS.includes(p) && view?.[p])].slice(0, MAX_PROVIDERS);
+}
+
+/** Why a provider shown has no value: not supported yet (a provider whose fetch isn't verified, turned off on the PCs), or no data */
+function missingText(provider) {
+  return UNVERIFIED_PROVIDERS.includes(provider) ? NOT_SUPPORTED : "No data";
+}
+
+/**
  * Choose the windows to show. Returns a list of { provider, providerName, window } in display order; windows are recomputed at draw time.
- * By default both providers' overall limits (main_window_ids) come first; per-model and per-group limits are appended only at 100%
+ * By default the providers' overall limits (main_window_ids) come first; per-model and per-group limits are appended only at 100%.
+ * A limit shown in the details only is never chosen unless the parameter names it
  */
 function selectWindows(view, parameter, now) {
   const param = String(parameter ?? "").trim().toLowerCase();
+  const named = providerList(param);
   const out = [];
   const push = (provider, id) => {
     const w = view?.[provider]?.windows?.[id];
@@ -349,14 +411,14 @@ function selectWindows(view, parameter, now) {
   const full = (provider) => {
     for (const id of view?.[provider]?.window_ids ?? []) {
       const w = view[provider].windows[id];
-      if (w.scope !== null && atDisplayTime(w, now).used_percent >= 100) push(provider, id);
+      if (w.scope !== null && !w.detail_only && atDisplayTime(w, now).used_percent >= 100) push(provider, id);
     }
   };
   if (param === "top") {
-    for (const provider of PROVIDER_ORDER) {
+    for (const provider of defaultProviders(view)) {
       const p = view?.[provider];
       if (!p) continue;
-      const ids = p.main_window_ids.length > 0 ? p.main_window_ids : p.window_ids;
+      const ids = p.main_window_ids.length > 0 ? p.main_window_ids : p.window_ids.filter((id) => !p.windows[id].detail_only);
       const top = ids.reduce((a, id) => {
         const w = atDisplayTime(p.windows[id], now);
         return a === null || w.used_percent > a.used ? { id, used: w.used_percent } : a;
@@ -366,14 +428,12 @@ function selectWindows(view, parameter, now) {
   } else if (param.includes(".")) {
     for (const key of param.split(",").map((s) => s.trim()).filter(Boolean)) {
       const [provider, id] = key.split(".");
-      if (provider === "claude" || provider === "codex") push(provider, id);
+      if (PROVIDER_ORDER.includes(provider)) push(provider, id);
     }
-  } else if (param === "claude" || param === "codex") {
-    main(param);
-    full(param);
   } else {
-    for (const provider of PROVIDER_ORDER) main(provider);
-    for (const provider of PROVIDER_ORDER) full(provider);
+    const providers = named ?? defaultProviders(view);
+    for (const provider of providers) main(provider);
+    for (const provider of providers) full(provider);
   }
   return out;
 }
@@ -386,8 +446,15 @@ function selectWindows(view, parameter, now) {
 function groupsOf(view, parameter, now, options = {}) {
   const param = String(parameter ?? "").trim().toLowerCase();
   const items = selectWindows(view, param, now);
-  const listed = param === "" ? [...PROVIDER_ORDER] : param === "claude" || param === "codex" ? [param] : [];
-  const order = [...listed];
+  // Shown in full (the "no 5h" row, per-model limits on large): the providers listed, or by default
+  const listed = param === "" ? defaultProviders(view) : providerList(param) ?? [];
+  // Shown even without a limit to draw (so a provider named without values, or one whose fetch failed, says why): those listed, the
+  // providers named in window keys, or the default ones of top
+  const keyed = param.includes(".")
+    ? [...new Set(param.split(",").map((k) => k.trim().split(".")[0]).filter((p) => PROVIDER_ORDER.includes(p)))]
+    : null;
+  const shown = param === "top" ? defaultProviders(view) : keyed ?? listed;
+  const order = [...shown];
   for (const x of items) if (!order.includes(x.provider)) order.push(x.provider);
   const groups = [];
   for (const provider of order) {
@@ -396,7 +463,7 @@ function groupsOf(view, parameter, now, options = {}) {
     // Always show per-model and per-group limits (large): append them after the overall limits even below 100%
     if (options.allScoped && listed.includes(provider) && p) {
       for (const id of p.window_ids) {
-        if (p.windows[id].scope !== null && !rows.some((r) => r.window.id === id)) {
+        if (p.windows[id].scope !== null && !p.windows[id].detail_only && !rows.some((r) => r.window.id === id)) {
           rows.push({ kind: "window", window: atDisplayTime(p.windows[id], now) });
         }
       }
@@ -409,7 +476,7 @@ function groupsOf(view, parameter, now, options = {}) {
       provider,
       name: PROVIDER_NAMES[provider],
       plan: p?.plan ? PLAN_NAMES[p.plan] ?? null : null,
-      message: !p ? "No data" : rows.length === 0 ? ERROR_NAMES[p.error_code] ?? "No limits to show" : null,
+      message: !p ? missingText(provider) : rows.length === 0 ? ERROR_NAMES[p.error_code] ?? "No limits to show" : null,
       rows,
     });
   }
@@ -542,9 +609,9 @@ function freshnessOf(view, provider, now, ids = null) {
   // At the limit the red dot says enough (values are expected to stop updating), so no age is shown
   if (p?.blocked === true && !limitLifted(p, list, now)) return { level: "limit", text: "" };
   if (oldest === null) return { level: "unknown", text: "" };
-  const age = Math.max(0, Math.floor((now.getTime() - oldest) / 60000));
-  if (age <= FRESH_MAX_MINUTES) return { level: "fresh", text: "" };
-  return { level: age <= CAUTION_MAX_MINUTES ? "stale" : "old", text: formatDuration(age) };
+  const ms = Math.max(0, now.getTime() - oldest);
+  if (ms <= FRESH_MAX_MINUTES * 60000) return { level: "fresh", text: "" };
+  return { level: ms <= CAUTION_MAX_MINUTES * 60000 ? "stale" : "old", text: formatDuration(Math.floor(ms / 60000)) };
 }
 
 /**
@@ -687,17 +754,23 @@ const INLINE_WIDTH = 225;
 function inlineText(items, cached, prefix = "") {
   const build = (step) => {
     const body = items.map((x) => {
-      if (x.missing) return `${x.providerName} ${x.label.startsWith("5h:") ? "5h N/A" : x.label}`;
+      // Last of all, the provider's short name
+      const who = step >= 7 ? SHORT_PROVIDER_NAMES[x.provider] ?? x.providerName : x.providerName;
+      if (x.missing) {
+        // Last of all, the reason's short form too (Not supported as N/A)
+        const reason = step >= 7 ? (x.label === NOT_SUPPORTED ? "N/A" : x.short ?? x.label) : x.label;
+        return `${who} ${reason.startsWith("5h:") || reason.startsWith("5h ") ? "5h N/A" : reason}`;
+      }
       const reset = x.window.value_status === "reset_estimated";
       const mark = step <= 1 && !reset ? shortMark(x.window) : "";
       const scope = scopeName(x.window.scope);
       const name = step >= 6 ? "" : step >= 3 && scope ? scope : step >= 5 ? "" : shortName(x.window);
       const value = reset ? `${RESET_MARK}${compactPercent(x.window)}` : compactPercent(x.window);
-      return [x.providerName, name, value].filter(Boolean).join(" ") + (mark ? ` (${mark})` : "");
+      return [who, name, value].filter(Boolean).join(" ") + (mark ? ` (${mark})` : "");
     }).join(" · ") || "Headroom";
     return `${prefix}${cached ? `${WARN_MARK} ${body}` : body}`;
   };
-  const tries = [0, 1, 2, 3, 5, 6].map(build);
+  const tries = [0, 1, 2, 3, 5, 6, 7].map(build);
   return tries.find((s) => textWidth(s, 11) <= INLINE_WIDTH) ?? tries[tries.length - 1];
 }
 
@@ -907,6 +980,13 @@ function notifyKey(cfg) {
 }
 /** The run-out reminder rings this many minutes before the forecast run-out time */
 const RUNOUT_LEAD_MINUTES = 15;
+/**
+ * Time reminders waiting on the device at most (the earliest to ring, among those not rung yet): iOS keeps 64 pending notifications per
+ * app, and the rest are left for limit alerts. The ones that rang are records apart (to match deliveries) and never take a place
+ */
+const MAX_REMINDERS = 50;
+/** Reminders the state keeps, the latest to ring first (every one waiting, then those that rang), the oldest dropped */
+const KEPT_REMINDERS = 200;
 /** Events older than this when read are not told (the moment has passed) */
 const ALERT_MAX_AGE_MINUTES = 12 * 60;
 /** Most alerts listed in one notification */
@@ -918,7 +998,9 @@ const NOTIFY_KEEP_MS = 8 * 24 * 60 * 60000;
 /** Reset times this close are the same cycle (providers' reset times jitter by seconds to minutes) */
 const CYCLE_TOLERANCE_MS = 10 * 60000;
 /** Errors worth a notification (the kinds the server makes provider_error events of; a failed fetch retries on its own) */
-const ALERT_ERRORS = ["login_required", "safety_stop"];
+/** What the details screen says to do about an access denial */
+const DENIED_HINT = "The service denied access, so fetching stopped on every PC. Check the account, then run headroom collect --provider <name> --resume-access on a PC";
+const ALERT_ERRORS = ["login_required", "safety_stop", "access_denied"];
 /**
  * Monochrome symbols shared by the notifications and the details screen (characters without a color emoji form, or with the text
  * variation selector U+FE0E, so iOS draws them in the text color)
@@ -1023,6 +1105,7 @@ function reminderPlan(view, now) {
         title: notifyTitle(provider, fullLimitName(w)), body: `${SYMBOLS.runout} ~${minutes} min left (runs out ${clockText(new Date(p2.at), now)})` });
     }
   }
+  // Every candidate: the ones that rang are matched as records, and at most MAX_REMINDERS of the others wait (reconcileReminders)
   return out;
 }
 
@@ -1080,6 +1163,10 @@ function reconcileReminders(previous, plan, now, gen, pending = null, version = 
   const schedule = [];
   const cancel = [];
   const reminders = [];
+  /** Planned and not rung: the cap below picks which of them wait */
+  const waiting = [];
+  /** Kept as waiting from before (due and still on the device, or planned from a newer view): they take places first */
+  let held = 0;
   const used = new Set();
   for (const item of plan) {
     const index = previous.findIndex((r, i) => !used.has(i) && sameReminder(r, item));
@@ -1096,6 +1183,8 @@ function reconcileReminders(previous, plan, now, gen, pending = null, version = 
     const another = prev && (prev.cancelling === true || (item.boundary != null && (prev.boundary ?? null) !== item.boundary));
     if (prev && !another && rung(prev)) {
       reminders.push(prev);
+      // Due this minute, with the device's list unknown: it may still be waiting, so it keeps its place
+      if (pending === null && prev.fire_at > t - 60000) held += 1;
       continue;
     }
     // A new time is a new operation too (its own identifier: a late cancel of the old one can't take the new one). A retry of one
@@ -1104,19 +1193,19 @@ function reconcileReminders(previous, plan, now, gen, pending = null, version = 
     const id = prev && !retimed ? prev.id : reminderId(gen, item);
     if (retimed) cancel.push(prev.id);
     const moved = !prev || retimed || missing(prev);
-    if (moved) schedule.push({ ...item, id });
-    reminders.push({ id, kind: item.kind, provider: item.provider, window_id: item.window_id, cycle: item.cycle, fire_at: moved ? item.fire_at : prev.fire_at,
+    waiting.push({ item: { ...item, id }, moved, onDevice: Boolean(prev) && !moved, entry: { id, kind: item.kind, provider: item.provider, window_id: item.window_id, cycle: item.cycle, fire_at: moved ? item.fire_at : prev.fire_at,
       set_at: moved ? t : prev.set_at ?? t, boundary: retimed ? item.boundary ?? null : item.boundary ?? prev?.boundary ?? null,
       // The view version it was planned from (a run with an older view never cancels it)
       ...(Number.isSafeInteger(version) ? { from: moved ? version : prev.from ?? version } : {}),
       // Whether it is known to be scheduled (one saved just before scheduling stays unconfirmed until it was)
-      ...(moved || prev.confirmed === undefined ? {} : { confirmed: prev.confirmed }) });
+      ...(moved || prev.confirmed === undefined ? {} : { confirmed: prev.confirmed }) } });
   }
   for (const [i, r] of previous.entries()) {
     if (used.has(i)) continue;
     // Planned from a newer view than this one (by a run that read it): not this run's to cancel
     if (Number.isSafeInteger(version) && Number.isSafeInteger(r.from) && r.from > version) {
       reminders.push(r);
+      if (!rung(r)) held += 1;
       continue;
     }
     // Due (or ringing within a minute) and still waiting: kept, so its delivery is matched when its reset is told (unless its provider
@@ -1124,10 +1213,23 @@ function reconcileReminders(previous, plan, now, gen, pending = null, version = 
     const withdrawnHere = cancelDue === true || (typeof cancelDue?.has === "function" && cancelDue.has(r.provider));
     if (!withdrawnHere && r.fire_at <= t + 60000 && pending !== null && pending.has(r.id)) {
       reminders.push(r);
+      held += 1;
       continue;
     }
     if (!rung(r)) cancel.push(r.id);
     else if (r.fire_at > t - NOTIFY_KEEP_MS) reminders.push(r);
+  }
+  // At most MAX_REMINDERS wait on the device: the earliest to ring of those not rung (in the plan's order). One past them isn't
+  // scheduled, and one waiting on the device is taken back; it is planned again once a place is free
+  const room = Math.max(0, MAX_REMINDERS - held);
+  const chosen = new Set([...waiting].sort((a, b) => a.entry.fire_at - b.entry.fire_at).slice(0, room));
+  for (const w of waiting) {
+    if (chosen.has(w)) {
+      if (w.moved) schedule.push(w.item);
+      reminders.push(w.entry);
+    } else if (w.onDevice) {
+      cancel.push(w.entry.id);
+    }
   }
   return { schedule, cancel, reminders };
 }
@@ -1146,7 +1248,7 @@ function sanitizeEvents(body) {
     if (!e || typeof e !== "object" || !Number.isSafeInteger(e.seq) || e.seq < 1 || !EVENT_KINDS.includes(e.kind)) continue;
     events.push({
       seq: e.seq, created_at: str(e.created_at, 40), kind: e.kind,
-      provider: oneOf(e.provider, ["claude", "codex"]),
+      provider: oneOf(e.provider, PROVIDER_ORDER),
       window_id: typeof e.window_id === "string" && ID.test(e.window_id) ? e.window_id : null,
       label: str(e.label, 24), scope: str(e.scope, 32), cycle: str(e.cycle, 40),
       threshold: num(e.threshold), used_percent: num(e.used_percent), eta_minutes: num(e.eta_minutes), resets_at: str(e.resets_at, 40),
@@ -1582,7 +1684,8 @@ function readNotifyState(text) {
     return { ...x, until: Math.max(x.at + NOTIFY_KEEP_MS, Number.isFinite(cycle) ? cycle + 24 * 60 * 60000 : 0) };
   };
   return {
-    reminders: Array.isArray(s.reminders) ? s.reminders.filter(reminder).slice(0, 50) : [],
+    // The latest to ring first: every one waiting (they ring later than any that rang) stays, the oldest records go
+    reminders: Array.isArray(s.reminders) ? s.reminders.filter(reminder).sort((a, b) => b.fire_at - a.fire_at).slice(0, KEPT_REMINDERS) : [],
     told: {
       limits: Array.isArray(s.told?.limits) ? keepTold(s.told.limits.filter(told).map(withUntil)) : [],
       warned: Array.isArray(s.told?.warned) ? keepTold(s.told.warned.filter(told).map(withUntil)) : [],
@@ -1610,7 +1713,9 @@ function readNotifyState(text) {
 function forgetSwitched(state, boundaries, version = null) {
   // A view older than the one the stamps came from (read before another run took the lock) says nothing about a switch
   if (!boundaries || (Number.isSafeInteger(state.boundaries_version) && !(version >= state.boundaries_version))) return { state, cancel: [], switched: [] };
-  const switched = PROVIDER_ORDER.filter((p) => state.boundaries && state.boundaries[p] !== boundaries[p]);
+  // A provider whose stamp isn't known on one side (an earlier version's saved state, an earlier Worker's view) isn't taken as switched
+  const switched = PROVIDER_ORDER.filter((p) => state.boundaries && typeof state.boundaries[p] === "string" && typeof boundaries[p] === "string"
+    && state.boundaries[p] !== boundaries[p]);
   const gone = (provider) => switched.includes(provider);
   // A cycle told for an event made after the new account was accepted (both server times) is the new account's: it stays (a switch
   // can be seen late, when the view couldn't be read at the time an event of the new account was told)
@@ -1628,7 +1733,8 @@ function forgetSwitched(state, boundaries, version = null) {
       ...state,
       reminders: state.reminders.filter((r) => !gone(r.provider)),
       told: { limits: state.told.limits.filter(keep), warned: state.told.warned.filter(keep) },
-      boundaries: { claude: boundaries.claude, codex: boundaries.codex },
+      // A stamp not known now keeps the one known before (it is compared again once known)
+      boundaries: Object.fromEntries(PROVIDER_ORDER.map((p) => [p, boundaries[p] ?? state.boundaries?.[p] ?? null])),
       boundaries_version: Number.isSafeInteger(version) ? version : null,
     },
   };
@@ -1715,7 +1821,7 @@ function dayLabel(date, now) {
 function iconCss() {
   return PROVIDER_ORDER.map((p) => (ICONS[p]
     ? `.ic-${p}{background:url(data:image/png;base64,${ICONS[p]}) center/contain no-repeat}`
-    : `.ic-${p}{background:${BRAND_COLORS[p]};border-radius:28%}.ic-${p}::after{content:"${p === "claude" ? "✳︎" : ">_"}"}`)).join("");
+    : `.ic-${p}{background:${BRAND_COLORS[p]};border-radius:28%}.ic-${p}::after{content:"${FALLBACK_MARKS[p].css}"}`)).join("");
 }
 
 /** Minutes since the oldest fetch among a provider's overall limits (all limits without overall ones). null if unknown */
@@ -1893,7 +1999,8 @@ function missingFiveHour(p) {
  */
 function detailHtml(input) {
   const { view, events, trends, now, provider = null, note = "" } = input;
-  const providers = provider ? [provider] : PROVIDER_ORDER;
+  // The providers the widget shows by default (Codex, Claude and any other with values), or the one tapped
+  const providers = provider ? [provider] : defaultProviders(view);
   const sections = providers.map((id) => {
     const p = view?.[id] ?? null;
     const fresh = p ? freshnessOf(view, id, now) : { level: "unknown", text: "" };
@@ -1904,8 +2011,9 @@ function detailHtml(input) {
     const head = `<header class="ph"><i class="ic ic-${id}"></i><span class="pn"><h2 style="color:${BRAND_COLORS[id]}">${esc(PROVIDER_NAMES[id])}</h2>` +
       `${p?.plan ? `<span class="plan">${esc(PLAN_NAMES[p.plan] ?? "")}</span>` : ""}</span>` +
       `<span class="fresh">${ageText ? `<span>${esc(ageText)}</span>` : ""}<i class="dot" style="background:${FRESH_COLORS[fresh.level]}"></i></span></header>`;
-    if (!p) return `<section>${head}<p class="message">${esc(SYMBOLS.unknown)} No data</p></section>`;
-    const message = p.window_ids.length === 0 ? `<p class="message">${esc(SYMBOLS.runout)} ${esc(ERROR_NAMES[p.error_code] ?? "No limits to show")}</p>` : "";
+    if (!p) return `<section>${head}<p class="message">${esc(SYMBOLS.unknown)} ${esc(missingText(id))}</p></section>`;
+    const message = p.window_ids.length === 0 ? `<p class="message">${esc(SYMBOLS.runout)} ${esc(ERROR_NAMES[p.error_code] ?? "No limits to show")}</p>` +
+      (p.error_code === "access_denied" ? `<p class="na-note">${esc(DENIED_HINT)}</p>` : "") : "";
     const missing = missingFiveHour(p)
       ? `<div class="limit na"><div class="top"><span class="name">5h limit</span><b>—</b></div><div class="bar"></div>` +
         `<p class="na-note">${esc(NOT_AVAILABLE)}</p></div>`
@@ -1988,10 +2096,15 @@ ${iconCss()}`;
 
 /** Choices of "Make a parameter" per place: [label, parameter before notify] */
 const PARAMETER_CHOICES = {
-  home: [["Both providers", ""], ["Claude only", "claude"], ["Codex only", "codex"], ["Tightest limit of each", "top"]],
+  home: [
+    ["Codex and Claude (and any other with values)", ""], ["All three", "codex, claude, gemini"], ["Claude only", "claude"],
+    ["Codex only", "codex"], ["Gemini only", "gemini"], ["Codex and Claude only", "codex, claude"], ["Claude and Gemini", "claude, gemini"],
+    ["Codex and Gemini", "codex, gemini"], ["Tightest limit of each", "top"],
+  ],
   lock: [
     ["Tightest limit", ""], ["Claude 5h", "claude 5h"], ["Claude weekly", "claude weekly"], ["Codex 5h", "codex 5h"],
-    ["Codex weekly", "codex weekly"], ["5h of both, side by side", "both 5h"], ["Weekly of both, side by side", "both weekly"],
+    ["Codex weekly", "codex weekly"], ["Gemini 5h", "gemini 5h"], ["Gemini weekly", "gemini weekly"],
+    ["5h of Codex and Claude, side by side", "both 5h"], ["Weekly of Codex and Claude, side by side", "both weekly"],
     ["Claude 5h and weekly", "claude 5h, claude weekly"],
   ],
 };
@@ -2004,22 +2117,23 @@ function buildParameter(base, notify) {
 /** The guide: sections of [parameters (alternatives joined with " · "), what it shows] */
 const PARAMETER_GUIDE = [
   ["Home screen", [
-    ["(empty)", "Both providers' overall limits, Codex then Claude. Per-model limits only at 100% (on Large, always)"],
-    ["claude · codex", "That provider only"],
+    ["(empty)", "Codex and Claude, and Gemini once it has values: their overall limits. Per-model limits only at 100% (on Large, always)"],
+    ["claude · codex · gemini", "That provider only"],
+    ["codex, claude, gemini · claude, gemini", "Those providers side by side (up to three), in that order. One without values shows Not supported (Gemini) or No data"],
     ["top", "The tightest limit of each provider"],
-    ["claude.five_hour, codex.seven_day", "Those limits, in that order"],
+    ["claude.five_hour, gemini.seven_day", "Those limits, in that order"],
   ]],
   ["Lock screen", [
     ["(empty)", "The limit with the least left (Inline: each provider's tightest)"],
     ["5h · weekly", "That limit, of the provider with less left"],
-    ["claude 5h · codex weekly", "That limit of that provider"],
-    ["claude · codex", "That provider's tightest limit"],
+    ["claude 5h · gemini weekly", "That limit of that provider"],
+    ["claude · codex · gemini", "That provider's tightest limit"],
     ["claude 5h, codex 5h · codex 5h + codex weekly", "Two side by side on Rectangular (Circular shows the first, Inline both)"],
     ["both · both 5h · both weekly", "Codex and Claude side by side"],
   ]],
   ["Add to any", [
     ["notify", "This widget also sends notifications, as in claude, notify. Add it to one widget only"],
-    ["demo · demo:runout", "Sample data instead of your values: normal, runout, no5h, stale, reset, offline, error, nochart"],
+    ["demo · demo:runout", "Sample data instead of your values: normal, runout, no5h, stale, reset, offline, error, nochart, three, unsupported"],
   ]],
 ];
 
@@ -2060,6 +2174,10 @@ const DEMO_SCENARIOS = [
   { name: "offline", title: "Can't update (last data)" },
   { name: "error", title: "Sign-in required / no data" },
   { name: "nochart", title: "No chart data yet" },
+  // Gemini with values: three columns by default (its own model limit at 100%, the Claude and GPT models in the details only)
+  { name: "three", title: "Three providers (Gemini on)" },
+  // Drawn with all three named (the widget's parameter, when it names nothing else, or the preview's)
+  { name: "unsupported", title: "Gemini not supported yet (all three)", parameter: "gemini, codex, claude" },
 ];
 
 /**
@@ -2074,6 +2192,11 @@ function demoName(parameter) {
     return DEMO_SCENARIOS.some((s) => s.name === name) ? name : "runout";
   }
   return null;
+}
+
+/** What a demo draws when the widget's parameter names nothing else (a scenario that needs more providers than the default) */
+function demoParameter(name) {
+  return DEMO_SCENARIOS.find((x) => x.name === name)?.parameter ?? "";
 }
 
 /** The parameter without its demo item (what the demo shows) */
@@ -2091,6 +2214,7 @@ function demoResult(name, now) {
     resets_at: at(o.resets ?? (id.includes("five_hour") ? 180 : 3 * 1440)),
     eta_at: null, reset_first: null, eta_minutes: null, rate_15m: null,
     rate_60m: o.rate ?? null, rate_24h: o.rate ?? null, rate_pace: o.rate ?? 0,
+    detail_only: o.detail === true,
   });
   const provider = (plan, windows) => ({
     status: "ok", plan, error_code: null,
@@ -2113,12 +2237,18 @@ function demoResult(name, now) {
     stale: () => [win("five_hour", 20, { recent: 2, rate: 3, age: 90 }), win("seven_day", 41, { recent: 5, rate: 0.5, age: 90 })],
     reset: () => [win("five_hour", 100, { resets: 120 }), win("seven_day", 60, { recent: 6, rate: 0.6 })],
   };
+  // Gemini (only in "three"; in the others it is turned off on the PCs, as by default, so the view has none): its own model limit
+  // (Argon) at 100%, and the Claude and GPT models it offers (shown in the details only)
+  const gemini = () => [win("five_hour", 28, { recent: 4, rate: 3, age }), win("seven_day", 33, { recent: 4, rate: 0.4, age }),
+    win("seven_day_argon", 100, { scope: "Argon", resets: 2 * 1440, age }),
+    win("partner_five_hour", 8, { scope: "Claude and GPT", detail: true, age }), win("partner_seven_day", 5, { scope: "Claude and GPT", detail: true, age })];
   const body = {
-    view_version: VIEW_VERSION, data_version: 1, boundaries: { claude: "#0", codex: "#0" },
+    view_version: VIEW_VERSION, data_version: 1, boundaries: { claude: "#0", codex: "#0", gemini: "#0" },
     claude: name === "error"
       ? { status: "error", plan: "max", error_code: "login_required", main_window_ids: "", window_ids: "", windows: {} }
       : provider("max", (claude[name] ?? claude.normal)()),
     codex: name === "error" ? null : provider("plus", (codex[name] ?? codex.normal)()),
+    gemini: name === "three" ? provider("pro", gemini()) : null,
   };
   const view = sanitizeView(body);
   // 7-day trend: a sawtooth that drops to 0 at each weekly reset (ending at the current value). A break on the point right after each reset
@@ -2137,7 +2267,7 @@ function demoResult(name, now) {
     const points = sanitizeHistory({ provider: p, windows: { seven_day: list } }, p, "seven_day", now, TREND_HOURS);
     return points ? { windowId: "seven_day", points } : null;
   };
-  const trends = Object.fromEntries(["claude", "codex"].flatMap((p) => (trend(p) ? [[p, trend(p)]] : [])));
+  const trends = Object.fromEntries(PROVIDER_ORDER.flatMap((p) => (trend(p) ? [[p, trend(p)]] : [])));
   return { view, trends, demo: true, ...(name === "offline" ? { cachedAt: at(-25) } : {}) };
 }
 
@@ -2202,7 +2332,7 @@ async function sampleMenu() {
   for (;;) {
     const index = await choose("Sample data", "Made-up values for each state. No network, nothing saved.", DEMO_SCENARIOS.map((s) => s.title));
     if (index < 0) return;
-    await previewSizes(DEMO_SCENARIOS[index].title, () => demoResult(DEMO_SCENARIOS[index].name, new Date()));
+    await previewSizes(DEMO_SCENARIOS[index].title, () => demoResult(DEMO_SCENARIOS[index].name, new Date()), null, demoParameter(DEMO_SCENARIOS[index].name));
   }
 }
 
@@ -2270,7 +2400,7 @@ async function main() {
   const demo = config.runsInWidget ? demoName(display) : null;
   if (demo !== null) {
     const now = new Date();
-    const widget = render(demoResult(demo, now), config.widgetFamily, withoutDemo(display), now);
+    const widget = render(demoResult(demo, now), config.widgetFamily, withoutDemo(display) || demoParameter(demo), now);
     Script.setWidget(widget);
     Script.complete();
     return;
@@ -2499,7 +2629,7 @@ function saveCacheBody(fm, tag, origin, view) {
   const v = view.data_version;
   try {
     // An empty view (both providers withdrawn) says so in its marker: a notifying run that can't read the body still knows
-    fm.writeString(fm.joinPath(dir, seenFileName(tag, v)), view.claude === null && view.codex === null ? "withdrawn" : "");
+    fm.writeString(fm.joinPath(dir, seenFileName(tag, v)), PROVIDER_ORDER.every((p) => view[p] === null) ? "withdrawn" : "");
   } catch (_) {
     // Can't create the marker (device storage not writable): don't save the previous view and don't delete anything. The view isn't
     // received (false): shown this time, but nothing is planned from it
@@ -2531,7 +2661,7 @@ function withdrawnAt(fm, tag, v) {
 
 /** The empty view of a withdrawal at version v (both providers withdrawn) */
 function emptyViewAt(v) {
-  return { view_version: VIEW_VERSION, data_version: v, boundaries: null, claude: null, codex: null };
+  return { view_version: VIEW_VERSION, data_version: v, boundaries: null, ...Object.fromEntries(PROVIDER_ORDER.map((p) => [p, null])) };
 }
 
 /**
@@ -3571,7 +3701,7 @@ async function sendSamples(cfg) {
   const pick = new Alert();
   pick.title = "Sample notifications";
   pick.message = "Each kind of notification, with made-up values. They arrive right away.";
-  const choices = [["Claude", ["claude"]], ["Codex", ["codex"]], ["Both", ["codex", "claude"]]];
+  const choices = [...PROVIDER_ORDER.map((p) => [PROVIDER_NAMES[p], [p]]), ["All", [...PROVIDER_ORDER]]];
   for (const [label] of choices) pick.addAction(label);
   pick.addCancelAction("Cancel");
   const index = await pick.presentSheet();
@@ -3882,7 +4012,7 @@ function iconImage(provider) {
       const image = data ? Image.fromData(data) : null;
       if (image) return { image, tint: false };
     }
-    const symbol = SFSymbol.named(provider === "claude" ? "asterisk" : "terminal");
+    const symbol = SFSymbol.named(FALLBACK_MARKS[provider]?.symbol ?? "circle");
     return symbol ? { image: symbol.image, tint: true } : null;
   } catch (_) {
     return null;
@@ -3939,30 +4069,30 @@ function ringOf(window) {
  * Pairs without such a limit are { missing: true } (e.g. Codex, which has no 5-hour limit)
  */
 /** Reason for a failed fetch shown in tight spaces (the lock screen circle, two side by side) */
-const SHORT_ERROR_NAMES = { login_required: "Sign in", not_installed: "Not installed", fetch_failed: "Fetch failed", safety_stop: "Paused", account_changed: "Paused" };
+const SHORT_ERROR_NAMES = { login_required: "Sign in", not_installed: "Not installed", fetch_failed: "Fetch failed", safety_stop: "Paused", account_changed: "Paused", access_denied: "Denied" };
 const LOCK_WINDOW_NAMES = { "5h": "five_hour", "5": "five_hour", five_hour: "five_hour", weekly: "seven_day", week: "seven_day", wk: "seven_day", seven_day: "seven_day" };
-function lockPicks(view, parameter, now) {
+function lockPicks(view, parameter, now, max = 2) {
   const param = String(parameter ?? "").trim().toLowerCase();
   let selectors;
   if (/^both\b/.test(param)) {
     const rest = param.replace(/^both\s*/, "");
-    selectors = PROVIDER_ORDER.map((p) => `${p} ${rest}`);
+    selectors = DEFAULT_PROVIDERS.map((p) => `${p} ${rest}`);
   } else {
     selectors = param.split(/[,+]/).map((s) => s.trim()).filter(Boolean);
     if (selectors.length === 0) selectors = [""];
   }
   const out = [];
-  for (const selector of selectors.slice(0, 2)) {
+  for (const selector of selectors.slice(0, max)) {
     let provider = null;
     let windowId = null;
     if (selector.includes(".")) {
       // Older form (claude.five_hour). The window id is used as is
       const [p, id] = selector.split(".");
-      provider = p === "claude" || p === "codex" ? p : null;
+      provider = PROVIDER_ORDER.includes(p) ? p : null;
       windowId = id || null;
     } else {
       const words = selector.split(/\s+/).filter(Boolean);
-      provider = words.find((w) => w === "claude" || w === "codex") ?? null;
+      provider = words.find((w) => PROVIDER_ORDER.includes(w)) ?? null;
       windowId = words.map((w) => LOCK_WINDOW_NAMES[w]).find(Boolean) ?? null;
     }
     const providers = provider ? [provider] : [...PROVIDER_ORDER];
@@ -3973,7 +4103,8 @@ function lockPicks(view, parameter, now) {
       const ids = windowId ? [windowId] : v.main_window_ids.length > 0 ? v.main_window_ids : v.window_ids;
       for (const id of ids) {
         const w = v.windows?.[id];
-        if (!w) continue;
+        // A limit shown in the details only is taken only when named
+        if (!w || (w.detail_only && !windowId)) continue;
         const shown = lockWindow(view, p, w, now);
         if (best === null || shown.used_percent > best.window.used_percent) best = { provider: p, providerName: PROVIDER_NAMES[p], window: shown };
       }
@@ -3992,8 +4123,10 @@ function lockPicks(view, parameter, now) {
       : undefined;
     const p = withError ?? withMain ?? provider ?? "claude";
     const code = withError ? view[p].error_code : null;
-    const label = withError ? ERROR_NAMES[code] ?? "No data" : withMain ? `5h: ${NOT_AVAILABLE}` : "No data";
-    const short = withError ? SHORT_ERROR_NAMES[code] ?? "No data" : withMain ? `5h ${NOT_AVAILABLE}` : "No data";
+    // A provider named without any value: not supported yet, or no data
+    const none = withError || withMain ? null : provider && !view?.[provider] ? missingText(provider) : "No data";
+    const label = withError ? ERROR_NAMES[code] ?? "No data" : withMain ? `5h: ${NOT_AVAILABLE}` : none;
+    const short = withError ? SHORT_ERROR_NAMES[code] ?? "No data" : withMain ? `5h ${NOT_AVAILABLE}` : none;
     out.push({ missing: true, provider: p, providerName: PROVIDER_NAMES[p], windowId, label, short });
   }
   return out;
@@ -4043,7 +4176,7 @@ function ringImage(icon, ring, hex, geom, provider, text = null) {
     ctx.setFont(Font.boldSystemFont(geom.icon * 0.8));
     ctx.setTextColor(new Color(hex));
     ctx.setTextAlignedCenter();
-    ctx.drawTextInRect(provider === "claude" ? "C" : "X", new Rect(c - geom.icon / 2, iconTop, geom.icon, geom.icon));
+    ctx.drawTextInRect(FALLBACK_MARKS[provider]?.letter ?? "?", new Rect(c - geom.icon / 2, iconTop, geom.icon, geom.icon));
   }
   if (text) {
     ctx.setFont(Font.boldSystemFont(geom.font));
@@ -4155,9 +4288,20 @@ function addHeader(stack, group, opts) {
   name.lineLimit = 1;
   const f = opts.content.freshness ? group.freshness : null;
   const extras = [group.plan && opts.content.plan ? group.plan : null, opts.demo ? "Demo" : null].filter(Boolean);
+  // The staleness text beside the dot. A demo keeps its mark longer than this text (the dot stays): a narrow column of three still says Demo
+  let freshText = f?.text ?? "";
   if (opts.width) {
-    const fixed = (icon ? s.icon + 5 : 0) + textWidth(group.name, s.name, true) + 2 + (f ? 6 + (f.text ? textWidth(f.text, s.headerSmall) + 3 : 0) : 0) + 4;
-    while (extras.length > 0 && fixed + extras.reduce((sum, t) => sum + 5 + textWidth(t, s.headerSmall), 0) > opts.width) extras.shift();
+    const fixed = () => (icon ? s.icon + 5 : 0) + textWidth(group.name, s.name, true) + 2 + (f ? 6 + (freshText ? textWidth(freshText, s.headerSmall) + 3 : 0) : 0) + 4;
+    const over = () => fixed() + extras.reduce((sum, t) => sum + 5 + textWidth(t, s.headerSmall), 0) > opts.width;
+    while (extras.length > 0 && over()) {
+      if (extras.length === 1 && extras[0] === "Demo" && freshText) freshText = "";
+      else extras.shift();
+    }
+    // Still too wide (a narrow column of three): the staleness text loses its last part ("1h 30m" → "1h"), then goes
+    while (freshText && over()) {
+      const parts = freshText.split(" ");
+      freshText = parts.length > 1 ? parts.slice(0, -1).join(" ") : "";
+    }
   }
   for (const text of extras) {
     names.addSpacer(5);
@@ -4165,8 +4309,8 @@ function addHeader(stack, group, opts) {
   }
   row.addSpacer(null);
   if (f) {
-    if (f.text) {
-      addSmallText(row, f.text, s.headerSmall, SUB());
+    if (freshText) {
+      addSmallText(row, freshText, s.headerSmall, SUB());
       row.addSpacer(3);
     }
     const dot = row.addImage(dotImage(FRESH_COLORS[f.level], 6));
@@ -4296,8 +4440,15 @@ function addRow(stack, group, row, opts) {
   line.layoutHorizontally();
   line.bottomAlignContent();
   line.size = new Size(opts.width, lineHeight(s));
-  // Don't shrink text (its size is already aligned across all columns)
-  const label = line.addText(p.label);
+  // Don't shrink text (its size is already aligned across all columns). A label too long even at the smallest size (a long per-model
+  // name in a column of three) is cut in a box that leaves the remaining value its room
+  const room = Math.floor(opts.width - (p.showPct ? 8 + textWidth(p.pct, s.pct, !p.missing) : 0));
+  let holder = line;
+  if (textWidth(p.label, fit.label) > room) {
+    holder = line.addStack();
+    holder.size = new Size(Math.max(0, room), 0);
+  }
+  const label = holder.addText(p.label);
   label.font = Font.systemFont(fit.label);
   label.textColor = p.missing ? SUB() : TEXT();
   label.lineLimit = 1;
@@ -4753,20 +4904,24 @@ function screenSize() {
  * Home screen layout decision: from the size, padding and height budget, decide the rows shown per group (the result of visibleRows).
  * The header freshness, the trend windows and the drawing all use this result
  */
-function layoutGroups(view, family, parameter, now, { cached = false, screen = null } = {}) {
+function layoutGroups(view, family, parameter, now, { cached = false, screen = null, demo = false } = {}) {
   const content = SIZE_CONTENT[family] ?? SIZE_CONTENT.medium;
-  const scale = SCALES[family] ?? SCALES.medium;
+  let scale = SCALES[family] ?? SCALES.medium;
   const pad = PADDING[family] ?? 0;
   const size = widgetSize(family, screen);
   const inner = size.width - 2 * pad;
   const large = family === "large" || family === "extraLarge";
   // In small, two stacked groups pull the visual center down, so add a little space below to lift them
   const lift = family === "small" ? 2 : 0;
-  const showNote = cached && family !== "small";
-  // Height budget: the inside of the padding minus the visual correction, the offline notice and estimation error (2pt)
-  const available = size.height - 2 * pad - lift - (showNote ? 4 + scale.small * 1.25 : 0) - 2;
   const groups = groupsOf(view, String(parameter ?? "").trim(), now, { allScoped: content.scoped });
   const two = groups.length >= 2;
+  const smallThree = family === "small" && groups.length >= 3;
+  if (smallThree) scale = SCALES.smallThree;
+  // Three columns leave a header no room for Demo: the demo says so in the note row at the bottom instead (as the offline notice)
+  const demoNote = demo && groups.length >= 3 && family !== "small";
+  const showNote = (cached || demoNote) && family !== "small";
+  // Height budget: the inside of the padding minus the visual correction, the note row and estimation error (2pt)
+  const available = size.height - 2 * pad - lift - (showNote ? 4 + scale.small * 1.25 : 0) - 2;
   const message = scale.label * 1.25;
   const counts = (max) => groups.map((g) => Math.min(max, g.rows.length));
   const ranks = groups.map((g) => g.rows.map(rowRank));
@@ -4782,7 +4937,7 @@ function layoutGroups(view, family, parameter, now, { cached = false, screen = n
   } else if (two && family !== "small") {
     limits = groups.map((g) => fitRows([Math.min(MAX_WINDOWS[family] ?? 2, g.rows.length)], scale, available, 0, g.rows.length > 0 ? 0 : message)[0]);
   } else {
-    between = family === "small" ? 8 : 12;
+    between = smallThree ? 4 : family === "small" ? 8 : 12;
     const mins = groups.map((g) => (g.rows.length > 0 ? 0 : message));
     limits = fitRows(counts(family === "small" && two ? MAX_WINDOWS.small : MAX_WINDOWS_SINGLE[family] ?? 4), scale, available, between, mins, ranks);
   }
@@ -4801,7 +4956,10 @@ function layoutGroups(view, family, parameter, now, { cached = false, screen = n
     // Allow 10% extra column height for estimation error (the chart can shrink, so the bars don't disappear on overflow)
     ? Math.max(TREND_MIN_HEIGHT, Math.min(TREND_MAX_HEIGHT, Math.floor(available - columns * 1.1 - trendChrome(scale))))
     : 0;
-  return { content, scale, pad, size, inner, large, lift, showNote, two, between, trendHeight, groups: laid };
+  // Side by side (medium and large): columns of a fixed equal width (long text doesn't widen one), closer together when three
+  const gap = groups.length >= 3 ? 10 : 14;
+  const colWidth = two ? Math.floor((inner - gap * (groups.length - 1)) / groups.length) : inner;
+  return { content, scale, pad, size, inner, large, lift, showNote, demoNote, two, between, trendHeight, gap, colWidth, groups: laid };
 }
 
 /** Estimated height of one group (header, rows, spacing) */
@@ -4856,11 +5014,13 @@ const SCALES = {
   // header is the estimated header height (a text line is about 1.2x the font size). rowHeight is built below from the same formula used for drawing
   // headerSmall is the plan and freshness text in the header. Large uses medium's sizes throughout (header, rows, bars); the chart takes the room left
   small: { compact: true, icon: 13, name: 12, headerSmall: 9, label: 10, pct: 10, small: 9, bar: 5, gapBar: 2, gapSub: 2, gapRow: 3, gapHeader: 3, header: 15 },
+  // Small with three providers stacked: a smaller header and less space under it (rows as small)
+  smallThree: { compact: true, icon: 11, name: 11, headerSmall: 9, label: 10, pct: 10, small: 9, bar: 5, gapBar: 2, gapSub: 2, gapRow: 3, gapHeader: 1, header: 13 },
   medium: { compact: false, icon: 15, name: 13, headerSmall: 10, label: 12, pct: 13, small: 10, bar: 8, gapBar: 3, gapSub: 2, gapRow: 7, gapHeader: 6, header: 16 },
   large: { compact: false, icon: 15, name: 13, headerSmall: 10, label: 12, pct: 13, small: 10, bar: 8, gapBar: 3, gapSub: 2, gapRow: 7, gapHeader: 6, header: 16 },
 };
 // The height of one limit (for estimating visible rows) is built from the same formula as the fixed height used when drawing (so they don't drift)
-for (const [family, s] of Object.entries(SCALES)) s.rowHeight = rowHeightOf(s, SIZE_CONTENT[family]);
+for (const [family, s] of Object.entries(SCALES)) s.rowHeight = rowHeightOf(s, SIZE_CONTENT[family] ?? SIZE_CONTENT.small);
 SCALES.extraLarge = SCALES.large;
 
 function render(result, family, parameter, now) {
@@ -4888,13 +5048,15 @@ function drawWidget(result, family, parameter, now) {
   const note = cached ? cachedNote(result.cachedAt, now) : "";
   const param = String(parameter ?? "").trim();
   if (family === "accessoryInline") {
-    const items = param && param.toLowerCase() !== "top" ? lockPicks(result.view, param, now) : selectWindows(result.view, "top", now);
+    const items = param && param.toLowerCase() !== "top" ? lockPicks(result.view, param, now, MAX_PROVIDERS) : selectWindows(result.view, "top", now);
     if (!(param && param.toLowerCase() !== "top")) {
       for (const p of PROVIDER_ORDER) {
         // A failure without a reason code is also No data
         const v = result.view?.[p];
         const failed = Boolean(v?.error_code) || v?.status === "error";
-        if (failed && !items.some((x) => x.provider === p)) items.push({ missing: true, provider: p, providerName: PROVIDER_NAMES[p], label: ERROR_NAMES[v.error_code] ?? "No data" });
+        if (failed && !items.some((x) => x.provider === p)) {
+          items.push({ missing: true, provider: p, providerName: PROVIDER_NAMES[p], label: ERROR_NAMES[v.error_code] ?? "No data", short: SHORT_ERROR_NAMES[v.error_code] ?? "No data" });
+        }
       }
       items.sort((a, b) => PROVIDER_ORDER.indexOf(a.provider) - PROVIDER_ORDER.indexOf(b.provider));
     }
@@ -4982,50 +5144,36 @@ function drawWidget(result, family, parameter, now) {
   }
 
   // Home screen: compute the inner width from the device's widget size, then draw in a centered frame of that width
-  const layout = layoutGroups(result.view, family, param, now, { cached, screen: screenSize() });
+  const layout = layoutGroups(result.view, family, param, now, { cached, screen: screenSize(), demo: Boolean(result.demo) });
   const { content, scale, inner, groups, two, large } = layout;
   const body = centeredBody(widget, inner, layout.lift);
   if (tap && groups.length === 1) widget.url = tapTo(groups[0].provider);
-  const base = { content, now, trends: result.trends ?? null, rows: Infinity, demo: Boolean(result.demo), outs: [] };
-  if (groups.length === 0 || groups.every((g) => g.rows.length === 0 && g.message === "No data")) {
+  // A demo says Demo in each header, or once in the note row when three columns leave the headers no room
+  const base = { content, now, trends: result.trends ?? null, rows: Infinity, demo: Boolean(result.demo) && !layout.demoNote, outs: [] };
+  const namesNothing = param === "" || param.toLowerCase() === "top";
+  if (groups.length === 0 || (namesNothing && groups.every((g) => g.rows.length === 0 && g.message === "No data"))) {
     addSmallText(body, "No data yet", 12, SUB());
-  } else if (large) {
-    // Large: Claude and Codex side by side, with one full-width chart below overlaying both trends
+  } else if (large || (two && family !== "small")) {
+    // Medium and large: the providers side by side (two or three columns of a fixed equal width); large adds one full-width chart
+    // below overlaying their weekly trends
     if (two) {
-      const gap = 14;
-      const colWidth = Math.floor((inner - gap) / 2);
       const cols = body.addStack();
       cols.layoutHorizontally();
       cols.topAlignContent();
-      for (const [index, group] of groups.slice(0, 2).entries()) {
-        if (index > 0) cols.addSpacer(gap);
+      for (const [index, group] of groups.entries()) {
+        if (index > 0) cols.addSpacer(layout.gap);
         const col = cols.addStack();
         col.layoutVertically();
-        col.size = new Size(colWidth, 0);
+        col.size = new Size(layout.colWidth, 0);
         if (tap) col.url = tapTo(group.provider);
-        drawGroup(col, group, withFit(groups.slice(0, 2), { ...base, scale, width: colWidth }));
+        drawGroup(col, group, withFit(groups, { ...base, scale, width: layout.colWidth }));
       }
     } else {
       drawGroup(body, groups[0], withFit(groups.slice(0, 1), { ...base, scale, width: inner }));
     }
-    if (layout.trendHeight > 0) {
+    if (large && layout.trendHeight > 0) {
       body.addSpacer(TREND_GAP);
-      drawCombinedTrend(body, groups.slice(0, 2), { ...base, scale, width: inner, height: layout.trendHeight, view: result.view });
-    }
-  } else if (two && family !== "small") {
-    // Medium: Claude and Codex side by side. Column width is fixed to half the inner width (long text doesn't widen a column)
-    const gap = 14;
-    const colWidth = Math.floor((inner - gap) / 2);
-    const cols = body.addStack();
-    cols.layoutHorizontally();
-    cols.topAlignContent();
-    for (const [index, group] of groups.slice(0, 2).entries()) {
-      if (index > 0) cols.addSpacer(gap);
-      const col = cols.addStack();
-      col.layoutVertically();
-      col.size = new Size(colWidth, 0);
-      if (tap) col.url = tapTo(group.provider);
-      drawGroup(col, group, withFit(groups.slice(0, 2), { ...base, scale, width: colWidth }));
+      drawCombinedTrend(body, groups, { ...base, scale, width: inner, height: layout.trendHeight, view: result.view });
     }
   } else {
     // Small, or a single provider: stacked top to bottom
@@ -5035,13 +5183,13 @@ function drawWidget(result, family, parameter, now) {
     }
   }
   widget.__outs = base.outs;
-  // Only when showing previous values, put that notice at the bottom (small has only the ⚠ in the header)
+  // Only when showing previous values (or a demo of three columns), put that notice at the bottom (small has only the ⚠ in the header)
   if (layout.showNote) {
     body.addSpacer(4);
     const row = body.addStack();
     row.layoutHorizontally();
     row.addSpacer(null);
-    addSmallText(row, note, 9, SUB());
+    addSmallText(row, [layout.demoNote ? "Demo" : "", note].filter(Boolean).join(" · "), 9, SUB());
   }
   return widget;
 }
@@ -5063,5 +5211,6 @@ if (typeof Script !== "undefined" && typeof ListWidget !== "undefined") {
     splitNotify, notifyPrefs, reminderPlan, reconcileReminders, reminderId, sanitizeEvents, selectAlerts, alertNotifications, sampleNotifications, eventPhrase, notifyTitle, SYMBOLS, eventsFileName, eventsCursor,
     readNotifyState, readRecords, forgetSwitched, withdrawnAt, accountMark, emptyViewAt, recordName, parseRecord, eventMark, lockFree, holdsLock, withoutCancelled, orphanFiles, fileTag, deliveredSeqs, keepTold, readConfigState, LOCK_SETTLE_MS, detailUrl, parameterGuideHtml, buildParameter, PARAMETER_CHOICES, PARAMETER_GUIDE, detailHtml, detailTiles, tilesHtml, tileTime, providerAge, worstText, fullLimitName, detailChart, dayLabel, iconCss, missingFiveHour, esc, KEYCHAIN_NOTIFY, RUNOUT_LEAD_MINUTES,
     resetDate, errorText, cachedNote, readCache, originTag, cacheTag, sameConfig, DEFAULT_CONFIG_ID, cacheFileName, seenFileName, pickCache, seenFrom, OWN_FILE, formatDuration,
+    providerList, defaultProviders, missingText, demoParameter, MAX_REMINDERS, KEPT_REMINDERS, SHORT_PROVIDER_NAMES, NOT_SUPPORTED, UNVERIFIED_PROVIDERS, DEFAULT_PROVIDERS, MAX_PROVIDERS, VIEW_PROVIDERS, FALLBACK_MARKS, PROVIDER_NAMES,
   };
 }

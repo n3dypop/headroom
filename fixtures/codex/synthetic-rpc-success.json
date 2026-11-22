@@ -1,0 +1,8 @@
+{
+  "description": "Synthetic stdio replies for provider tests. No live account was queried.",
+  "replies": [
+    { "id": 1, "result": {} },
+    { "id": 2, "result": { "userId": "<redacted>", "account": { "type": "chatgpt" } } },
+    { "id": 3, "result": { "rateLimits": { "primary": { "usedPercent": 25, "windowDurationMins": 300 } } } }
+  ]
+}

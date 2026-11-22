@@ -15,8 +15,9 @@ Headroom shows how much of your **Claude Code** and **Codex** usage limits is le
 ```
  Your PCs (Windows / macOS, not always on)
    headroom agent (Rust, runs in the background)
-     ├─ Claude: claude -p "/usage" every 5 min + statusLine
-     └─ Codex : codex app-server, account/rateLimits/read every 5 min
+     ├─ Claude: claude -p "/usage" about every 15 min + statusLine
+     └─ Codex : codex app-server, account/rateLimits/read about every 15 min
+        │  (PCs take turns through the server; longer gaps while nothing changes)
         │  PUT with a per-PC write token
         ▼
  Cloudflare Worker + D1 (free plan)

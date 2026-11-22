@@ -10,8 +10,8 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
 
-use super::Provider;
 use super::claude::resolve_bin;
+use super::{Grant, Outcome, Provider, Run};
 use crate::config::CodexConfig;
 use crate::push::{EpochRead, clock_epoch};
 use crate::schema::{
@@ -22,7 +22,7 @@ use crate::time::{MINUTE_MS, iso_from_ms, now_ms};
 
 const STATE_FILE: &str = "state-codex.json";
 const MIN_INTERVAL_MS: i64 = 5 * MINUTE_MS;
-const STALE_AFTER_MS: i64 = 15 * MINUTE_MS;
+const STALE_AFTER_MS: i64 = 20 * MINUTE_MS;
 const LOCK_RETRY_MS: i64 = 30_000;
 const BLOCKED_RULE_VERSION: u8 = 1;
 
@@ -33,6 +33,10 @@ enum FetchError {
     WrongAuth,
     AccountChanged,
     AccountIdentityUnknown,
+    AccessDenied,
+    RateLimited { retry_ms: Option<i64> },
+    GrantExpired,
+    ClockChanged,
     Start,
     Timeout,
     Disconnected,
@@ -54,9 +58,11 @@ impl FetchError {
             Self::AccountChanged => {
                 "Fetching paused after a Codex account switch (run headroom collect --provider codex --accept-account to resume)"
             }
-            Self::AccountIdentityUnknown => {
-                "Cannot resume fetching because the Codex account identity is unavailable"
-            }
+            Self::AccountIdentityUnknown => "Could not confirm the Codex account identity",
+            Self::AccessDenied => crate::schedule::DENIED_TEXT,
+            Self::RateLimited { .. } => "Codex usage limit requests are rate limited",
+            Self::ClockChanged => "The clock epoch changed or could not be confirmed",
+            Self::GrantExpired => "The Codex fetch turn expired before the request",
             Self::Start => "Could not start Codex App Server",
             Self::Timeout => "Timed out waiting for a response from Codex App Server",
             Self::Disconnected => "Lost the connection to Codex App Server",
@@ -67,7 +73,7 @@ impl FetchError {
             Self::Remote => "Codex App Server failed to fetch usage limits",
             Self::StateIo => "Could not save or lock the Codex fetch state",
             Self::StateUnreadable => {
-                "Fetching paused because the Codex fetch state is unreadable (check permissions on state-codex.json and run headroom collect --provider codex --accept-account to resume)"
+                "The Codex fetch state can't be read right now. Headroom will retry automatically. If this persists, check the Headroom folder's permissions."
             }
         }
     }
@@ -81,14 +87,21 @@ impl FetchError {
             Self::MissingCli => ErrorCode::NotInstalled,
             Self::SignedOut | Self::WrongAuth => ErrorCode::LoginRequired,
             Self::AccountChanged => ErrorCode::AccountChanged,
+            Self::AccessDenied => ErrorCode::AccessDenied,
             _ => ErrorCode::FetchFailed,
         }
     }
 }
 
-#[derive(Serialize, Deserialize, Default)]
+#[derive(Clone, Serialize, Deserialize, Default)]
 struct State {
     last_attempt_ms: Option<i64>,
+    // Setup failures back off without moving the last poll or its scheduled interval.
+    #[serde(default)]
+    setup_failed_ms: Option<i64>,
+    // Older state only recorded the local attempt, which may have stopped during initialization.
+    #[serde(default)]
+    last_query_ms: Option<i64>,
     #[serde(default)]
     failures: u32,
     last_error: Option<FetchError>,
@@ -97,6 +110,10 @@ struct State {
     identity: Identity,
     #[serde(default)]
     account_changed: bool,
+    #[serde(default)]
+    switch_mark: i64,
+    #[serde(default)]
+    pending_identity: Identity,
     account_accepted_ms: Option<i64>,
 }
 
@@ -112,7 +129,7 @@ fn load_state(path: &Path) -> io::Result<State> {
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct Observation {
     #[serde(default)]
     epoch: Option<u64>,
@@ -167,7 +184,7 @@ fn read_observation<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Observatio
     Ok(Some(observation))
 }
 
-#[derive(Serialize, Deserialize, Default)]
+#[derive(Clone, Serialize, Deserialize, Default)]
 struct Identity {
     user_hash: Option<String>,
     workspace_hash: Option<String>,
@@ -196,10 +213,16 @@ impl State {
         }
     }
 
-    fn stop_reason(&self) -> Option<FetchError> {
+    fn pending_switch(&self) -> Option<i64> {
+        self.account_changed.then_some(self.switch_mark)
+    }
+
+    fn stop_message(&self) -> Option<&'static str> {
         self.account_changed.then_some(match self.last_error {
-            Some(FetchError::StateUnreadable) => FetchError::StateUnreadable,
-            _ => FetchError::AccountChanged,
+            Some(FetchError::StateUnreadable) => {
+                "The Codex fetch state is corrupt or invalid (run headroom collect --provider codex --accept-account to recover)"
+            }
+            _ => FetchError::AccountChanged.message(),
         })
     }
 
@@ -213,7 +236,9 @@ impl State {
     }
 
     fn needs_clock_repair(&self, now: i64, epoch: Option<u64>) -> bool {
-        self.last_attempt_ms.is_some_and(|t| t > now) || self.future_observation(now, epoch)
+        self.last_attempt_ms.is_some_and(|t| t > now)
+            || self.last_query_ms.is_some_and(|t| t > now)
+            || self.future_observation(now, epoch)
     }
 
     fn due_ms(&self, now: i64, interval: i64, epoch: Option<u64>) -> i64 {
@@ -223,7 +248,7 @@ impl State {
         } else {
             self.last_attempt_ms
         };
-        match attempt {
+        let due = match attempt {
             Some(last) => {
                 let normal = last.saturating_add(delay);
                 self.observation(epoch)
@@ -232,7 +257,9 @@ impl State {
                     .map_or(normal, |blocked_until| normal.max(blocked_until))
             }
             None => now,
-        }
+        };
+        self.setup_failed_ms
+            .map_or(due, |last| due.max(last.min(now).saturating_add(delay)))
     }
 
     fn snapshot(
@@ -242,10 +269,10 @@ impl State {
         epoch: Option<u64>,
     ) -> ProviderSnapshot {
         let error = error.or(self.last_error);
-        let mut snapshot = if let Some(reason) = self.stop_reason() {
+        let mut snapshot = if let Some(message) = self.stop_message() {
             ProviderSnapshot::empty(
                 ProviderStatus::Unavailable,
-                reason.message(),
+                message,
                 Some(ErrorCode::AccountChanged),
             )
         } else if let Some(error) = error.filter(|e| e.unavailable()) {
@@ -263,7 +290,7 @@ impl State {
             } else if now.saturating_sub(last.fetched_ms) > STALE_AFTER_MS {
                 snapshot.status = ProviderStatus::Stale;
                 snapshot.error =
-                    Some("Codex usage limits have not been updated for over 15 minutes".into());
+                    Some("Codex usage limits have not been updated for over 20 minutes".into());
             }
             snapshot
         } else {
@@ -304,6 +331,43 @@ pub(crate) struct CodexStatus {
     pub not_scheduled: Option<&'static str>,
 }
 
+struct Query<'a> {
+    expected: &'a Identity,
+    home: &'a Path,
+    epoch: u64,
+    grant: Option<Grant>,
+    clock: Option<fn() -> i64>,
+    collected_ms: i64,
+    run: &'a mut Option<Run>,
+    last_query_ms: &'a mut Option<i64>,
+}
+
+impl Query<'_> {
+    fn now(&self) -> i64 {
+        self.clock.map_or(self.collected_ms, |clock| clock())
+    }
+
+    fn check_grant(&self) -> Result<i64, FetchError> {
+        if trusted_epoch(self.home) != Some(self.epoch) {
+            return Err(FetchError::ClockChanged);
+        }
+        let now = self.now();
+        if self.grant.is_some_and(|grant| grant.passed(now)) {
+            return Err(FetchError::GrantExpired);
+        }
+        Ok(now)
+    }
+
+    fn before_write(&mut self) -> Result<(), FetchError> {
+        let now = self.check_grant()?;
+        if *self.run == Some(Run::NotRun) {
+            *self.last_query_ms = Some(now);
+        }
+        *self.run = Some(Run::Unknown);
+        Ok(())
+    }
+}
+
 pub struct CodexProvider {
     home: PathBuf,
     cfg: CodexConfig,
@@ -312,8 +376,13 @@ pub struct CodexProvider {
     state: State,
     last_collect_ms: i64,
     retry_at: Option<i64>,
+    state_retry_at: Option<i64>,
+    grant: Option<Grant>,
+    run: Option<Run>,
     fetch_hold_until_ms: i64,
     accept_account_requested: bool,
+    accept_target: Option<i64>,
+    accepted: Option<bool>,
     unsaved_account_stop: bool,
 }
 
@@ -323,14 +392,19 @@ impl CodexProvider {
             home: home.to_path_buf(),
             cfg,
             log,
-            clock: Some(crate::time::now_ms),
+            clock: Some(now_ms),
             state: load_state(&home.join(STATE_FILE))
                 .unwrap_or_else(|_| State::recovery_required()),
             last_collect_ms: i64::MIN,
             // Include cached data in the daemon's first snapshot. Check whether the RPC is due under the lock.
             retry_at: Some(i64::MIN),
+            state_retry_at: None,
+            grant: None,
+            run: None,
             fetch_hold_until_ms: i64::MIN,
             accept_account_requested: false,
+            accept_target: None,
+            accepted: None,
             unsaved_account_stop: false,
         }
     }
@@ -359,13 +433,25 @@ impl CodexProvider {
     fn state_error(&mut self, now: i64) -> ProviderSnapshot {
         self.retry_at = Some(now.saturating_add(self.interval_ms()));
         self.log.log(FetchError::StateIo.message());
-        self.snapshot(now, Some(FetchError::StateIo))
+        let error = match self.run {
+            Some(Run::Ran(Outcome::AccessDenied)) => FetchError::AccessDenied,
+            Some(Run::Ran(Outcome::RateLimited { retry_ms })) => {
+                FetchError::RateLimited { retry_ms }
+            }
+            _ => FetchError::StateIo,
+        };
+        self.snapshot(now, Some(error))
     }
 
     fn state_read_error(&mut self, now: i64) -> ProviderSnapshot {
-        self.retry_at = Some(now.saturating_add(self.interval_ms()));
+        self.state_retry_at = Some(now.saturating_add(self.interval_ms()));
+        self.retry_at = self.state_retry_at;
         // Leave the file untouched after a permissions or I/O error and withhold current values until it is resolved.
-        State::recovery_required().snapshot(now, None, None)
+        ProviderSnapshot::empty(
+            ProviderStatus::Error,
+            FetchError::StateUnreadable.message(),
+            Some(ErrorCode::FetchFailed),
+        )
     }
 
     fn try_state_lock(&self) -> Result<Option<fs::File>, FetchError> {
@@ -394,6 +480,7 @@ impl CodexProvider {
             self.unsaved_account_stop = false;
         }
         self.state = load_state(path).map_err(|_| FetchError::StateUnreadable)?;
+        self.state_retry_at = None;
         Ok(lock)
     }
 
@@ -401,9 +488,14 @@ impl CodexProvider {
         &mut self,
         now: i64,
         force: bool,
-        fetch: impl FnOnce(&Path, &Path, &Identity) -> (Identity, Result<Observation, FetchError>),
+        fetch: impl FnOnce(&Path, &Path, &mut Query<'_>) -> (Identity, Result<Observation, FetchError>),
     ) -> ProviderSnapshot {
-        let accept_requested = std::mem::take(&mut self.accept_account_requested);
+        self.run = Some(Run::NotRun);
+        let accepting = std::mem::take(&mut self.accept_account_requested);
+        let target = self.accept_target.take();
+        let grant = self.grant.take();
+        // A requested acceptance only succeeds once the new identity and observation are saved.
+        self.accepted = accepting.then_some(false);
         if !self.cfg.enabled {
             return ProviderSnapshot::empty(
                 ProviderStatus::Unavailable,
@@ -434,8 +526,13 @@ impl CodexProvider {
         };
         self.retry_at = None;
         let epoch = trusted_epoch(&self.home);
-        if self.state.needs_clock_repair(now, epoch) {
-            self.state.last_attempt_ms = Some(now);
+        let repair_poll = self.state.needs_clock_repair(now, epoch);
+        if repair_poll || self.state.setup_failed_ms.is_some_and(|t| t > now) {
+            if repair_poll {
+                self.state.last_attempt_ms = Some(now);
+            }
+            self.state.setup_failed_ms = self.state.setup_failed_ms.map(|t| t.min(now));
+            self.state.last_query_ms = self.state.last_query_ms.map(|t| t.min(now));
             if self.state.future_observation(now, epoch) {
                 self.state.last_ok = None;
             }
@@ -443,7 +540,16 @@ impl CodexProvider {
                 return self.state_error(now);
             }
         }
-        let accepting = accept_requested && self.state.account_changed;
+        if accepting
+            && (target.is_none()
+                || target != self.state.pending_switch()
+                || grant.is_none_or(|g| g.passed(now)))
+        {
+            if self.state.account_changed {
+                self.retry_at = Some(now.saturating_add(self.interval_ms()));
+            }
+            return self.snapshot(now, None);
+        }
         if self.state.account_changed && !accepting {
             // Check for a manual resume from another process on the next scheduled poll.
             self.retry_at = Some(now.saturating_add(self.interval_ms()));
@@ -466,24 +572,58 @@ impl CodexProvider {
             self.retry_at = Some(now.saturating_add(LOCK_RETRY_MS));
             return self.state.snapshot(now, None, None);
         };
+        if grant.is_some_and(|g| g.passed(now)) {
+            return self.snapshot(now, None);
+        }
+        let previous_attempt = self.state.last_attempt_ms;
         self.state.last_attempt_ms = Some(now);
         if write_json_atomic(&state_path, &self.state).is_err() {
+            self.state.last_attempt_ms = previous_attempt;
             return self.state_error(now);
         }
 
-        let empty_identity = Identity::default();
         let expected = if accepting {
-            &empty_identity
+            &self.state.pending_identity
         } else {
             &self.state.identity
         };
         let (identity, result) = fetch(
             &codex_bin(&self.cfg),
             &self.home.join("codex-cwd"),
-            expected,
+            &mut Query {
+                expected,
+                home: &self.home,
+                epoch: start_epoch,
+                grant,
+                clock: self.clock,
+                collected_ms: now,
+                run: &mut self.run,
+                last_query_ms: &mut self.state.last_query_ms,
+            },
         );
+        if result.is_ok() {
+            // Both replies are known. The observation still has to be accepted and saved.
+            self.run = Some(Run::Ran(Outcome::Failed));
+        }
+        if self.run == Some(Run::NotRun) {
+            self.state.last_attempt_ms = previous_attempt;
+            if matches!(
+                result,
+                Err(FetchError::GrantExpired | FetchError::ClockChanged)
+            ) {
+                if write_json_atomic(&state_path, &self.state).is_err() {
+                    return self.state_error(now);
+                }
+                return self.snapshot(now, None);
+            }
+            self.state.setup_failed_ms = Some(now);
+        } else {
+            self.state.setup_failed_ms = None;
+        }
         if expected.differs_from(&identity) || matches!(result, Err(FetchError::AccountChanged)) {
             self.state.account_changed = true;
+            self.state.switch_mark = self.state.switch_mark.wrapping_add(1);
+            self.state.pending_identity = identity;
             self.state.last_ok = None;
             self.state.last_error = Some(FetchError::AccountChanged);
             self.log.log(FetchError::AccountChanged.message());
@@ -495,50 +635,65 @@ impl CodexProvider {
             self.retry_at = Some(now.saturating_add(self.interval_ms()));
             return self.snapshot(now, None);
         }
+        // The poll lock pins the account state. Pin the clock only for adoption and its save.
+        let clock_lock = if result.is_ok() {
+            crate::clock::try_clock_lock(&self.home).ok().flatten()
+        } else {
+            None
+        };
         let result = match result {
-            Ok(_) if accepting && identity.user_hash.is_none() => {
+            Ok(_) if clock_lock.is_none() || trusted_epoch(&self.home) != Some(start_epoch) => {
+                Err(FetchError::ClockChanged)
+            }
+            Ok(_)
+                if ((accepting || expected.user_hash.is_some())
+                    && identity.user_hash.is_none())
+                    || (expected.workspace_hash.is_some() && identity.workspace_hash.is_none()) =>
+            {
                 Err(FetchError::AccountIdentityUnknown)
             }
             result => result,
         };
-        let previous_accepted_ms = self.state.account_accepted_ms;
-        // A new observation is stamped when the RPC completes, after the attempt began.
         let snapshot_ms = result.as_ref().map_or(now, |o| now.max(o.fetched_ms));
         match result {
             Ok(mut observation) => {
+                let mut next = self.state.clone();
                 observation.epoch = Some(start_epoch);
-                self.state.identity = if accepting {
-                    // Use the first new observation's timestamp to keep it within the receiver's history boundary.
-                    self.state.account_accepted_ms = Some(observation.fetched_ms);
+                next.identity = if accepting {
+                    next.account_accepted_ms = Some(observation.fetched_ms);
+                    next.pending_identity = Identity::default();
                     identity
                 } else {
-                    std::mem::take(&mut self.state.identity).with_observed(identity)
+                    std::mem::take(&mut next.identity).with_observed(identity)
                 };
-                self.state.account_changed = false;
-                self.state.last_ok = Some(observation);
-                self.state.failures = 0;
-                self.state.last_error = None;
+                next.account_changed = false;
+                next.last_ok = Some(observation);
+                next.failures = 0;
+                next.last_error = None;
+                if write_json_atomic(&state_path, &next).is_err() {
+                    return self.state_error(now);
+                }
+                self.state = next;
+                self.run = Some(Run::Ran(Outcome::Ok));
+                if accepting {
+                    self.accepted = Some(true);
+                }
             }
             Err(error) => {
                 if matches!(error, FetchError::SignedOut | FetchError::WrongAuth) {
                     self.state.last_ok = None;
                 }
-                if !accepting {
+                if !accepting && error != FetchError::ClockChanged {
                     self.state.identity =
                         std::mem::take(&mut self.state.identity).with_observed(identity);
                 }
                 self.state.failures = self.state.failures.saturating_add(1);
                 self.state.last_error = Some(error);
                 self.log.log(error.message());
+                if write_json_atomic(&state_path, &self.state).is_err() {
+                    return self.state_error(now);
+                }
             }
-        }
-        if write_json_atomic(&state_path, &self.state).is_err() {
-            if accepting {
-                self.state.account_changed = true;
-                self.state.account_accepted_ms = previous_accepted_ms;
-                self.state.last_ok = None;
-            }
-            return self.state_error(now);
         }
         self.snapshot(snapshot_ms, None)
     }
@@ -548,11 +703,24 @@ impl CodexProvider {
         if matches!(path.try_exists(), Ok(false)) {
             return None;
         }
-        let state = load_state(&path).unwrap_or_else(|_| State::recovery_required());
+        let state = match load_state(&path) {
+            Ok(state) => state,
+            Err(_) => {
+                return Some(CodexStatus {
+                    failures: 0,
+                    last_error: FetchError::StateUnreadable.message(),
+                    not_scheduled: Some(if cfg.enabled {
+                        "waiting to retry the state read"
+                    } else {
+                        "disabled"
+                    }),
+                });
+            }
+        };
         let last_error = state
-            .stop_reason()
-            .or(state.last_error)
-            .map_or("none", FetchError::message);
+            .stop_message()
+            .or(state.last_error.map(FetchError::message))
+            .unwrap_or("none");
         let not_scheduled = if state.account_changed {
             Some("waiting for manual resume")
         } else if !cfg.enabled {
@@ -588,6 +756,22 @@ impl Provider for CodexProvider {
         self.collect_with(now, force, fetch)
     }
 
+    fn state_retry_at(&self) -> Option<i64> {
+        self.state_retry_at
+    }
+
+    fn take_run(&mut self) -> Option<Run> {
+        self.run.take()
+    }
+
+    fn last_fetch_attempt_ms(&self) -> Option<i64> {
+        self.state.last_query_ms
+    }
+
+    fn grant(&mut self, grant: Option<Grant>) {
+        self.grant = grant;
+    }
+
     fn fetch_due_ms(&self, now: i64) -> i64 {
         if !self.cfg.enabled || self.state.account_changed {
             return i64::MAX;
@@ -616,7 +800,19 @@ impl Provider for CodexProvider {
         if !self.unsaved_account_stop {
             self.state = saved;
         }
-        if self.state.last_ok.take().is_none() && !self.unsaved_account_stop {
+        let EpochRead::Read {
+            epoch,
+            in_flight: None,
+            ..
+        } = clock_epoch(&self.home)
+        else {
+            return false;
+        };
+        if let Some(saved_epoch) = self.state.last_ok.as_ref().and_then(|o| o.epoch)
+            && saved_epoch != epoch
+        {
+            self.state.last_ok = None;
+        } else if !self.unsaved_account_stop {
             return true;
         }
         if write_json_atomic(&path, &self.state).is_err() {
@@ -626,8 +822,22 @@ impl Provider for CodexProvider {
         true
     }
 
+    fn pending_switch(&self) -> Option<i64> {
+        load_state(&self.home.join(STATE_FILE))
+            .ok()?
+            .pending_switch()
+    }
+
+    fn accept_target(&mut self, target: Option<i64>) {
+        self.accept_target = target;
+    }
+
     fn accept_account(&mut self) {
         self.accept_account_requested = true;
+    }
+
+    fn account_accepted(&self) -> Option<bool> {
+        self.accepted
     }
 }
 
@@ -660,29 +870,42 @@ fn standalone_codex_bin() -> Option<PathBuf> {
 fn fetch(
     bin: &Path,
     cwd: &Path,
-    expected: &Identity,
+    query: &mut Query<'_>,
+) -> (Identity, Result<Observation, FetchError>) {
+    rpc::AppServer::start(bin, cwd, || query.check_grant().map(|_| ()))
+        .and_then(|mut server| {
+            let mut rpc = server.connection()?;
+            Ok(read_limits(&mut rpc, query))
+        })
+        .unwrap_or_else(|error| (Identity::default(), Err(error)))
+}
+
+fn read_limits(
+    server: &mut rpc::Connection<'_>,
+    query: &mut Query<'_>,
 ) -> (Identity, Result<Observation, FetchError>) {
     let mut identity = Identity::default();
     let result = (|| {
-        let mut server = rpc::AppServer::start(bin, cwd)?;
         server.request(
+            query,
             1,
             "initialize",
             json!({"clientInfo":{"name":"headroom","version":env!("CARGO_PKG_VERSION")}}),
         )?;
         server.notify_initialized()?;
-        let account = server.request(2, "account/read", json!({"refreshToken":false}))?;
+        let account = server.request(query, 2, "account/read", json!({"refreshToken":false}))?;
         identity = account_identity(&account)?;
-        if expected.differs_from(&identity) {
+        if query.expected.differs_from(&identity) {
             return Err(FetchError::AccountChanged);
         }
 
         let limits = server.request(
+            query,
             3,
             "account/rateLimits/read",
             json!({"excludeResetCreditDetails":true}),
         )?;
-        let fetched_ms = now_ms();
+        let fetched_ms = query.now();
         if let (Some(user), Some(workspace)) =
             (identity.user_hash.as_deref(), text(&limits, "accountId"))
         {
@@ -868,6 +1091,7 @@ mod tests {
     use super::*;
     use crate::schema::WindowKind;
     use crate::test_util::TempHome;
+    use std::time::{Duration, Instant};
 
     const NOW: i64 = 1_795_000_000_000;
 
@@ -906,32 +1130,304 @@ mod tests {
     fn test_provider(home: &Path) -> CodexProvider {
         CodexProvider {
             clock: None,
-            ..CodexProvider::new(home, CodexConfig::default(), Logger::stderr())
+            ..CodexProvider::new(
+                home,
+                CodexConfig {
+                    codex_bin: home
+                        .join("missing-fixture-bin")
+                        .to_string_lossy()
+                        .into_owned(),
+                    ..CodexConfig::default()
+                },
+                Logger::stderr(),
+            )
+        }
+    }
+
+    fn failures() -> Value {
+        serde_json::from_str(include_str!(
+            "../../../fixtures/codex/synthetic-rpc-errors.json"
+        ))
+        .unwrap()
+    }
+
+    fn initialize() -> Value {
+        json!({"id":1,"result":{}})
+    }
+
+    fn account() -> Value {
+        json!({"id":2,"result":{"account":{"type":"chatgpt"}}})
+    }
+
+    fn grant_until(until_ms: i64) -> Grant {
+        Grant {
+            until_ms,
+            until: Instant::now() + Duration::from_secs(60),
+        }
+    }
+
+    fn authorize_switch(p: &mut CodexProvider) {
+        p.accept_target(Some(p.pending_switch().unwrap()));
+        p.accept_account();
+        p.grant(Some(grant_until(i64::MAX)));
+    }
+
+    fn successful_rpc(
+        q: &mut Query<'_>,
+        sent: &mut Vec<u8>,
+    ) -> (Identity, Result<Observation, FetchError>) {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../../fixtures/codex/synthetic-rpc-success.json"
+        ))
+        .unwrap();
+        replay(
+            q,
+            fixture["replies"].as_array().unwrap(),
+            FetchError::Disconnected,
+            sent,
+        )
+    }
+
+    fn targets(sent: &[u8]) -> Vec<String> {
+        sent.split(|&b| b == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_slice::<Value>(line).unwrap())
+            .map(|frame| frame["method"].as_str().unwrap().to_owned())
+            .filter(|method| method.starts_with("account/"))
+            .collect()
+    }
+
+    // Feed stdio frames to the production handshake and capture every outgoing method.
+    fn replay(
+        query: &mut Query<'_>,
+        frames: &[Value],
+        end: FetchError,
+        sent: &mut Vec<u8>,
+    ) -> (Identity, Result<Observation, FetchError>) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        for frame in frames {
+            tx.send(Ok(serde_json::to_vec(frame).unwrap())).unwrap();
+        }
+        tx.send(Err(end)).unwrap();
+        let mut rpc = rpc::Connection {
+            input: sent,
+            replies: &rx,
+            deadline: Instant::now() + Duration::from_secs(5),
+        };
+        read_limits(&mut rpc, query)
+    }
+
+    #[test]
+    fn only_a_matching_target_reply_completes_the_run() {
+        let (_root, home) = temp_home("rpc-run");
+        let mut p = test_provider(&home);
+        let mut init_failure = failures()["denied"].clone();
+        init_failure["id"] = json!(1);
+        let mut notification = failures()["denied"].clone();
+        notification["method"] = json!("account/rateLimits/updated");
+        let mut wrong_id = failures()["denied"].clone();
+        wrong_id["id"] = json!(42);
+        let full = json!({"id":3,"result":{"ordinaryUsageAllowed":false,
+            "rateLimits":{"primary":{"usedPercent":100,"windowDurationMins":300}}}});
+        let eof = FetchError::Disconnected;
+        for (frames, end, expected, writes) in [
+            (vec![init_failure], eof, Run::NotRun, 1),
+            (vec![initialize()], eof, Run::Unknown, 3),
+            (
+                vec![initialize(), account()],
+                FetchError::Timeout,
+                Run::Unknown,
+                4,
+            ),
+            (
+                vec![initialize(), json!({"id":2,"result":{"account":null}})],
+                eof,
+                Run::Ran(Outcome::Failed),
+                3,
+            ),
+            (
+                vec![initialize(), wrong_id, notification, account(), full],
+                eof,
+                Run::Ran(Outcome::Ok),
+                4,
+            ),
+        ] {
+            let mut sent = Vec::new();
+            let snap = p.collect_with(NOW, true, |_, _, q| replay(q, &frames, end, &mut sent));
+            assert_eq!(sent.iter().filter(|&&b| b == b'\n').count(), writes);
+            assert_eq!(p.take_run(), Some(expected));
+            assert_eq!(p.take_run(), None);
+            assert_eq!(
+                p.last_fetch_attempt_ms(),
+                (expected != Run::NotRun).then_some(NOW)
+            );
+            if expected == Run::Ran(Outcome::Ok) {
+                assert_eq!(snap.blocked, Some(true));
+            }
+        }
+        assert_eq!(test_provider(&home).last_fetch_attempt_ms(), Some(NOW));
+    }
+
+    #[test]
+    fn confirmed_holds_survive_a_local_write_error_without_copying_the_rpc_error() {
+        let f = failures();
+        for (frames, outcome) in [
+            (
+                vec![initialize(), f["denied"].clone()],
+                Outcome::AccessDenied,
+            ),
+            (
+                vec![initialize(), account(), f["limited"].clone()],
+                Outcome::RateLimited {
+                    retry_ms: Some(21_600_000),
+                },
+            ),
+            (
+                vec![initialize(), account(), f["backend"].clone()],
+                Outcome::RateLimited { retry_ms: None },
+            ),
+        ] {
+            for fail_write in [false, true] {
+                let (_root, home) = temp_home("rpc-hold");
+                let mut p = test_provider(&home);
+                p.log = Logger::file(&home);
+                let path = home.join(STATE_FILE);
+                let snap = p.collect_with(NOW, true, |_, _, q| {
+                    let res = replay(q, &frames, FetchError::Disconnected, &mut Vec::new());
+                    if fail_write {
+                        let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
+                        fs::create_dir(tmp).unwrap();
+                    }
+                    res
+                });
+                assert_eq!(p.take_run(), Some(Run::Ran(outcome)));
+                assert_eq!(p.state_retry_at(), None);
+                let diag = if outcome == Outcome::AccessDenied {
+                    FetchError::AccessDenied
+                } else {
+                    FetchError::RateLimited { retry_ms: None }
+                };
+                assert_eq!(snap.error.as_deref(), Some(diag.message()));
+                for output in [
+                    fs::read_to_string(&path).unwrap(),
+                    fs::read_to_string(home.join("logs/agent.log")).unwrap(),
+                    serde_json::to_string(&snap).unwrap(),
+                ] {
+                    assert!(!output.contains("synthetic-private-marker"));
+                }
+            }
         }
     }
 
     #[test]
-    fn a_fetch_keeps_its_starting_epoch_across_rejection_and_recovery() {
+    fn expired_grants_skip_setup_and_are_checked_again_at_each_target_write() {
+        use std::sync::atomic::{AtomicI64, Ordering};
+        static WALL: AtomicI64 = AtomicI64::new(NOW);
+        let (_root, home) = temp_home("rpc-grant");
+        let mut p = test_provider(&home);
+        for late_monotonic in [false, true] {
+            let mut grant = grant_until(if late_monotonic { NOW + 2 } else { NOW + 1 });
+            if late_monotonic {
+                grant.until = Instant::now();
+            }
+            p.grant(Some(grant));
+            p.clock = Some(|| NOW + 1);
+            p.collect_with(NOW, true, |_, _, _| panic!("expired before setup"));
+            assert_eq!(p.take_run(), Some(Run::NotRun));
+            assert_eq!(p.last_fetch_attempt_ms(), None);
+        }
+        p.clock = None;
+        for (first_send, writes, run) in [
+            (NOW + 1, 2, Run::NotRun),
+            (NOW, 3, Run::Ran(Outcome::Failed)),
+        ] {
+            p.grant(Some(grant_until(NOW + 1)));
+            let mut sent = Vec::new();
+            p.collect_with(NOW, true, |_, _, q| {
+                WALL.store(first_send, Ordering::Relaxed);
+                q.clock = Some(|| WALL.fetch_add(1, Ordering::Relaxed));
+                replay(
+                    q,
+                    &[initialize(), account()],
+                    FetchError::Disconnected,
+                    &mut sent,
+                )
+            });
+            assert_eq!(sent.iter().filter(|&&b| b == b'\n').count(), writes);
+            let methods = targets(&sent);
+            if run == Run::NotRun {
+                assert!(methods.is_empty());
+            } else {
+                assert_eq!(methods, ["account/read"]);
+            }
+            assert_eq!(p.take_run(), Some(run));
+            if run == Run::NotRun {
+                assert_eq!(p.last_fetch_attempt_ms(), None);
+                assert_eq!(p.fetch_due_ms(NOW), NOW);
+            }
+        }
+    }
+
+    #[test]
+    fn setup_and_preflight_write_failures_do_not_count_as_queries() {
+        let (_root, home) = temp_home("rpc-setup");
+        let mut p = test_provider(&home);
+        p.collect_with(NOW, true, |_, _, _| {
+            (Identity::default(), Err(FetchError::Start))
+        });
+        assert_eq!(p.take_run(), Some(Run::NotRun));
+        assert_eq!(p.last_fetch_attempt_ms(), None);
+        assert_eq!(p.state.last_attempt_ms, None);
+        assert_eq!(
+            test_provider(&home).fetch_due_ms(NOW),
+            NOW + 2 * MIN_INTERVAL_MS
+        );
+        let tmp = home
+            .join(STATE_FILE)
+            .with_extension(format!("{}.tmp", std::process::id()));
+        fs::create_dir(tmp).unwrap();
+        p.collect_with(NOW, true, |_, _, _| panic!("attempt record was not saved"));
+        assert_eq!(p.take_run(), Some(Run::NotRun));
+        assert_eq!(p.last_fetch_attempt_ms(), None);
+    }
+
+    #[test]
+    fn cached_limits_become_stale_just_after_twenty_minutes() {
+        let s = State {
+            last_ok: Some(observation()),
+            ..State::default()
+        };
+        let at = NOW + 20 * MINUTE_MS;
+        assert_eq!(s.snapshot(at, None, Some(1)).status, ProviderStatus::Ok);
+        let stale = s.snapshot(at + 1, None, Some(1));
+        assert_eq!(stale.status, ProviderStatus::Stale);
+        assert_eq!(
+            stale.error.as_deref(),
+            Some("Codex usage limits have not been updated for over 20 minutes")
+        );
+    }
+
+    #[test]
+    fn a_completed_rpc_from_an_old_epoch_is_rejected() {
         let (_root, home) = temp_home("fetch-epoch");
         let mut provider = test_provider(&home);
-        let late = provider.collect_with(NOW, true, |_, _, _| {
+        let late = provider.collect_with(NOW, true, |_, _, q| {
+            let result = successful_rpc(q, &mut Vec::new());
             set_epoch(&home, 2, false, None);
             set_epoch(&home, 3, true, None);
-            let mut sample = observation();
-            sample.snapshot.blocked = Some(true);
-            sample.snapshot.windows[0].used_percent = 100.0;
-            sample.snapshot.windows[0].resets_at = Some(iso_from_ms(NOW + 60 * MINUTE_MS));
-            (Identity::default(), Ok(sample))
+            result
         });
+        assert_eq!(provider.take_run(), Some(Run::Ran(Outcome::Failed)));
         assert!(late.windows.is_empty());
         let saved = load_state(&home.join(STATE_FILE)).unwrap();
-        assert_eq!(saved.last_ok.unwrap().epoch, Some(1));
+        assert!(saved.last_ok.is_none());
         let mut again = test_provider(&home);
-        assert_eq!(again.fetch_due_ms(NOW), NOW + MIN_INTERVAL_MS);
+        let due = NOW + 2 * MIN_INTERVAL_MS;
+        assert_eq!(again.fetch_due_ms(NOW), due);
         let cached = again.collect_with(NOW, false, |_, _, _| panic!("early poll"));
         assert!(cached.windows.is_empty());
-        let fresh = again.collect_with(NOW + MIN_INTERVAL_MS, false, |_, _, _| {
-            let sample = observation_at(NOW + MIN_INTERVAL_MS);
+        let fresh = again.collect_with(due, false, |_, _, _| {
+            let sample = observation_at(due);
             (Identity::default(), Ok(sample))
         });
         assert!(!fresh.windows.is_empty());
@@ -945,6 +1441,13 @@ mod tests {
             (Identity::default(), Ok(observation()))
         });
         let probe = |provider: &mut CodexProvider| {
+            provider.forget_cached();
+            assert!(
+                load_state(&home.join(STATE_FILE))
+                    .unwrap()
+                    .last_ok
+                    .is_some()
+            );
             assert_eq!(provider.fetch_due_ms(NOW), i64::MAX);
             let snap = provider.collect_with(NOW, true, |_, _, _| panic!("untrusted fetch"));
             assert!(snap.windows.is_empty());
@@ -1060,6 +1563,48 @@ mod tests {
     }
 
     #[test]
+    fn unreadable_state_sets_a_retry_deadline_until_reloaded() {
+        let (_root, home) = temp_home("state-read-retry");
+        let mut provider = test_provider(&home);
+        let path = home.join(STATE_FILE);
+        let initial = provider.collect_with(NOW, true, |_, _, _| {
+            (Identity::default(), Ok(observation()))
+        });
+        assert_eq!(initial.status, ProviderStatus::Ok);
+        assert_eq!(provider.state_retry_at(), None);
+
+        let saved = home.join("saved-state.json");
+        fs::rename(&path, &saved).unwrap();
+        fs::create_dir(&path).unwrap();
+        let failed_at = NOW + 1;
+        let failed = provider.collect_with(failed_at, true, |_, _, _| {
+            panic!("fetched with unreadable state")
+        });
+        assert_eq!(failed.error_code, Some(ErrorCode::FetchFailed));
+        assert!(failed.windows.is_empty());
+        let status = CodexProvider::status_parts(&home, &CodexConfig::default()).unwrap();
+        assert!(status.last_error.contains("retry automatically"));
+        assert!(status.last_error.contains("permissions"));
+        assert!(!status.last_error.contains("--accept-account"));
+        assert_eq!(
+            status.not_scheduled,
+            Some("waiting to retry the state read")
+        );
+        let retry_at = failed_at + MIN_INTERVAL_MS;
+        assert_eq!(provider.state_retry_at(), Some(retry_at));
+        assert_eq!(provider.next_due_ms(failed_at), retry_at);
+
+        fs::remove_dir(&path).unwrap();
+        fs::rename(saved, &path).unwrap();
+        provider.hold_fetch_until(retry_at + MIN_INTERVAL_MS);
+        let restored = provider.collect_with(retry_at, false, |_, _, _| {
+            panic!("fetched before the hold expired")
+        });
+        assert_eq!(restored.status, ProviderStatus::Ok);
+        assert_eq!(provider.state_retry_at(), None);
+    }
+
+    #[test]
     fn forgetting_a_cache_distinguishes_absence_and_corruption_from_io_errors() {
         let (_root, home) = temp_home("discard-errors");
         let mut provider = test_provider(&home);
@@ -1082,6 +1627,7 @@ mod tests {
         lock.try_lock().unwrap();
         assert!(!provider.forget_cached());
         drop(lock);
+        set_epoch(&home, 2, true, None);
         let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
         fs::create_dir(&tmp).unwrap();
         assert!(!provider.forget_cached());
@@ -1143,7 +1689,8 @@ mod tests {
         daemon.hold_fetch_until(due);
         daemon.collect_with(due - 1, false, |_, _, _| panic!("fetch without a turn"));
 
-        daemon.collect_with(due, false, |_, _, _| {
+        daemon.collect_with(due, false, |_, _, q| {
+            q.before_write().unwrap();
             (Identity::default(), Err(FetchError::Timeout))
         });
         let attempt = due + 1;
@@ -1272,6 +1819,63 @@ mod tests {
             (Identity::default(), Ok(observation()))
         });
         assert_eq!(snap.blocked, Some(false));
+    }
+
+    #[test]
+    fn a_named_round_and_restart_keep_the_cache_until_one_due_fetch() {
+        use crate::{agent::Round, config::Config, requests::Request};
+
+        struct Other;
+        impl Provider for Other {
+            fn id(&self) -> &'static str {
+                "claude"
+            }
+            fn next_due_ms(&self, _: i64) -> i64 {
+                i64::MAX
+            }
+            fn collect(&mut self, _: i64, _: bool) -> ProviderSnapshot {
+                observation().snapshot
+            }
+            fn take_run(&mut self) -> Option<Run> {
+                Some(Run::Ran(Outcome::Ok))
+            }
+        }
+
+        let (_root, home) = temp_home("named-round");
+        let mut p = test_provider(&home);
+        let cached = p.collect_with(NOW, false, |_, _, q| successful_rpc(q, &mut Vec::new()));
+        for restarted in [false, true] {
+            let mut providers: Vec<Box<dyn Provider>> =
+                vec![Box::new(Other), Box::new(test_provider(&home))];
+            let mut round = Round::new(
+                &Config::default(),
+                "pc",
+                Logger::stderr(),
+                || NOW + 1,
+                &home,
+            );
+            if restarted {
+                round.run(&mut providers, None);
+            } else {
+                let req = Request {
+                    provider: Some("claude".into()),
+                    force: true,
+                    ..Request::default()
+                };
+                assert!(round.run_request(&mut providers, None, &req).1.ok);
+            }
+            assert_eq!(round.latest["codex"], cached);
+            let saved = load_state(&home.join(STATE_FILE)).unwrap();
+            assert_eq!(saved.last_ok.unwrap().fetched_ms, NOW);
+        }
+        let due = NOW + MIN_INTERVAL_MS;
+        let mut sent = Vec::new();
+        p.grant(Some(grant_until(due + 60_000)));
+        p.collect_with(due, false, |_, _, q| successful_rpc(q, &mut sent));
+        assert_eq!(targets(&sent), ["account/read", "account/rateLimits/read"]);
+        assert_eq!(p.take_run(), Some(Run::Ran(Outcome::Ok)));
+        p.collect_with(due, false, |_, _, _| panic!("duplicate due fetch"));
+        assert_eq!(p.take_run(), Some(Run::NotRun));
     }
 
     #[test]
@@ -1515,6 +2119,7 @@ mod tests {
         });
         assert_eq!(stale.status, ProviderStatus::Stale);
         assert_eq!(stale.fetched_at, cached.fetched_at);
+        assert_eq!(provider.state_retry_at(), None);
         assert_eq!(
             provider.next_due_ms(failed_at),
             failed_at + 2 * MIN_INTERVAL_MS
@@ -1540,13 +2145,16 @@ mod tests {
                 panic!("second process acquired a live lock")
             });
             assert!(pending.windows.is_empty());
+            assert_eq!(second.take_run(), Some(Run::NotRun));
             assert_eq!(second.next_due_ms(NOW), NOW + LOCK_RETRY_MS);
+            assert_eq!(second.state_retry_at(), None);
             (Identity::default(), Ok(observation()))
         });
         let result = second.collect_with(NOW + LOCK_RETRY_MS, false, |_, _, _| {
             panic!("uses committed first result")
         });
         assert_eq!(result.status, ProviderStatus::Ok);
+        assert_eq!(second.take_run(), Some(Run::NotRun));
     }
 
     #[test]
@@ -1559,9 +2167,9 @@ mod tests {
             (identity("synthetic-first"), Ok(observation()))
         });
         assert_eq!(initial.history_since, None);
-        let switched = provider.collect_with(NOW + 1, true, |_, _, expected| {
-            let new = identity("synthetic-second");
-            assert!(expected.differs_from(&new));
+        let switched = provider.collect_with(NOW + 1, true, |_, _, query| {
+            let new = identity("<redacted>");
+            assert!(query.expected.differs_from(&new));
             (new, Err(FetchError::AccountChanged))
         });
         assert_eq!(switched.status, ProviderStatus::Unavailable);
@@ -1580,39 +2188,66 @@ mod tests {
             panic!("force bypassed account stop")
         });
         assert_eq!(held.error_code, Some(ErrorCode::AccountChanged));
-        restarted.accept_account();
+        let target = provider.pending_switch().unwrap();
+        for (mark, grant) in [
+            (target.wrapping_add(1), Some(grant_until(i64::MAX))),
+            (target, None),
+        ] {
+            restarted.accept_target(Some(mark));
+            restarted.accept_account();
+            // The previous call's grant must already be gone.
+            if let Some(grant) = grant {
+                restarted.grant(Some(grant));
+            }
+            restarted.collect_with(NOW + 2, false, |_, _, _| panic!("unauthorized RPC"));
+            assert_eq!(restarted.take_run(), Some(Run::NotRun));
+            assert_eq!(restarted.account_accepted(), Some(false));
+        }
+        restarted.grant(Some(grant_until(i64::MAX)));
+        restarted.collect_with(NOW + 2, true, |_, _, _| panic!("acceptance carried over"));
+        assert_eq!(restarted.account_accepted(), None);
+        set_epoch(&home, 1, false, None);
+        authorize_switch(&mut restarted);
+        restarted.collect_with(NOW + 2, false, |_, _, _| panic!("untrusted fetch"));
+        assert_eq!(restarted.account_accepted(), Some(false));
+        set_epoch(&home, 1, true, None);
+        authorize_switch(&mut restarted);
         let failed = restarted.collect_with(NOW + 3, false, |_, _, _| {
-            (identity("synthetic-second"), Err(FetchError::Remote))
+            (identity("<redacted>"), Err(FetchError::Remote))
         });
         assert_eq!(failed.error_code, Some(ErrorCode::AccountChanged));
         assert_eq!(failed.history_since, None);
-        restarted.accept_account();
+        assert_eq!(restarted.account_accepted(), Some(false));
+        authorize_switch(&mut restarted);
         let unknown = restarted.collect_with(NOW + 4, false, |_, _, _| {
             (Identity::default(), Ok(observation()))
         });
         assert_eq!(unknown.error_code, Some(ErrorCode::AccountChanged));
         assert_eq!(unknown.history_since, None);
-        restarted.accept_account();
+        assert_eq!(restarted.account_accepted(), Some(false));
+        authorize_switch(&mut restarted);
         let accepted_ms = NOW + 6;
         let boundary = Some(iso_from_ms(accepted_ms));
-        let accepted = restarted.collect_with(NOW + 5, false, |_, _, expected| {
-            let new = identity("synthetic-second");
-            assert!(!expected.differs_from(&new));
-            let mut fresh = observation();
-            fresh.fetched_ms = accepted_ms;
-            fresh.snapshot.fetched_at = boundary.clone();
-            fresh.snapshot.windows[0].fetched_at = boundary.clone();
-            (new, Ok(fresh))
+        let mut sent = Vec::new();
+        let accepted = restarted.collect_with(NOW + 5, false, |_, _, q| {
+            q.clock = Some(|| NOW + 6);
+            successful_rpc(q, &mut sent)
         });
+        assert_eq!(targets(&sent), ["account/read", "account/rateLimits/read"]);
+        assert_eq!(restarted.take_run(), Some(Run::Ran(Outcome::Ok)));
+        assert_eq!(provider.pending_switch(), None);
         assert_eq!(accepted.status, ProviderStatus::Ok);
         assert_eq!(accepted.history_since, boundary);
         assert_eq!(accepted.windows[0].fetched_at, boundary);
+        assert_eq!(restarted.account_accepted(), Some(true));
         assert_eq!(
             load_state(&home.join(STATE_FILE))
                 .unwrap()
                 .account_accepted_ms,
             Some(accepted_ms)
         );
+        restarted.collect_with(accepted_ms + 1, false, |_, _, _| panic!("early poll"));
+        assert_eq!(restarted.account_accepted(), None);
 
         let mut after_restart = test_provider(&home);
         let cached = after_restart.collect_with(accepted_ms + 1, false, |_, _, _| {
@@ -1635,6 +2270,51 @@ mod tests {
     }
 
     #[test]
+    fn acceptance_without_a_pending_switch_reports_false() {
+        let (_root, home) = temp_home("accept-no-switch");
+        let mut provider = test_provider(&home);
+        provider.accept_account();
+        provider.grant(Some(grant_until(i64::MAX)));
+        provider.collect_with(NOW, true, |_, _, _| panic!("no pending switch"));
+        assert_eq!(provider.take_run(), Some(Run::NotRun));
+        assert_eq!(provider.account_accepted(), Some(false));
+    }
+
+    #[test]
+    fn acceptance_reports_failure_when_the_final_state_write_fails() {
+        let (_root, home) = temp_home("accept-save-failure");
+        let path = home.join(STATE_FILE);
+        let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
+        let mut provider = test_provider(&home);
+        provider.collect_with(NOW, true, |_, _, _| {
+            (Identity::default(), Err(FetchError::AccountChanged))
+        });
+
+        authorize_switch(&mut provider);
+        fs::create_dir(&tmp).unwrap();
+        provider.collect_with(NOW + 1, false, |_, _, _| panic!("preflight save failed"));
+        assert_eq!(provider.take_run(), Some(Run::NotRun));
+        assert_eq!(provider.account_accepted(), Some(false));
+        fs::remove_dir(&tmp).unwrap();
+
+        authorize_switch(&mut provider);
+        let mut sent = Vec::new();
+        let shown = provider.collect_with(NOW + 1, false, |_, _, q| {
+            let result = successful_rpc(q, &mut sent);
+            fs::create_dir(&tmp).unwrap();
+            result
+        });
+        assert_eq!(targets(&sent), ["account/read", "account/rateLimits/read"]);
+        assert_eq!(provider.take_run(), Some(Run::Ran(Outcome::Failed)));
+        assert!(shown.windows.is_empty());
+        assert!(tmp.is_dir());
+        assert_eq!(provider.account_accepted(), Some(false));
+        let saved = load_state(&path).unwrap();
+        assert!(saved.account_changed);
+        assert_eq!(saved.account_accepted_ms, None);
+    }
+
+    #[test]
     fn unreadable_state_withholds_cached_windows_until_explicit_recovery() {
         let (_root, home) = temp_home("unreadable-state");
         let state_path = home.join(STATE_FILE);
@@ -1653,10 +2333,11 @@ mod tests {
         assert!(stopped.windows.is_empty());
         assert_eq!(fs::read_to_string(&state_path).unwrap(), old_state);
         let status = CodexProvider::status_parts(&home, &CodexConfig::default()).unwrap();
+        assert!(status.last_error.contains("corrupt or invalid"));
         assert!(status.last_error.contains("--accept-account"));
         assert_eq!(status.not_scheduled, Some("waiting for manual resume"));
 
-        provider.accept_account();
+        authorize_switch(&mut provider);
         let failed = provider.collect_with(NOW + 2, false, |_, _, _| {
             assert!(
                 load_state(&state_path).unwrap().account_changed,
@@ -1671,7 +2352,7 @@ mod tests {
         });
         assert_eq!(automatic.error_code, Some(ErrorCode::AccountChanged));
 
-        restarted.accept_account();
+        authorize_switch(&mut restarted);
         let recovered = restarted.collect_with(NOW + MIN_INTERVAL_MS + 1, false, |_, _, _| {
             let identity = account_identity(
                 &json!({"account":{"type":"chatgpt"},"userId":"synthetic-current-user"}),
@@ -1744,5 +2425,17 @@ mod tests {
         });
         assert_eq!(switched.error_code, Some(ErrorCode::AccountChanged));
         assert!(switched.windows.is_empty());
+        let prior = provider.pending_switch().unwrap();
+        authorize_switch(&mut provider);
+        provider.collect_with(NOW + 1, false, |_, _, q| successful_rpc(q, &mut Vec::new()));
+        assert_eq!(provider.account_accepted(), Some(false));
+        assert_eq!(provider.take_run(), Some(Run::Ran(Outcome::Failed)));
+        assert_ne!(test_provider(&home).pending_switch().unwrap(), prior);
+        provider.accept_target(Some(prior));
+        provider.accept_account();
+        provider.grant(Some(grant_until(i64::MAX)));
+        provider.collect_with(NOW + 1, false, |_, _, _| panic!("superseded acceptance"));
+        assert_eq!(provider.take_run(), Some(Run::NotRun));
+        assert_eq!(provider.account_accepted(), Some(false));
     }
 }
