@@ -11,7 +11,7 @@
 // From here down to "Widget rendering below" everything is a pure function that doesn't use the Scriptable API (tested with Node).
 // Startup is at the end (main runs after all constants are defined)
 
-const HEADROOM_VERSION = 98;
+const HEADROOM_VERSION = 99;
 /** View version this script can read (VIEW_VERSION in packages/core) */
 const VIEW_VERSION = 1;
 /** Settings are stored as JSON in a single Keychain item (so the server and credentials are always read as a pair) */
@@ -379,9 +379,14 @@ function sanitizeProvider(p) {
     // At its limit (true / false / unknown); the header dot turns red while values stop updating at the limit. Not for a denied one:
     // its values are withheld, and the dot says nothing of a limit
     blocked: !denied && typeof p.blocked === "boolean" ? p.blocked : null,
+    // The PC whose fetch the values came from (its name as registered on the server); none for a denied one, whose values are withheld
+    collector: !denied && typeof p.collector === "string" && COLLECTOR_NAME.test(p.collector) ? p.collector : null,
     main_window_ids: denied ? [] : main, window_ids: denied ? [] : all, windows: denied ? {} : windows,
   };
 }
+
+/** A PC's name as the server registers it */
+const COLLECTOR_NAME = /^[a-z0-9][a-z0-9-]{0,31}$/;
 
 /**
  * Validate the server response and keep only the fields needed for display (also the saved shape; extra fields and unknown versions are neither saved nor shown).
@@ -2239,10 +2244,13 @@ function detailHtml(input) {
     // The age of the values beside the dot, always (the widget shows it only when old; here it stands in for each limit's own)
     const age = p ? providerAge(p, now) : null;
     const ageText = age === null ? "" : age < 1 ? "now" : formatDuration(age);
+    // Which PC fetched them, before the age ("macbook · 3m"). A long name is cut short; the age always shows
+    const pc = p?.collector ? `<span class="pc">${esc(p.collector)}${ageText ? " ·" : ""}</span>` : "";
+    const fromText = pc + (ageText ? `<span>${esc(ageText)}</span>` : "");
     // As the widget's header: the icon, the name group and the freshness dot are centered in the row, the name and the plan share a baseline
     const head = `<header class="ph"><i class="ic ic-${id}"></i><span class="pn"><h2 style="color:${BRAND_COLORS[id]}">${esc(PROVIDER_NAMES[id])}</h2>` +
       `${p?.plan ? `<span class="plan">${esc(PLAN_NAMES[p.plan] ?? "")}</span>` : ""}</span>` +
-      `<span class="fresh">${ageText ? `<span>${esc(ageText)}</span>` : ""}<i class="dot" style="background:${FRESH_COLORS[fresh.level]}"></i></span></header>`;
+      `<span class="fresh">${fromText}<i class="dot" style="background:${FRESH_COLORS[fresh.level]}"></i></span></header>`;
     // A provider without values: why, and for one that may be off, how to set it up
     if (!p) {
       const hint = missingText(id) === NOT_SET_UP ? `<p class="na-note">${esc(NOT_SET_UP_HINT)}</p>` : "";
@@ -2296,7 +2304,7 @@ body{margin:0;padding:16px 14px 28px;font:15px -apple-system,system-ui,sans-seri
 section{background:var(--card);border-radius:16px;padding:14px;margin-bottom:12px}
 .ph{display:flex;align-items:center;gap:8px;margin-bottom:2px}.pn{display:flex;align-items:baseline;gap:6px}
 .ph h2{font-size:18px;line-height:1;margin:0}.plan{color:var(--sub);font-size:13px;line-height:1}
-.fresh{margin-left:auto;display:flex;align-items:center;gap:6px;color:var(--sub);font-size:13px;line-height:1}.fresh .dot{width:9px;height:9px;margin:0}
+.fresh{margin-left:auto;display:flex;align-items:center;gap:6px;min-width:0;color:var(--sub);font-size:13px;line-height:1}.fresh span{white-space:nowrap;flex-shrink:0}.fresh .pc{flex-shrink:1;min-width:0;overflow:hidden;text-overflow:ellipsis}.fresh .dot{width:9px;height:9px;margin:0}
 .ic{--s:22px;display:inline-flex;align-items:center;justify-content:center;width:var(--s);height:var(--s);flex:none;color:#fff;font:600 12px ui-monospace,monospace}
 .dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:5px;vertical-align:middle;flex:none}
 .limit{padding:20px 0 10px}.limit:last-child{padding-bottom:2px}.limit+.limit,.na+.limit{border-top:1px solid var(--line)}
@@ -2440,8 +2448,10 @@ function demoResult(name, now) {
     rate_60m: o.rate ?? null, rate_24h: o.rate ?? null, rate_pace: o.rate ?? 0,
     detail_only: o.detail === true,
   });
+  // The PC each sample's values came from
+  const SAMPLE_PCS = { max: "desktop", plus: "laptop", pro: "desktop" };
   const provider = (plan, windows) => ({
-    status: "ok", plan, error_code: null,
+    status: "ok", plan, error_code: null, collector: SAMPLE_PCS[plan],
     main_window_ids: windows.filter((w) => !w.scope).map((w) => w.id).join(","),
     window_ids: windows.map((w) => w.id).join(","),
     windows: Object.fromEntries(windows.map((w) => [w.id, w])),

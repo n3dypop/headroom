@@ -2804,7 +2804,18 @@ test("The details page escapes what it shows and lists every limit with its pace
   assert.ok(lib.detailHtml({ view: low, events: null, trends: {}, now, provider: "claude", note: "" }).includes("<em>Confidence</em><b>Low</b><span>not drawn</span>"));
   assert.ok(html.includes(".ic-claude{") && html.includes('<i class="ic ic-claude">'), "provider icons");
   assert.ok(!html.includes("<h3>Symbols</h3>") && !html.includes("<em>Updated</em>"), "no key and no Updated tile (the age is beside the header dot)");
-  assert.ok(html.includes(`<span class="fresh"><span>1m</span><i class="dot"`), "the age beside the freshness dot");
+  assert.ok(html.includes(`<span class="fresh"><span class="pc">desktop ·</span><span>1m</span><i class="dot"`), "the PC the values came from and their age beside the freshness dot");
+  // the PC's name only as the server registers one; none for a denied provider (its values are withheld) or from an older server
+  const named = (collector: unknown, error_code: string | null = null) => {
+    const v = plain(lib.demoResult("normal", now).view) as any;
+    return lib.sanitizeView({ ...v, claude: { ...v.claude, collector, error_code, main_window_ids: v.claude.main_window_ids.join(","), window_ids: v.claude.window_ids.join(",") } })?.claude.collector;
+  };
+  assert.equal(named("macbook"), "macbook");
+  for (const bad of ["Mac Book", "<b>pc</b>", "-pc", "a".repeat(33), 7, undefined]) assert.equal(named(bad), null, String(bad));
+  assert.equal(named("macbook", "access_denied"), null, "denied");
+  const unnamed = plain(lib.demoResult("normal", now).view) as any;
+  unnamed.claude.collector = null;
+  assert.ok(lib.detailHtml({ view: unnamed, events: null, trends: {}, now, provider: "claude", note: "" }).includes(`<span class="fresh"><span>1m</span><i class="dot"`), "the age alone without a name");
   assert.ok(html.includes(`<div class="tile wide"><em>${S.pace} Pace</em>`), "Pace takes two columns");
   // Not available, as on the widget
   const no5h = lib.detailHtml({ view: plain(lib.demoResult("no5h", now).view), events: null, trends: {}, now, provider: "codex", note: "" });
