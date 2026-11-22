@@ -11,7 +11,7 @@
 // From here down to "Widget rendering below" everything is a pure function that doesn't use the Scriptable API (tested with Node).
 // Startup is at the end (main runs after all constants are defined)
 
-const HEADROOM_VERSION = 70;
+const HEADROOM_VERSION = 97;
 /** View version this script can read (VIEW_VERSION in packages/core) */
 const VIEW_VERSION = 1;
 /** Settings are stored as JSON in a single Keychain item (so the server and credentials are always read as a pair) */
@@ -80,14 +80,15 @@ function widgetSize(family, screen) {
 /**
  * Items shown per size.
  * 5h, weekly limits, recent consumption (gray), the amount likely used before reset (forecast, drawn lighter inside the bar) and icons are shown at every size.
- * reset: reset (↻ and timer) / marks: confidence marks (approx., est.) / plan: plan / pace: consumption rate /
+ * reset: reset (↻ and timer) / marks: confidence marks (approx., est.) / plan: plan / pace: consumption rate (the plan and the rate are
+ * in the details only: three providers side by side leave no room for them) /
  * forecastTime: if it will likely run out, replace the reset time in the time row with the run-out time (⚠) / scoped: always show per-model and per-group limits / trend: 7-day weekly trend /
  * freshness: value freshness dot (with elapsed time when old)
  */
 const SIZE_CONTENT = {
   small: { reset: false, marks: false, plan: false, pace: false, forecastTime: false, scoped: false, trend: false, freshness: true },
-  medium: { reset: true, marks: true, plan: true, pace: false, forecastTime: true, scoped: false, trend: false, freshness: true },
-  large: { reset: true, marks: true, plan: true, pace: true, forecastTime: true, scoped: true, trend: true, freshness: true },
+  medium: { reset: true, marks: true, plan: false, pace: false, forecastTime: true, scoped: false, trend: false, freshness: true },
+  large: { reset: true, marks: true, plan: false, pace: false, forecastTime: true, scoped: true, trend: true, freshness: true },
 };
 SIZE_CONTENT.extraLarge = SIZE_CONTENT.large;
 /**
@@ -140,6 +141,125 @@ const RESET_MARK = "↻";
  * packages/scriptable/icons/<provider>.png and writes dist/Headroom.js. If empty, SF Symbols are used instead
  */
 const ICONS = { claude: "", codex: "", gemini: "" }; // @icons
+/**
+ * A second set of icons (packages/scriptable/icons/alt/<provider>.png, embedded the same way). Settings › Icons switches every
+ * widget and the details page to it; a provider without one keeps its icon above. Nothing to switch when it is empty
+ */
+const ALT_ICONS = { claude: "", codex: "", gemini: "" }; // @alt-icons
+/**
+ * Keychain item holding the providers whose second icon is chosen in Settings, comma-separated ("claude,gemini"; "alt", as earlier
+ * versions saved it: every provider; none: each one's first). One for the whole iPhone
+ */
+const KEYCHAIN_ICONS = "headroom.icons";
+/** The icon set this run read (undefined: not read yet; a change in Settings clears it) */
+let iconChoice;
+
+const BASE64_DIGITS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+/** A base64 PNG's width / height, read from its header (1 when it can't be read) */
+function pngAspect(base64) {
+  const bytes = [];
+  for (let i = 0; i + 4 <= Math.min(base64?.length ?? 0, 32); i += 4) {
+    const n = [0, 1, 2, 3].map((k) => BASE64_DIGITS.indexOf(base64[i + k]));
+    if (n.some((v) => v < 0)) return 1;
+    const v = (n[0] << 18) | (n[1] << 12) | (n[2] << 6) | n[3];
+    bytes.push((v >> 16) & 255, (v >> 8) & 255, v & 255);
+  }
+  if (bytes.length < 24 || bytes[0] !== 0x89 || bytes[1] !== 0x50 || bytes[2] !== 0x4e || bytes[3] !== 0x47) return 1;
+  const u32 = (o) => bytes[o] * 2 ** 24 + bytes[o + 1] * 2 ** 16 + bytes[o + 2] * 2 ** 8 + bytes[o + 3];
+  const w = u32(16), h = u32(20);
+  return w > 0 && h > 0 ? w / h : 1;
+}
+
+/**
+ * The size an icon of that shape is drawn at in place of a square of side box. The icons are cut to what is visible, so a wide one
+ * gets the square's area (wider and shorter, at most 1.5 × as wide): what is seen is as large as a square icon's. A tall one fits
+ * the square's height
+ */
+function iconBox(aspect, box) {
+  const ar = Number.isFinite(aspect) && aspect > 0 ? aspect : 1;
+  if (ar < 1) return { w: box * ar, h: box };
+  const w = Math.min(box * Math.sqrt(ar), box * 1.5);
+  return { w, h: w / ar };
+}
+
+/** Keychain item holding the appearance chosen in Settings ("light" or "dark"; none: Auto, as the iPhone is set). One for the whole iPhone */
+const KEYCHAIN_APPEARANCE = "headroom.appearance";
+/** The appearance this run read (undefined: not read yet; a change in Settings clears it) */
+let appearanceChoice;
+const APPEARANCE_NAMES = { auto: "Auto", light: "Light", dark: "Dark" };
+
+/** The appearance chosen in Settings: "auto" (also when it can't be read), "light" or "dark" */
+function readAppearance() {
+  try {
+    const v = Keychain.contains(KEYCHAIN_APPEARANCE) ? Keychain.get(KEYCHAIN_APPEARANCE) : null;
+    return v === "light" || v === "dark" ? v : "auto";
+  } catch (_) {
+    return "auto";
+  }
+}
+
+function currentAppearance() {
+  if (appearanceChoice === undefined) appearanceChoice = readAppearance();
+  return appearanceChoice;
+}
+
+/**
+ * A widget color for the appearance: Auto lets iOS pick by the iPhone's Light or Dark setting (a widget can't read it itself);
+ * Light or Dark is fixed. Only for the widget's own texts and background (DrawContext takes fixed colors)
+ */
+function themed(light, dark) {
+  const mode = currentAppearance();
+  return mode === "light" ? new Color(light) : mode === "dark" ? new Color(dark) : Color.dynamic(new Color(light), new Color(dark));
+}
+
+/** Home screen widget background (the lock screen's stays transparent) */
+const WIDGET_BG = { light: "#ffffff", dark: "#1c1c1e" };
+
+/** A page's colors for the appearance: as the iPhone (both, by prefers-color-scheme) for Auto, else light or dark alone */
+function pageAppearance(css) {
+  const mode = currentAppearance();
+  const dark = /@media \(prefers-color-scheme:dark\)\{(:root\{[^}]*\})\}/g;
+  if (mode === "light") return css.replace(dark, "").replace(/color-scheme:light dark/g, "color-scheme:light");
+  if (mode === "dark") return css.replace(dark, "$1").replace(/color-scheme:light dark/g, "color-scheme:dark");
+  return css;
+}
+
+/**
+ * The width of the slot every provider icon takes, as a factor of the icon size: the widest icon in use (iconBox; 1 when all are
+ * square). Each icon is centred in it, so what follows an icon starts at the same place for every provider (in lists and side by side)
+ */
+function iconSlot() {
+  const icons = currentIcons();
+  return Math.max(1, ...PROVIDER_ORDER.map((p) => (icons[p] ? iconBox(pngAspect(icons[p]), 1).w : 1)));
+}
+
+/** Whether there is a second set of icons to switch to */
+function hasAltIcons() {
+  return PROVIDER_ORDER.some((p) => ALT_ICONS[p]);
+}
+
+/** The providers saved as using their second icon (all of them for "alt"; throws when the Keychain can't be read) */
+function readIconNames() {
+  const saved = Keychain.contains(KEYCHAIN_ICONS) ? String(Keychain.get(KEYCHAIN_ICONS) ?? "") : "";
+  const named = saved === "alt" ? PROVIDER_ORDER : saved.split(",");
+  return PROVIDER_ORDER.filter((p) => named.includes(p));
+}
+
+/** The providers whose second icon is chosen in Settings (none when it can't be read; only those with a second icon) */
+function readIconChoice() {
+  try {
+    return readIconNames().filter((p) => ALT_ICONS[p]);
+  } catch (_) {
+    return [];
+  }
+}
+
+/** The icons in use, per provider: its second icon when chosen, else its first */
+function currentIcons() {
+  if (iconChoice === undefined) iconChoice = readIconChoice();
+  return Object.fromEntries(PROVIDER_ORDER.map((p) => [p, iconChoice.includes(p) ? ALT_ICONS[p] : ICONS[p]]));
+}
 
 /** Accept only the server origin (https://host[:port]). No path, userinfo, query or fragment */
 function normalizeBaseUrl(raw) {
@@ -374,10 +494,35 @@ function lockWindow(view, provider, w, now) {
  * The providers a parameter names on its own, one to MAX_PROVIDERS in its order ("gemini", "claude, gemini", "codex claude gemini").
  * null if it names anything else (empty, top, window keys)
  */
+/** Words of the parameter for a limit: the provider's own 5-hour and weekly limits */
+const LIMIT_WORDS = { "5h": "five_hour", wk: "seven_day", weekly: "seven_day" };
+
+/**
+ * The widget parameter: words separated by commas or spaces, in any order and case. Providers (claude, codex, gemini: shown in that
+ * order), limits (5h, wk), the modes most (large: the provider using most of the limit, then the others) and others (lock screen: the
+ * providers other than the tightest one), and notify. A word of none of these is kept as unknown (the widget says so)
+ */
+function parseParameter(parameter) {
+  const out = { providers: [], limits: [], most: false, others: false, notify: false, unknown: [] };
+  for (const word of String(parameter ?? "").toLowerCase().split(/[\s,]+/).filter(Boolean)) {
+    if (PROVIDER_ORDER.includes(word)) {
+      if (!out.providers.includes(word)) out.providers.push(word);
+    } else if (Object.prototype.hasOwnProperty.call(LIMIT_WORDS, word)) {
+      if (!out.limits.includes(LIMIT_WORDS[word])) out.limits.push(LIMIT_WORDS[word]);
+    } else if (word === "most" || word === "others" || word === "notify") {
+      out[word] = true;
+    } else if (!out.unknown.includes(word)) {
+      out.unknown.push(word);
+    }
+  }
+  out.providers = out.providers.slice(0, MAX_PROVIDERS);
+  return out;
+}
+
+/** The providers a parameter that names nothing else names (null when it names a limit, a mode or nothing) */
 function providerList(parameter) {
-  const words = String(parameter ?? "").trim().toLowerCase().split(/[\s,]+/).filter(Boolean);
-  if (words.length === 0 || !words.every((w) => PROVIDER_ORDER.includes(w))) return null;
-  return [...new Set(words)].slice(0, MAX_PROVIDERS);
+  const q = parseParameter(parameter);
+  return q.providers.length > 0 && q.limits.length === 0 && !q.most && !q.others ? q.providers : null;
 }
 
 /** The providers shown when the parameter names none: the default ones, then any other the view has values of */
@@ -396,8 +541,7 @@ function missingText(provider) {
  * A limit shown in the details only is never chosen unless the parameter names it
  */
 function selectWindows(view, parameter, now) {
-  const param = String(parameter ?? "").trim().toLowerCase();
-  const named = providerList(param);
+  const q = parseParameter(parameter);
   const out = [];
   const push = (provider, id) => {
     const w = view?.[provider]?.windows?.[id];
@@ -414,24 +558,13 @@ function selectWindows(view, parameter, now) {
       if (w.scope !== null && !w.detail_only && atDisplayTime(w, now).used_percent >= 100) push(provider, id);
     }
   };
-  if (param === "top") {
-    for (const provider of defaultProviders(view)) {
-      const p = view?.[provider];
-      if (!p) continue;
-      const ids = p.main_window_ids.length > 0 ? p.main_window_ids : p.window_ids.filter((id) => !p.windows[id].detail_only);
-      const top = ids.reduce((a, id) => {
-        const w = atDisplayTime(p.windows[id], now);
-        return a === null || w.used_percent > a.used ? { id, used: w.used_percent } : a;
-      }, null);
-      if (top) push(provider, top.id);
-    }
-  } else if (param.includes(".")) {
-    for (const key of param.split(",").map((s) => s.trim()).filter(Boolean)) {
-      const [provider, id] = key.split(".");
-      if (PROVIDER_ORDER.includes(provider)) push(provider, id);
+  const providers = q.providers.length > 0 ? q.providers : defaultProviders(view);
+  if (q.limits.length > 0) {
+    // Limits named: those overall limits of each provider, nothing else
+    for (const provider of providers) {
+      for (const id of q.limits) if (view?.[provider]?.windows?.[id]?.scope === null) push(provider, id);
     }
   } else {
-    const providers = named ?? defaultProviders(view);
     for (const provider of providers) main(provider);
     for (const provider of providers) full(provider);
   }
@@ -444,32 +577,35 @@ function selectWindows(view, parameter, now) {
  * (not when fetching failed). Not shown when the parameter names windows, or with top
  */
 function groupsOf(view, parameter, now, options = {}) {
-  const param = String(parameter ?? "").trim().toLowerCase();
-  const items = selectWindows(view, param, now);
-  // Shown in full (the "no 5h" row, per-model limits on large): the providers listed, or by default
-  const listed = param === "" ? defaultProviders(view) : providerList(param) ?? [];
-  // Shown even without a limit to draw (so a provider named without values, or one whose fetch failed, says why): those listed, the
-  // providers named in window keys, or the default ones of top
-  const keyed = param.includes(".")
-    ? [...new Set(param.split(",").map((k) => k.trim().split(".")[0]).filter((p) => PROVIDER_ORDER.includes(p)))]
-    : null;
-  const shown = param === "top" ? defaultProviders(view) : keyed ?? listed;
-  const order = [...shown];
+  const q = parseParameter(parameter);
+  const items = selectWindows(view, parameter, now);
+  // The providers shown, also without a limit to draw (so one named without values, or whose fetch failed, says why)
+  const listed = q.providers.length > 0 ? q.providers : defaultProviders(view);
+  const order = [...listed];
   for (const x of items) if (!order.includes(x.provider)) order.push(x.provider);
   const groups = [];
   for (const provider of order) {
     const p = view?.[provider] ?? null;
     const rows = items.filter((x) => x.provider === provider).map((x) => ({ kind: "window", window: x.window }));
     // Always show per-model and per-group limits (large): append them after the overall limits even below 100%
-    if (options.allScoped && listed.includes(provider) && p) {
+    if (options.allScoped && q.limits.length === 0 && listed.includes(provider) && p) {
       for (const id of p.window_ids) {
         if (p.windows[id].scope !== null && !p.windows[id].detail_only && !rows.some((r) => r.window.id === id)) {
           rows.push({ kind: "window", window: atDisplayTime(p.windows[id], now) });
         }
       }
     }
+    // As in the details: the overall limits, then the provider's own per-model ones; in each, the shorter window first (5h, weekly)
+    sortRows(rows);
     const canTellMissing = listed.includes(provider) && p && (p.status === "ok" || p.status === "stale");
-    if (canTellMissing && p.main_window_ids.length > 0 && !p.main_window_ids.includes("five_hour")) {
+    if (canTellMissing && q.limits.length > 0) {
+      // A limit named that the provider hasn't: said so in its place (5h first, as named)
+      for (const [i, id] of q.limits.entries()) {
+        if (!rows.some((r) => r.kind === "window" && r.window.id === id)) {
+          rows.splice(i, 0, { kind: "missing", text: NOT_AVAILABLE, ...MISSING_LABELS[id] });
+        }
+      }
+    } else if (canTellMissing && p.main_window_ids.length > 0 && !p.main_window_ids.includes("five_hour")) {
       rows.unshift({ kind: "missing", text: NOT_AVAILABLE });
     }
     groups.push({
@@ -482,6 +618,17 @@ function groupsOf(view, parameter, now, options = {}) {
   }
   return groups;
 }
+
+/** Rows of one provider in place: the overall limits first, then the per-model and per-group ones; in each, 5h, then weekly, then others */
+function sortRows(rows) {
+  const group = (r) => (r.window.scope === null ? 0 : 1);
+  const length = (r) => (r.window.id.includes("five_hour") ? 0 : r.window.id.includes("seven_day") ? 1 : 2);
+  const order = rows.map((r, i) => ({ r, i })).sort((a, b) => group(a.r) - group(b.r) || length(a.r) - length(b.r) || a.i - b.i);
+  rows.splice(0, rows.length, ...order.map((x) => x.r));
+}
+
+/** The heading of a row for a limit a provider hasn't (as on the widget, and sized as the long name) */
+const MISSING_LABELS = { five_hour: { label: "5h limit", fitLabel: "5h limit" }, seven_day: { label: "Wk limit", fitLabel: "Weekly limit" } };
 
 /**
  * Bar segments (0-1). remaining is what's left (filled from the left); recent is the recently consumed part of used (gray, right after remaining).
@@ -629,6 +776,19 @@ function limitLifted(p, ids, now) {
   return windows.some(passed) && ![...windows, ...overall].some((w) => w.used_percent >= 100 && !passed(w));
 }
 
+/** Shown where the reset time goes for a limit not started yet: its countdown begins with the first use */
+const NOT_STARTED = "On first use";
+/** Shown where the reset time goes for a limit in use whose reset time isn't known */
+const RESET_UNKNOWN = "Reset unknown";
+
+/**
+ * Whether the limit hasn't started: nothing used and no reset time (a provider whose window starts on the first use gives none
+ * until then, as Gemini's 5h limit). A value reset since its fetch isn't one (it shows "Reset")
+ */
+function notStarted(window) {
+  return !window.resets_at && !window.reset_passed && window.used_percent === 0;
+}
+
 /** Short form of the reset: a running timer within 24 hours, "Fri 09:00" beyond that. null if passed */
 function resetShort(window, now) {
   const date = resetDate(window, now);
@@ -657,7 +817,10 @@ function timeShort(window, now) {
   if (runOutPassed(window, now)) return { warn: true, kind: "text", text: "Limit" };
   const reset = resetShort(window, now);
   if (reset) return { warn: false, ...reset };
-  return resetPassed(window, now) ? { warn: false, kind: "text", text: "Reset" } : null;
+  if (resetPassed(window, now)) return { warn: false, kind: "text", text: "Reset" };
+  if (notStarted(window)) return { warn: false, kind: "text", text: NOT_STARTED, symbol: "start" };
+  // In use with no reset time given: said so (never an empty row)
+  return window.reset_passed ? null : { warn: false, kind: "text", text: RESET_UNKNOWN, symbol: "unknown" };
 }
 
 /** Whether the limit's reset time has passed */
@@ -677,7 +840,31 @@ function runOutPassed(w, now) {
 }
 
 /** Symbols for the time row (SF Symbols; both monochrome, tinted with the text color) */
-const TIME_SYMBOLS = { reset: "arrow.clockwise", warn: "exclamationmark.triangle" };
+/**
+ * What leads each status under a bar, always (monochrome, in the gray of the text): the reset time and "Reset" (↻), the run-out time,
+ * "Soon" and "Limit" (⚠), no such limit (✕ Not available), a limit not started (⧗ On first use) and a reset time not known
+ * (? Reset unknown). SF Symbols, with the text mark when one can't be drawn
+ */
+const TIME_SYMBOLS = { reset: "arrow.clockwise", warn: "exclamationmark.triangle", none: "xmark", start: "hourglass", unknown: "questionmark" };
+const TIME_MARKS = { reset: RESET_MARK, warn: WARN_MARK, none: "✕", start: "⧗", unknown: "?" };
+
+/** The status's mark (a key of TIME_SYMBOLS) */
+function timeMarkOf(time) {
+  return time.symbol ?? (time.warn ? "warn" : "reset");
+}
+
+/** Draws a status's mark: its SF Symbol in the given color, or its text mark */
+function addTimeMark(stack, key, size, color, gap) {
+  const symbol = symbolImage(TIME_SYMBOLS[key]);
+  if (symbol) {
+    const a = stack.addImage(symbol);
+    a.imageSize = new Size(size, size);
+    a.tintColor = color;
+    stack.addSpacer(gap);
+  } else {
+    addSmallText(stack, `${TIME_MARKS[key]} `, size + 1, color, 1);
+  }
+}
 
 /** Short row mark (only reset (estimated); staleness is shown by the header dot and approximations get no mark) */
 function rowMark(w) {
@@ -707,6 +894,14 @@ function limitLabel(w) {
   const scope = scopeName(w.scope);
   // Per-model and per-group limits are short (e.g. Fable weekly) so long headings that don't fit the column aren't cut off
   return scope ? `${scope} ${windowName(w).toLowerCase()}` : `${windowName(w)} limit`;
+}
+
+/** Row heading on the widget (not the details): the length is short (Wk limit, Fable wk, Argon wk) so it isn't cut off in a column */
+function rowLabel(w) {
+  const scope = scopeName(w.scope);
+  const name = windowName(w);
+  const short = name === "Weekly" ? "Wk" : name === "Monthly" ? "Mo" : name;
+  return scope ? `${scope} ${short.toLowerCase()}` : `${short} limit`;
 }
 
 /** Limit name in the heading of the lock screen rectangle (e.g. 5h, Weekly, Fable weekly) */
@@ -751,26 +946,30 @@ const INLINE_WIDTH = 225;
  * shorten scoped limit names (Wk Fable -> Fable) -> drop limit names (5h, Wk) -> drop scoped names too.
  * The ⚠ for failed updates, the remaining value and the ↻ before a value reset since its fetch are kept
  */
-function inlineText(items, cached, prefix = "") {
+function inlineText(items, cached, prefix = "", now = new Date()) {
+  // The time of a limit as text (the line can't hold a countdown): its mark and the clock time, or the status
+  const timeOf = (w) => {
+    const t = timeShort(w, now);
+    if (!t) return "";
+    return `${TIME_MARKS[timeMarkOf(t)]} ${t.kind === "timer" ? clockText(t.date, now) : t.text}`;
+  };
+  // One limit: "Claude 5h 35% · ↻ 18:10"; several: "Claude 5h 35% · Codex wk 80%". Until it fits: drop the time, shorten the provider
+  // names (Cl, Cx), then drop the limit names
   const build = (step) => {
     const body = items.map((x) => {
-      // Last of all, the provider's short name
-      const who = step >= 7 ? SHORT_PROVIDER_NAMES[x.provider] ?? x.providerName : x.providerName;
-      if (x.missing) {
-        // Last of all, the reason's short form too (Not supported as N/A)
-        const reason = step >= 7 ? (x.label === NOT_SUPPORTED ? "N/A" : x.short ?? x.label) : x.label;
-        return `${who} ${reason.startsWith("5h:") || reason.startsWith("5h ") ? "5h N/A" : reason}`;
-      }
+      const who = step >= 2 ? SHORT_PROVIDER_NAMES[x.provider] ?? x.providerName : x.providerName;
+      // A reason, shortened with the names (Not supported and Not available as N/A)
+      if (x.missing) return `${who} ${step >= 2 ? (x.label === NOT_SUPPORTED ? "N/A" : (x.short ?? x.label).replace(NOT_AVAILABLE, "N/A")) : x.label}`;
       const reset = x.window.value_status === "reset_estimated";
-      const mark = step <= 1 && !reset ? shortMark(x.window) : "";
-      const scope = scopeName(x.window.scope);
-      const name = step >= 6 ? "" : step >= 3 && scope ? scope : step >= 5 ? "" : shortName(x.window);
       const value = reset ? `${RESET_MARK}${compactPercent(x.window)}` : compactPercent(x.window);
-      return [who, name, value].filter(Boolean).join(" ") + (mark ? ` (${mark})` : "");
+      const name = step >= 3 ? "" : LIMIT_NAMES[x.window.id] ?? shortName(x.window);
+      // A value reset since its fetch already says so (↻): no time after it
+      const time = step === 0 && items.length === 1 && !reset ? timeOf(x.window) : "";
+      return [[who, name, value].filter(Boolean).join(" "), time].filter(Boolean).join(" · ");
     }).join(" · ") || "Headroom";
     return `${prefix}${cached ? `${WARN_MARK} ${body}` : body}`;
   };
-  const tries = [0, 1, 2, 3, 5, 6, 7].map(build);
+  const tries = [0, 1, 2, 3].map(build);
   return tries.find((s) => textWidth(s, 11) <= INLINE_WIDTH) ?? tries[tries.length - 1];
 }
 
@@ -1022,10 +1221,10 @@ function notifyTitle(provider, limit = null) {
 
 /** Split the widget parameter into what to show and whether this run notifies ("notify" as one of its comma-separated items) */
 function splitNotify(parameter) {
-  const raw = String(parameter ?? "");
-  const items = raw.split(",").map((s) => s.trim());
-  if (!items.some((s) => s.toLowerCase() === "notify")) return { display: parameter ?? null, notify: false };
-  return { display: items.filter((s) => s && s.toLowerCase() !== "notify").join(", "), notify: true };
+  // Words separated by commas or spaces, as parseParameter reads them
+  const words = String(parameter ?? "").split(/[\s,]+/).filter(Boolean);
+  if (!words.some((s) => s.toLowerCase() === "notify")) return { display: parameter ?? null, notify: false };
+  return { display: words.filter((s) => s.toLowerCase() !== "notify").join(", "), notify: true };
 }
 
 /**
@@ -1818,13 +2017,23 @@ function dayLabel(date, now) {
 }
 
 /**
- * Provider icons for the page as CSS classes (.ic-claude, .ic-codex): the embedded image, or without one a tile in the provider color
+ * Provider icons for the page as CSS classes (.ic-claude, .ic-codex): the embedded image (a wide one in a wider box), or without one a
+ * tile in the provider color
  * with the sign the widget's SF Symbols show (an asterisk for Claude, a prompt for Codex). Defined once, so an image isn't repeated
  */
 function iconCss() {
-  return PROVIDER_ORDER.map((p) => (ICONS[p]
-    ? `.ic-${p}{background:url(data:image/png;base64,${ICONS[p]}) center/contain no-repeat}`
-    : `.ic-${p}{background:${BRAND_COLORS[p]};border-radius:28%}.ic-${p}::after{content:"${FALLBACK_MARKS[p].css}"}`)).join("");
+  const icons = currentIcons();
+  const round = (x) => Math.round(x * 1000) / 1000;
+  // A wide icon's box is wider at the same height, as on the widget (iconBox): what is seen is as large as a square icon's
+  const width = (p) => (icons[p] ? round(iconBox(pngAspect(icons[p]), 1).w) : 1);
+  // Each icon centred in the slot of the widest: its width and its side margins add up to the slot, the same in every row and header
+  const slot = round(iconSlot());
+  // (with a slot wider than the square, every provider sets its margins, the widest 0: the base's are for an element without an icon)
+  const place = (w) => `${w > 1 ? `;width:calc(var(--s)*${w})` : ""}${slot > 1 ? `;margin:0 calc(var(--s)*${round((slot - w) / 2)})` : ""}`;
+  const base = slot > 1 ? `.ic{margin:0 calc(var(--s)*${round((slot - 1) / 2)})}` : "";
+  return base + PROVIDER_ORDER.map((p) => (icons[p]
+    ? `.ic-${p}{background:url(data:image/png;base64,${icons[p]}) center/contain no-repeat${place(width(p))}}`
+    : `.ic-${p}{background:${BRAND_COLORS[p]};border-radius:28%${place(1)}}.ic-${p}::after{content:"${FALLBACK_MARKS[p].css}"}`)).join("");
 }
 
 /** Minutes since the oldest fetch among a provider's overall limits (all limits without overall ones). null if unknown */
@@ -1900,7 +2109,7 @@ function detailTiles(w, now) {
   const tiles = [];
   const reset = resetDate(w, now);
   tiles.push({ caption: `${SYMBOLS.reset} Reset`, ...(reset ? tileTime(reset, now, inText)
-    : w.reset_passed ? { main: "Passed", sub: "shown as 0%" } : { main: "—", sub: "unknown" }) });
+    : w.reset_passed ? { main: "Passed", sub: "shown as 0%" } : notStarted(w) ? { main: "Not started", sub: "on first use" } : { main: "—", sub: "unknown" }) });
   const p = projectionOf(w, now);
   const passed = runOutPassed(w, now);
   tiles.push(w.reset_passed ? { caption: "Forecast", main: "—", sub: "next value" }
@@ -1975,11 +2184,11 @@ function detailChart(view, trends, providers, now) {
     return `<text x="${x}" y="${height + 13}"${i === today ? " class=\"today\"" : ""}>${d}</text>`;
   });
   const scale = `<text x="4" y="${trendY(100, height, TREND_INSET) + 10}" class="scale">100%</text><text x="4" y="${trendY(0, height, TREND_INSET) - 3}" class="scale">0%</text>`;
-  // Heading on the left and the providers on the right, as in the large widget: a dot in each provider's color, gray with "–" for a
-  // provider without a series this week, or "No weekly data yet" when neither has one
+  // Heading on the left and the providers on the right, as in the large widget: a dot in each provider's color and its name (also for
+  // a provider without a series this week), or "No weekly data yet" when none has one
   const has = (s) => Boolean(s.points && s.points.length > 0);
   const legend = series.some(has)
-    ? series.map((s) => `<span><i class="dot" style="background:${has(s) ? BRAND_COLORS[s.provider] : BAR_COLORS.track}"></i>${esc(PROVIDER_NAMES[s.provider])}${has(s) ? "" : " –"}</span>`).join("")
+    ? series.map((s) => `<span><i class="dot" style="background:${BRAND_COLORS[s.provider]}"></i>${esc(PROVIDER_NAMES[s.provider])}</span>`).join("")
     : "<span>No weekly data yet</span>";
   return `<div class="chead"><h3>Weekly usage</h3><div class="plegend">${legend}</div></div>` +
     `<svg class="chart" viewBox="0 0 ${width} ${height + 16}" role="img" aria-label="Weekly usage this week">` +
@@ -2000,6 +2209,20 @@ function missingFiveHour(p) {
  * freshness dot with the age of the values and the providers' icons. Everything shown is escaped; nothing is loaded from
  * the network (the page is self-contained)
  */
+/**
+ * The order of a provider's limits in the details: the overall ones, then its per-model and per-group ones (Fable weekly, Argon
+ * weekly), then the ones shown in the details only (other providers' models); in each, the shorter window first (5h before weekly),
+ * else as the view has them
+ */
+function detailOrder(p) {
+  const group = (id) => (p.main_window_ids.includes(id) ? 0 : p.windows[id]?.detail_only ? 2 : 1);
+  const length = (id) => (id.includes("five_hour") ? 0 : id.includes("seven_day") ? 1 : 2);
+  return p.window_ids
+    .map((id, i) => ({ id, i }))
+    .sort((a, b) => group(a.id) - group(b.id) || length(a.id) - length(b.id) || a.i - b.i)
+    .map((x) => x.id);
+}
+
 function detailHtml(input) {
   const { view, events, trends, now, provider = null, note = "" } = input;
   // The providers the widget shows by default (Codex, Claude and any other with values), or the one tapped
@@ -2019,9 +2242,9 @@ function detailHtml(input) {
       (p.error_code === "access_denied" ? `<p class="na-note">${esc(DENIED_HINT)}</p>` : "") : "";
     const missing = missingFiveHour(p)
       ? `<div class="limit na"><div class="top"><span class="name">5h limit</span><b>—</b></div><div class="bar"></div>` +
-        `<p class="na-note">${esc(NOT_AVAILABLE)}</p></div>`
+        `<p class="na-note">${esc(TIME_MARKS.none)} ${esc(NOT_AVAILABLE)}</p></div>`
       : "";
-    const ids = [...p.main_window_ids, ...p.window_ids.filter((x) => !p.main_window_ids.includes(x))];
+    const ids = detailOrder(p);
     const limits = ids.map((wid) => {
       const w = atDisplayTime(p.windows[wid], now);
       const s = barSegmentsAt(w, now);
@@ -2064,7 +2287,7 @@ section{background:var(--card);border-radius:16px;padding:14px;margin-bottom:12p
 .ph{display:flex;align-items:center;gap:8px;margin-bottom:2px}.pn{display:flex;align-items:baseline;gap:6px}
 .ph h2{font-size:18px;line-height:1;margin:0}.plan{color:var(--sub);font-size:13px;line-height:1}
 .fresh{margin-left:auto;display:flex;align-items:center;gap:6px;color:var(--sub);font-size:13px;line-height:1}.fresh .dot{width:9px;height:9px;margin:0}
-.ic{display:inline-flex;align-items:center;justify-content:center;width:22px;height:22px;flex:none;color:#fff;font:600 12px ui-monospace,monospace}
+.ic{--s:22px;display:inline-flex;align-items:center;justify-content:center;width:var(--s);height:var(--s);flex:none;color:#fff;font:600 12px ui-monospace,monospace}
 .dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:5px;vertical-align:middle;flex:none}
 .limit{padding:20px 0 10px}.limit:last-child{padding-bottom:2px}.limit+.limit,.na+.limit{border-top:1px solid var(--line)}
 .top{display:flex;justify-content:space-between;align-items:baseline}.name{font-size:15px;font-weight:400;color:var(--text)}.top b{font-size:24px;font-weight:600}.old .top b{color:var(--sub)}
@@ -2087,11 +2310,11 @@ text{font-size:10px;fill:var(--sub);text-anchor:middle}text.today{fill:var(--tex
 .s-use{stroke-width:2.5}.s-forecast{stroke-width:1.5;stroke-dasharray:2 2.5}.s-guide{stroke-width:1;opacity:.6}.s-reset{stroke-width:1;stroke-dasharray:3 3}
 .llegend{display:flex;flex-wrap:wrap;justify-content:center;gap:4px 12px;font-size:12px;color:var(--sub);margin-top:6px}.llegend span{display:inline-flex;align-items:center;gap:4px}
 .events{list-style:none;margin:0;padding:0}.events li{display:flex;align-items:center;gap:8px;padding:6px 0;border-top:1px solid var(--line);font-size:14px}
-.events li:first-child{border-top:0}.events time{min-width:70px;color:var(--sub);font-size:13px}.events .ic{width:16px;height:16px;font-size:8px}
+.events li:first-child{border-top:0}.events time{min-width:70px;color:var(--sub);font-size:13px}.events .ic{--s:16px;font-size:8px}
 ${iconCss()}`;
   const sub = note ? `${SYMBOLS.runout} ${note.replace(/^⚠︎ /, "")}` : `As of ${clockText(now, now)}`;
   return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">` +
-    `<title>Headroom</title><style>${css}</style></head><body><div class="page"><h1>Headroom</h1><span>${esc(sub)}</span></div>` +
+    `<title>Headroom</title><style>${pageAppearance(css)}</style></head><body><div class="page"><h1>Headroom</h1><span>${esc(sub)}</span></div>` +
     `${sections}${chartSection}${historySection}</body></html>`;
 }
 
@@ -2102,13 +2325,14 @@ const PARAMETER_CHOICES = {
   home: [
     ["Codex and Claude (and any other with values)", ""], ["All three", "codex, claude, gemini"], ["Claude only", "claude"],
     ["Codex only", "codex"], ["Gemini only", "gemini"], ["Codex and Claude only", "codex, claude"], ["Claude and Gemini", "claude, gemini"],
-    ["Codex and Gemini", "codex, gemini"], ["Tightest limit of each", "top"],
+    ["Codex and Gemini", "codex, gemini"], ["The 5h limit of each", "5h"], ["The weekly limit of each", "wk"],
+    ["Large: most used 5h first", "most, 5h"], ["Large: most used weekly first", "most, wk"],
   ],
   lock: [
-    ["Tightest limit", ""], ["Claude 5h", "claude 5h"], ["Claude weekly", "claude weekly"], ["Codex 5h", "codex 5h"],
-    ["Codex weekly", "codex weekly"], ["Gemini 5h", "gemini 5h"], ["Gemini weekly", "gemini weekly"],
-    ["5h of Codex and Claude, side by side", "both 5h"], ["Weekly of Codex and Claude, side by side", "both weekly"],
-    ["Claude 5h and weekly", "claude 5h, claude weekly"],
+    ["The tightest limit for its time left", ""], ["5h, of the tightest provider", "5h"], ["Weekly, of the tightest provider", "wk"],
+    ["5h of the others (beside the one above)", "5h, others"], ["Weekly of the others (beside the one above)", "wk, others"],
+    ["Claude 5h", "claude, 5h"], ["Claude weekly", "claude, wk"], ["Codex 5h", "codex, 5h"], ["Codex weekly", "codex, wk"],
+    ["Gemini 5h", "gemini, 5h"], ["Gemini weekly", "gemini, wk"],
   ],
 };
 
@@ -2119,24 +2343,23 @@ function buildParameter(base, notify) {
 
 /** The guide: sections of [parameters (alternatives joined with " · "), what it shows] */
 const PARAMETER_GUIDE = [
+  ["Words", [
+    ["claude · codex · gemini", "Those providers, in that order (up to three). None named: Codex and Claude, and Gemini once it has values"],
+    ["5h · wk", "Only that limit, the provider's own 5-hour or weekly one. None named: as the size shows them"],
+    ["notify", "This widget also sends notifications. Add it to one widget only"],
+  ]],
   ["Home screen", [
-    ["(empty)", "Codex and Claude, and Gemini once it has values: their overall limits. Per-model limits only at 100% (on Large, always)"],
-    ["claude · codex · gemini", "That provider only"],
-    ["codex, claude, gemini · claude, gemini", "Those providers side by side (up to three), in that order. One without values shows Not supported (Gemini) or No data"],
-    ["top", "The tightest limit of each provider"],
-    ["claude.five_hour, gemini.seven_day", "Those limits, in that order"],
+    ["(empty)", "Each provider's overall limits; per-model limits only at 100% (on Large, always). Small: one limit each, the shortest all have"],
+    ["claude · codex, gemini", "Those providers only"],
+    ["5h · claude, wk", "That limit of each provider, or of the one named"],
+    ["most, 5h · most, wk", "Large: the provider using most of that limit, larger, then the others"],
   ]],
   ["Lock screen", [
-    ["(empty)", "The limit with the least left (Inline: each provider's tightest)"],
-    ["5h · weekly", "That limit, of the provider with less left"],
-    ["claude 5h · gemini weekly", "That limit of that provider"],
-    ["claude · codex · gemini", "That provider's tightest limit"],
-    ["claude 5h, codex 5h · codex 5h + codex weekly", "Two side by side on Rectangular (Circular shows the first, Inline both)"],
-    ["both · both 5h · both weekly", "Codex and Claude side by side"],
-  ]],
-  ["Add to any", [
-    ["notify", "This widget also sends notifications, as in claude, notify. Add it to one widget only"],
-    ["demo · demo:runout", "Sample data instead of your values: normal, runout, no5h, stale, reset, offline, error, nochart, three, unsupported"],
+    ["(empty)", "The tightest limit: the least left at its reset at the current pace (5h or weekly); one used up only when all are"],
+    ["5h · wk", "That limit, of the tightest provider"],
+    ["claude, 5h", "That limit of that provider. Circular: its ring, with the limit's name inside"],
+    ["5h, others", "Rectangular: rings of the other providers (the next tightest on the left, used-up ones on the right), to put beside a rectangle of 5h"],
+    ["claude, codex, 5h", "Rectangular: those two side by side"],
   ]],
 ];
 
@@ -2155,8 +2378,8 @@ section{background:var(--card);border-radius:16px;padding:14px;margin-bottom:12p
 code,.empty{display:inline-block;font:600 13.5px ui-monospace,SFMono-Regular,Menlo,monospace;background:var(--chip);padding:2px 7px;border-radius:6px;margin:0 4px 4px 0}
 .empty{font-family:-apple-system,system-ui,sans-serif;font-weight:500;color:var(--sub)}`;
   return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">` +
-    `<title>Widget parameter</title><style>${css}</style></head><body><h1>Widget parameter</h1>` +
-    `<p class="how">Long-press the widget, choose Edit Widget, and type into Parameter. Upper or lower case doesn't matter; separate items with commas. ` +
+    `<title>Widget parameter</title><style>${pageAppearance(css)}</style></head><body><h1>Widget parameter</h1>` +
+    `<p class="how">Long-press the widget, choose Edit Widget, and type into Parameter: words separated by commas or spaces, in any order and case. To see each state with sample values, use Widget › Preview sample data. ` +
     `In the app menu, Widget › Make a parameter builds one and copies it.</p>${sections}</body></html>`;
 }
 
@@ -2166,46 +2389,34 @@ code,.empty{display:inline-block;font:600 13.5px ui-monospace,SFMono-Regular,Men
 /**
  * Demo, so every display state can be checked. Draws with made-up values only: no network, never reads
  * or saves the previous view (never mixed with real values). Shows Demo in the header and on the lock screen.
- * Chosen with the widget parameter demo (= runout) or demo:<name>, or Widget > "Preview sample data" in the app menu
+ * Shown with Widget > "Preview sample data" in the app menu (a widget parameter has no demo)
+ */
+/**
+ * The samples Preview sample data offers: the states that can happen now. Gemini is on where its fetch was verified, so most have
+ * three providers. (demoResult also draws "error" and "unsupported", kept for the tests)
  */
 const DEMO_SCENARIOS = [
-  { name: "normal", title: "Normal (plenty left, chart)" },
-  { name: "runout", title: "Runs out before reset" },
-  { name: "no5h", title: "Codex without a 5h limit" },
-  { name: "stale", title: "Stale and old values" },
-  { name: "reset", title: "Reset passed / limit reached" },
-  { name: "offline", title: "Can't update (last data)" },
-  { name: "error", title: "Sign-in required / no data" },
-  { name: "nochart", title: "No chart data yet" },
-  // Gemini with values: three columns by default (its own model limit at 100%, the Claude and GPT models in the details only)
-  { name: "three", title: "Three providers (Gemini on)" },
-  // Drawn with all three named (the widget's parameter, when it names nothing else, or the preview's)
-  { name: "unsupported", title: "Gemini not supported yet (all three)", parameter: "gemini, codex, claude" },
+  // Gemini with values: its own model limit at 100%, the Claude and GPT models in the details only
+  { name: "three", title: "Everyday (Codex, Claude and Gemini)" },
+  { name: "normal", title: "Gemini off (Codex and Claude)" },
+  { name: "runout", title: "Runs out before the reset" },
+  { name: "reached", title: "Limit reached (0% until the reset)" },
+  { name: "reset", title: "Reset time passed (estimated)" },
+  { name: "firstuse", title: "Not used yet (starts on first use)" },
+  { name: "no5h", title: "Codex with a weekly limit only" },
+  { name: "stale", title: "Old values (the PCs asleep)" },
+  { name: "offline", title: "Can't update (iPhone offline)" },
+  { name: "attention", title: "Needs you (sign in, account changed)" },
+  { name: "nochart", title: "Just set up (no chart yet)" },
 ];
-
-/**
- * If one of the parameter's comma-separated items is a demo, its name (demo alone is runout; unknown names are runout too). null otherwise.
- * The other items still choose what to show (claude, demo:normal)
- */
-function demoName(parameter) {
-  for (const item of String(parameter ?? "").split(",")) {
-    const m = /^demo(?:[:\s]+(\w+))?$/i.exec(item.trim());
-    if (!m) continue;
-    const name = (m[1] ?? "runout").toLowerCase();
-    return DEMO_SCENARIOS.some((s) => s.name === name) ? name : "runout";
-  }
-  return null;
-}
 
 /** What a demo draws when the widget's parameter names nothing else (a scenario that needs more providers than the default) */
 function demoParameter(name) {
-  return DEMO_SCENARIOS.find((x) => x.name === name)?.parameter ?? "";
+  return DEMO_SCENARIOS.find((x) => x.name === name)?.parameter ?? DEMO_TEST_PARAMETERS[name] ?? "";
 }
 
-/** The parameter without its demo item (what the demo shows) */
-function withoutDemo(parameter) {
-  return String(parameter ?? "").split(",").map((x) => x.trim()).filter((x) => x && !/^demo(?:[:\s]+\w+)?$/i.test(x)).join(", ");
-}
+/** The parameters of the samples kept for the tests only: unsupported is Gemini named while it's off on every PC */
+const DEMO_TEST_PARAMETERS = { unsupported: "gemini, codex, claude" };
 
 /** Demo result (in the shape passed to render). The view and trend go through the same validation as real data (sanitizeView, sanitizeHistory) */
 function demoResult(name, now) {
@@ -2214,7 +2425,7 @@ function demoResult(name, now) {
     id, label: id, scope: o.scope ?? null, used_percent: used,
     recent_consumed_percent: o.recent ?? null, recent_quality: o.recent === undefined ? "unknown" : "exact", recent_minutes: id.includes("five_hour") ? 60 : 1440,
     confidence: "high", fetched_at: at(-(o.age ?? 1)),
-    resets_at: at(o.resets ?? (id.includes("five_hour") ? 180 : 3 * 1440)),
+    resets_at: o.resets === null ? null : at(o.resets ?? (id.includes("five_hour") ? 180 : 3 * 1440)),
     eta_at: null, reset_first: null, eta_minutes: null, rate_15m: null,
     rate_60m: o.rate ?? null, rate_24h: o.rate ?? null, rate_pace: o.rate ?? 0,
     detail_only: o.detail === true,
@@ -2232,6 +2443,7 @@ function demoResult(name, now) {
     runout: () => [win("five_hour", 70, { recent: 25, rate: 30 }), win("seven_day", 30, { recent: 4, rate: 0.3 })],
     stale: () => [win("five_hour", 35, { recent: 6, rate: 4, age: 30 }), win("seven_day", 22, { recent: 3, rate: 0.4, age: 30 })],
     reset: () => [win("five_hour", 80, { resets: -20 }), win("seven_day", 45, { recent: 5, rate: 0.5 })],
+    reached: () => [win("five_hour", 45, { recent: 5, rate: 3 }), win("seven_day", 30, { recent: 4, rate: 0.4 })],
   };
   const codex = {
     normal: () => [win("five_hour", 20, { recent: 2, rate: 3, age }), win("seven_day", 41, { recent: 5, rate: 0.5, age })],
@@ -2239,19 +2451,23 @@ function demoResult(name, now) {
     no5h: () => [win("seven_day", 41, { recent: 5, rate: 0.5 }), win("codex_other_seven_day", 12, { scope: "codex_other" })],
     stale: () => [win("five_hour", 20, { recent: 2, rate: 3, age: 90 }), win("seven_day", 41, { recent: 5, rate: 0.5, age: 90 })],
     reset: () => [win("five_hour", 100, { resets: 120 }), win("seven_day", 60, { recent: 6, rate: 0.6 })],
+    reached: () => [win("five_hour", 100, { resets: 95 }), win("seven_day", 58, { recent: 6, rate: 0.6 })],
   };
-  // Gemini (only in "three"; in the others it is turned off on the PCs, as by default, so the view has none): its own model limit
+  // Gemini (in "three", "reached", "firstuse" and "attention"; in the others it is turned off on the PCs, so the view has none): its own model limit
   // (Argon) at 100%, and the Claude and GPT models it offers (shown in the details only)
-  const gemini = () => [win("five_hour", 28, { recent: 4, rate: 3, age }), win("seven_day", 33, { recent: 4, rate: 0.4, age }),
+  // Not used yet: no reset time until the first use (its 5-hour limit starts then)
+  const gemini = (firstUse = false) => [firstUse ? win("five_hour", 0, { resets: null, age }) : win("five_hour", 28, { recent: 4, rate: 3, age }), win("seven_day", 33, { recent: 4, rate: 0.4, age }),
     win("seven_day_argon", 100, { scope: "Argon", resets: 2 * 1440, age }),
     win("partner_five_hour", 8, { scope: "Claude and GPT", detail: true, age }), win("partner_seven_day", 5, { scope: "Claude and GPT", detail: true, age })];
   const body = {
     view_version: VIEW_VERSION, data_version: 1, boundaries: { claude: "#0", codex: "#0", gemini: "#0" },
-    claude: name === "error"
+    claude: name === "error" || name === "attention"
       ? { status: "error", plan: "max", error_code: "login_required", main_window_ids: "", window_ids: "", windows: {} }
       : provider("max", (claude[name] ?? claude.normal)()),
     codex: name === "error" ? null : provider("plus", (codex[name] ?? codex.normal)()),
-    gemini: name === "three" ? provider("pro", gemini()) : null,
+    // An account switch on a PC waits to be accepted there
+    gemini: name === "attention" ? { status: "error", plan: "pro", error_code: "account_changed", main_window_ids: "", window_ids: "", windows: {} }
+      : ["three", "reached", "firstuse"].includes(name) ? provider("pro", gemini(name === "firstuse")) : null,
   };
   const view = sanitizeView(body);
   // 7-day trend: a sawtooth that drops to 0 at each weekly reset (ending at the current value). A break on the point right after each reset
@@ -2330,7 +2546,7 @@ async function widgetMenu() {
   }
 }
 
-/** Sample data: each display state with made-up values (the widget parameter demo:<name> shows the same on a widget) */
+/** Sample data: each display state with made-up values, in every size (no network, nothing saved) */
 async function sampleMenu() {
   for (;;) {
     const index = await choose("Sample data", "Made-up values for each state. No network, nothing saved.", DEMO_SCENARIOS.map((s) => s.title));
@@ -2399,15 +2615,6 @@ async function loadResult(cfg, family, display) {
 async function main() {
   // "notify" in the widget parameter chooses the one widget that also notifies; the rest of the parameter chooses what to show
   const { display, notify } = splitNotify(config.runsInWidget ? args.widgetParameter : null);
-  // Parameter demo / demo:<name> (alone or with other items): draw only the demo (no network, no saving, no notifications)
-  const demo = config.runsInWidget ? demoName(display) : null;
-  if (demo !== null) {
-    const now = new Date();
-    const widget = render(demoResult(demo, now), config.widgetFamily, withoutDemo(display) || demoParameter(demo), now);
-    Script.setWidget(widget);
-    Script.complete();
-    return;
-  }
   // From a shortcut with "notify": only the notification work, no menu or screen (the summary is the shortcut's output)
   if (!config.runsInWidget && splitNotify(typeof args.shortcutParameter === "string" ? args.shortcutParameter : "").notify) {
     const cfg = loadConfig();
@@ -2554,7 +2761,7 @@ function successorSwitches(p, previousGen) {
 function removeSettingsOf(cfg) {
   // Each group's settings before its switches: settings a failure leaves behind keep their switches (alone, they would read as both on)
   const own = cfg?.keyed ? [configKey(configId(cfg)), notifyKey(cfg)] : [];
-  const shared = [KEYCHAIN_CONFIG, ...Object.values(KEYCHAIN_LEGACY), KEYCHAIN_NOTIFY];
+  const shared = [KEYCHAIN_CONFIG, ...Object.values(KEYCHAIN_LEGACY), KEYCHAIN_NOTIFY, KEYCHAIN_ICONS, KEYCHAIN_APPEARANCE];
   // The items shared with earlier versions are all read before any of them is removed: one that can't be read leaves them all (not
   // counted as done). A generation's own items need no reading
   let sharedRead = true;
@@ -2736,7 +2943,10 @@ async function notice(title, message) {
   await alert.present();
 }
 
-/** "Settings": the server and token, resetting saved data, removing everything (both asked to confirm) */
+/**
+ * "Settings", in three groups: Server and token; Display (the appearance and each provider's icon, for every widget at once);
+ * Saved data (resetting it, or removing everything: both asked to confirm)
+ */
 async function settingsMenu() {
   for (;;) {
     const cfg = loadConfig();
@@ -2744,18 +2954,61 @@ async function settingsMenu() {
     const menu = new Alert();
     menu.title = "Settings";
     menu.message = `Server: ${hostOf(cfg)}`;
-    menu.addAction("Server and token");
+    const lines = [["Server and token", "server"], ["Display", "display"], ["Saved data", "data"]];
+    for (const [label] of lines) menu.addAction(label);
+    menu.addCancelAction("Back");
+    const choice = lines[await menu.presentSheet()]?.[1];
+    if (choice === "server") {
+      await editSettings();
+    } else if (choice === "display") {
+      await displayMenu();
+    } else if (choice === "data") {
+      if (await savedDataMenu()) return;
+    } else {
+      return;
+    }
+  }
+}
+
+/** "Settings › Display": the appearance and, for each provider with a second icon, which of its icons (every widget, at once) */
+async function displayMenu() {
+  for (;;) {
+    const menu = new Alert();
+    menu.title = "Display";
+    menu.message = "For every widget on the Home Screen and the details page, at each widget's next refresh.";
+    const chosen = readIconChoice();
+    const lines = [[`Appearance: ${APPEARANCE_NAMES[readAppearance()]}`, null],
+      ...PROVIDER_ORDER.filter((p) => ALT_ICONS[p]).map((p) => [`${PROVIDER_NAMES[p]} icon: ${chosen.includes(p) ? "Alternate" : "Default"}`, p])];
+    for (const [label] of lines) menu.addAction(label);
+    menu.addCancelAction("Back");
+    const index = await menu.presentSheet();
+    if (index < 0 || index >= lines.length) return;
+    if (index === 0) await chooseAppearance();
+    else await switchIcon(lines[index][1]);
+  }
+}
+
+/**
+ * "Settings › Saved data": reset it, or remove all settings (both asked to confirm). true once everything is removed (or there are
+ * no settings). The settings are read again each time (a reset saves them under a new generation)
+ */
+async function savedDataMenu() {
+  for (;;) {
+    const cfg = loadConfig();
+    if (!cfg) return true;
+    const menu = new Alert();
+    menu.title = "Saved data";
+    menu.message = "Reset after the server's database is recreated. Remove all settings takes Headroom off this iPhone.";
     menu.addDestructiveAction("Reset saved data");
     menu.addDestructiveAction("Remove all settings");
     menu.addCancelAction("Back");
-    const choice = await menu.presentSheet();
-    if (choice === 0) {
-      await editSettings();
-    } else if (choice === 1) {
+    const index = await menu.presentSheet();
+    const choice = index === 0 ? "reset" : index === 1 ? "remove" : null;
+    if (choice === "reset") {
       if (await confirmAlert("Reset saved data?", "Forgets saved values, scheduled reminders and where alerts left off. Use this after the server's database is recreated.", "Reset")) {
         await resetSavedData(cfg);
       }
-    } else if (choice === 2) {
+    } else if (choice === "remove") {
       if (await confirmAlert("Remove all settings?", "Removes the server, the token, saved values and notifications from this iPhone.", "Remove")) {
         if (!sameConfig(cfg, loadConfig())) {
           await notice("Not removed", "The settings changed meanwhile. Nothing was removed.");
@@ -2772,12 +3025,56 @@ async function settingsMenu() {
         if (!files || !notifications) {
           await notice("Partly removed", "Some saved data or notifications couldn't be removed. The data isn't used anymore, but a scheduled reminder may still ring once.");
         }
-        return;
+        return true;
       }
     } else {
-      return;
+      return false;
     }
   }
+}
+
+/** Chooses the appearance for the whole iPhone: Auto (as the iPhone is set; leaves no item behind), Light or Dark */
+async function chooseAppearance() {
+  const current = readAppearance();
+  const pick = new Alert();
+  pick.title = "Appearance";
+  pick.message = "For every widget on the Home Screen and the details page. Auto follows the iPhone's Light or Dark setting.";
+  const modes = ["auto", "light", "dark"];
+  for (const mode of modes) pick.addAction(`${mode === "auto" ? "Auto (iPhone setting)" : APPEARANCE_NAMES[mode]}${mode === current ? " ✓" : ""}`);
+  pick.addCancelAction("Back");
+  const next = modes[await pick.presentSheet()];
+  if (!next || next === current) return;
+  try {
+    if (next === "auto") {
+      if (Keychain.contains(KEYCHAIN_APPEARANCE)) Keychain.remove(KEYCHAIN_APPEARANCE);
+    } else {
+      Keychain.set(KEYCHAIN_APPEARANCE, next);
+    }
+  } catch (_) {
+    await notice("Can't save", "Couldn't write to the Keychain. Nothing was changed.");
+  }
+  appearanceChoice = undefined;
+}
+
+/** Switches one provider's icon between its first and second, for the whole iPhone (every provider on its first leaves no item) */
+async function switchIcon(provider) {
+  // What is saved, read again here: if it can't be read, nothing is written (the other providers' choices are never lost); a provider
+  // saved without a second icon in this build keeps its place
+  let chosen;
+  try {
+    chosen = readIconNames();
+  } catch (_) {
+    await notice("Can't read", "Couldn't read the icon setting from the Keychain. Nothing was changed.");
+    return;
+  }
+  const next = chosen.includes(provider) ? chosen.filter((p) => p !== provider) : PROVIDER_ORDER.filter((p) => p === provider || chosen.includes(p));
+  try {
+    if (next.length > 0) Keychain.set(KEYCHAIN_ICONS, next.join(","));
+    else if (Keychain.contains(KEYCHAIN_ICONS)) Keychain.remove(KEYCHAIN_ICONS);
+  } catch (_) {
+    await notice("Can't save", "Couldn't write to the Keychain. Nothing was changed.");
+  }
+  iconChoice = undefined;
 }
 
 /**
@@ -3931,8 +4228,8 @@ async function notificationMenu() {
 /** Bar colors. DrawContext takes fixed colors (Color.dynamic can't be used). Mid tones readable on both light and dark backgrounds */
 /** Recent consumption (recent) is a darker gray than the track */
 const BAR_COLORS = { recent: "#6B7280", track: "#8e8e93" };
-const TEXT = () => Color.dynamic(new Color("#1c1c1e"), new Color("#f2f2f7"));
-const SUB = () => Color.dynamic(new Color("#6e6e73"), new Color("#a1a1a6"));
+const TEXT = () => themed("#1c1c1e", "#f2f2f7");
+const SUB = () => themed("#6e6e73", "#a1a1a6");
 
 /**
  * Shape of a band (from x, width w). The right end is rounded with radius rightCap. The left end is rounded with radius leftCap for the first piece;
@@ -4007,16 +4304,20 @@ function emptyBarImage(width, height) {
   return ctx.getImage();
 }
 
-/** Provider icon. The embedded image if any, otherwise SF Symbols (tinted with the provider color). null if neither works */
+/**
+ * Provider icon with its shape (width / height). The embedded image if any, otherwise SF Symbols (tinted with the provider color).
+ * null if neither works
+ */
 function iconImage(provider) {
   try {
-    if (ICONS[provider]) {
-      const data = Data.fromBase64String(ICONS[provider]);
+    const icons = currentIcons();
+    if (icons[provider]) {
+      const data = Data.fromBase64String(icons[provider]);
       const image = data ? Image.fromData(data) : null;
-      if (image) return { image, tint: false };
+      if (image) return { image, tint: false, aspect: pngAspect(icons[provider]) };
     }
     const symbol = SFSymbol.named(FALLBACK_MARKS[provider]?.symbol ?? "circle");
-    return symbol ? { image: symbol.image, tint: true } : null;
+    return symbol ? { image: symbol.image, tint: true, aspect: 1 } : null;
   } catch (_) {
     return null;
   }
@@ -4064,81 +4365,94 @@ function ringOf(window) {
   return { fraction: left / 100, faded: window.value_status === "old" };
 }
 
-/**
- * Limits shown on the lock screen (up to 2). The parameter lists up to two "provider and limit" pairs separated by commas or + (case-insensitive):
- * empty = the one limit with the least remaining; `5h`, `weekly` = the provider with less remaining for that limit; `claude 5h`, `codex weekly`, `claude` =
- * that provider's limit (without a limit, the one with the least remaining); `claude 5h, codex 5h`, `codex 5h + codex weekly` = two side by side;
- * `both`, `both 5h`, `both weekly` = Claude and Codex side by side. The older `claude.five_hour` form is also read.
- * Pairs without such a limit are { missing: true } (e.g. Codex, which has no 5-hour limit)
- */
 /** Reason for a failed fetch shown in tight spaces (the lock screen circle, two side by side) */
 const SHORT_ERROR_NAMES = { login_required: "Sign in", not_installed: "Not installed", fetch_failed: "Fetch failed", safety_stop: "Paused", account_changed: "Paused", access_denied: "Denied" };
 const LOCK_WINDOW_NAMES = { "5h": "five_hour", "5": "five_hour", five_hour: "five_hour", weekly: "seven_day", week: "seven_day", wk: "seven_day", seven_day: "seven_day" };
+/**
+ * Limits shown on the lock screen (up to max): only the providers' own 5-hour and weekly limits (those named with 5h or wk, else both).
+ * Nothing named: the tightest (the least left at its reset at the current pace: lockOrder), never one used up while another has something left.
+ * Providers named: each one's tightest. others: the providers other than that one, in the same order (a rectangle beside one showing
+ * it). A provider without such a limit is { missing: true } with the reason
+ */
 function lockPicks(view, parameter, now, max = 2) {
-  const param = String(parameter ?? "").trim().toLowerCase();
-  let selectors;
-  if (/^both\b/.test(param)) {
-    const rest = param.replace(/^both\s*/, "");
-    selectors = DEFAULT_PROVIDERS.map((p) => `${p} ${rest}`);
-  } else {
-    selectors = param.split(/[,+]/).map((s) => s.trim()).filter(Boolean);
-    if (selectors.length === 0) selectors = [""];
+  const q = parseParameter(parameter);
+  const limits = q.limits.length > 0 ? q.limits : ["five_hour", "seven_day"];
+  const order = lockOrder(now);
+  // A provider's tightest: five_hour and seven_day are its own overall limits (a per-model one has an id of its own)
+  const tightest = (p) => limits
+    .map((id) => view?.[p]?.windows?.[id])
+    .filter(Boolean)
+    .map((w) => ({ provider: p, providerName: PROVIDER_NAMES[p], window: lockWindow(view, p, w, now) }))
+    .sort(order)[0] ?? null;
+  const named = q.providers.length > 0;
+  const providers = named ? q.providers : PROVIDER_ORDER.filter((p) => view?.[p]);
+  const each = providers.map((p) => tightest(p) ?? lockMissing(view, p, q.limits[0] ?? null, named));
+  const ranked = each.filter((x) => !x.missing).sort(order);
+  if (q.others) {
+    // The others in the same order (the one ② would pick next on the left, used-up ones on the right), those without a value last
+    return [...ranked.slice(1), ...each.filter((x) => x.missing)].slice(0, max);
   }
-  const out = [];
-  for (const selector of selectors.slice(0, max)) {
-    let provider = null;
-    let windowId = null;
-    if (selector.includes(".")) {
-      // Older form (claude.five_hour). The window id is used as is
-      const [p, id] = selector.split(".");
-      provider = PROVIDER_ORDER.includes(p) ? p : null;
-      windowId = id || null;
-    } else {
-      const words = selector.split(/\s+/).filter(Boolean);
-      provider = words.find((w) => PROVIDER_ORDER.includes(w)) ?? null;
-      windowId = words.map((w) => LOCK_WINDOW_NAMES[w]).find(Boolean) ?? null;
-    }
-    const providers = provider ? [provider] : [...PROVIDER_ORDER];
-    let best = null;
-    for (const p of providers) {
-      const v = view?.[p];
-      if (!v) continue;
-      const ids = windowId ? [windowId] : v.main_window_ids.length > 0 ? v.main_window_ids : v.window_ids;
-      for (const id of ids) {
-        const w = v.windows?.[id];
-        // A limit shown in the details only is taken only when named
-        if (!w || (w.detail_only && !windowId)) continue;
-        const shown = lockWindow(view, p, w, now);
-        if (best === null || shown.used_percent > best.window.used_percent) best = { provider: p, providerName: PROVIDER_NAMES[p], window: shown };
-      }
-    }
-    if (best) {
-      out.push(best);
-      continue;
-    }
-    // Why there is no limit: if values were fetched and there are overall limits but no 5-hour limit (depends on the plan), No 5h. If not fetched, the reason
-    // (e.g. sign-in required) or No data (a failed fetch is never presented as "no limit")
-    // For a provider whose fetch failed, show the reason first even if a weekly limit remains (don't show No 5h)
-    const failed = (x) => Boolean(view?.[x]?.error_code) || view?.[x]?.status === "error";
-    const withError = providers.find(failed);
-    const withMain = windowId === "five_hour"
-      ? providers.find((x) => !failed(x) && (view?.[x]?.main_window_ids?.length ?? 0) > 0)
-      : undefined;
-    const p = withError ?? withMain ?? provider ?? "claude";
-    const code = withError ? view[p].error_code : null;
-    // A provider named without any value: not supported yet, or no data
-    const none = withError || withMain ? null : provider && !view?.[provider] ? missingText(provider) : "No data";
-    const label = withError ? ERROR_NAMES[code] ?? "No data" : withMain ? `5h: ${NOT_AVAILABLE}` : none;
-    const short = withError ? SHORT_ERROR_NAMES[code] ?? "No data" : withMain ? `5h ${NOT_AVAILABLE}` : none;
-    out.push({ missing: true, provider: p, providerName: PROVIDER_NAMES[p], windowId, label, short });
-  }
-  return out;
+  if (named) return each.slice(0, max);
+  if (ranked.length > 0) return [ranked[0]];
+  return [each.find((x) => x.code) ?? each[0] ?? lockMissing(view, "claude", null, false)];
 }
 
-/** Lock screen ring dimensions (diameter, thickness, inner icon; the icon is small to leave space inside the ring) */
+/**
+ * How tight a limit is (percentage points): what would be left at its reset at the current pace (what is left, less the pace times
+ * the hours to the reset; below 0 it runs out first). The pace is the forecast's (only a reliable one); a limit not used yet, one past
+ * its reset or one without a reset time keeps all it has left (nothing known is used of it)
+ */
+function lockSlack(w, now) {
+  const left = Math.max(0, 100 - w.used_percent);
+  const reset = Date.parse(w.resets_at ?? "");
+  if (w.reset_passed || !Number.isFinite(reset) || reset <= now.getTime()) return left;
+  const pace = w.confidence === "high" || w.confidence === "medium" ? paceOf(w) ?? 0 : 0;
+  return left - pace * ((reset - now.getTime()) / 3600000);
+}
+
+/**
+ * The lock screen's order of limits (picks): those with something left first, the tightest first (the least left at the reset at
+ * the current pace: lockSlack, then the least left); used-up ones after them, the soonest back first. Ties keep the order given
+ * (PROVIDER_ORDER)
+ */
+function lockOrder(now) {
+  const used = (x) => (x.window.used_percent >= 100 ? 1 : 0);
+  const back = (x) => {
+    const t = Date.parse(x.window.resets_at ?? "");
+    return Number.isFinite(t) ? t : Infinity;
+  };
+  return (a, b) => used(a) - used(b)
+    || (used(a) ? back(a) - back(b) : lockSlack(a.window, now) - lockSlack(b.window, now) || b.window.used_percent - a.window.used_percent);
+}
+
+/**
+ * Why a provider has no limit to show on the lock screen: the reason of a failed fetch (never presented as "no limit"), the limit
+ * named that it hasn't (5h: Not available), or that it has no value (not supported yet, or no data)
+ */
+function lockMissing(view, provider, windowId, named) {
+  const v = view?.[provider];
+  const base = { missing: true, provider, providerName: PROVIDER_NAMES[provider], windowId };
+  if (Boolean(v?.error_code) || v?.status === "error") {
+    const code = v.error_code ?? null;
+    return { ...base, code: code ?? "error", label: ERROR_NAMES[code] ?? "No data", short: SHORT_ERROR_NAMES[code] ?? "No data" };
+  }
+  if (v && (v.main_window_ids?.length ?? 0) > 0) {
+    const name = LIMIT_NAMES[windowId ?? "five_hour"] ?? "5h";
+    return { ...base, label: `${name}: ${NOT_AVAILABLE}`, short: `${name} ${NOT_AVAILABLE}` };
+  }
+  const none = named && !v ? missingText(provider) : "No data";
+  return { ...base, label: none, short: none };
+}
+
+/**
+ * Lock screen ring dimensions (diameter, thickness, inner icon; the icon is small to leave space inside the ring). The rectangle's
+ * rings (② and ③, the same size) fill its height: 62pt fits the lowest rectangle (about 67pt)
+ */
 const LOCK_RINGS = {
   circular: { size: 54, width: 4, icon: 16, font: 12 },
-  rectangular: { size: 50, width: 4, icon: 20, font: 12 },
+  rectangular: { size: 62, width: 4.5, icon: 24, font: 12 },
+  // ③: ②'s ring with what is left inside, under a smaller icon
+  others: { size: 62, width: 4.5, icon: 18, font: 15 },
   pair: { size: 42, width: 3.5, icon: 12, font: 10 },
 };
 
@@ -4174,7 +4488,9 @@ function ringImage(icon, ring, hex, geom, provider, text = null) {
   }
   const iconTop = text ? c - geom.icon + 1 : c - geom.icon / 2;
   if (icon && !icon.tint) {
-    ctx.drawImageInRect(icon.image, new Rect(c - geom.icon / 2, iconTop, geom.icon, geom.icon));
+    // Centred where the square icon would be, at its own shape (a wide one as large to the eye: iconBox)
+    const box = iconBox(icon.aspect, geom.icon);
+    ctx.drawImageInRect(icon.image, new Rect(c - box.w / 2, iconTop + geom.icon / 2 - box.h / 2, box.w, box.h));
   } else {
     ctx.setFont(Font.boldSystemFont(geom.icon * 0.8));
     ctx.setTextColor(new Color(hex));
@@ -4211,9 +4527,9 @@ function drawLockPair(widget, picks, result, now, cached) {
     const mark = w ? [cached ? WARN_MARK : "", shortMark(w, true)].filter(Boolean).join(" ") : "";
     const demo = result.demo && index === 0 ? " · Demo" : "";
     const fits = (s) => textWidth(s, 9, true) * 0.8 <= 76;
-    const shortWindow = w ? limitName(w).replace(/ weekly$/, " wk").replace(/^Weekly$/, "Weekly") : "";
+    const name = w ? rowLabel(w) : "";
     const candidates = w
-      ? [`${limitName(w)}${mark ? ` ${mark}` : ""}${demo}`, `${shortWindow}${mark ? ` ${mark}` : ""}${demo}`, `${shortWindow}${demo}`]
+      ? [`${name}${mark ? ` ${mark}` : ""}${demo}`, `${LIMIT_NAMES[w.id] ?? name}${mark ? ` ${mark}` : ""}${demo}`, `${LIMIT_NAMES[w.id] ?? name}${demo}`]
       : [`${pick.short}${demo}`];
     const label = col.addText(candidates.find(fits) ?? candidates[candidates.length - 1]);
     label.font = Font.semiboldSystemFont(9);
@@ -4229,8 +4545,109 @@ function drawLockPair(widget, picks, result, now, cached) {
   }
 }
 
-/** Estimated width of the right column in the lock screen rectangle (the narrowest device's 153pt minus the ring and spacing) */
-const LOCK_TITLE_WIDTH = 95;
+/**
+ * ③ (others): ②'s rings, at ②'s size (the rectangle's height), with the icon and what is left inside; no name and no time (no text
+ * beside them, which would squeeze them). Two slots of the ring's size with the same space before, between and after them (② uses the
+ * same slots: its ring in the left one, its text in the right one), centred top to bottom. One alone: in the left slot. A provider
+ * without a value: its empty ring with N/A (a limit it hasn't, or not supported yet) or – inside, so it doesn't read as nothing left
+ */
+function drawLockOthers(widget, picks) {
+  const size = LOCK_RINGS.others.size;
+  const row = widget.addStack();
+  row.layoutHorizontally();
+  row.centerAlignContent();
+  const shown = picks.slice(0, 2);
+  for (let slot = 0; slot < 2; slot++) {
+    row.addSpacer(null);
+    const pick = shown[slot];
+    if (!pick) {
+      row.addSpacer(size);
+      continue;
+    }
+    const w = pick.missing ? null : pick.window;
+    const ring = ringImage(iconImage(pick.provider), ringOf(w), BRAND_COLORS[pick.provider], LOCK_RINGS.others, pick.provider, w ? compactPercent(w) : othersMissing(pick));
+    const img = row.addImage(ring);
+    img.imageSize = new Size(size, size);
+  }
+  row.addSpacer(null);
+}
+
+/** What ③'s empty ring shows for a provider without a value: N/A for a limit it hasn't or a provider not supported yet, else – */
+function othersMissing(pick) {
+  return pick.label === NOT_SUPPORTED || pick.short.includes(NOT_AVAILABLE) ? "N/A" : "–";
+}
+
+/** Width of ②'s text column: ③'s right ring's, so the text sits where that ring does */
+const LOCK_TITLE_WIDTH = LOCK_RINGS.others.size;
+/** The room for a line of ②'s column: its width less the least length of the flexible space that pushes the line right (about 8pt) */
+const LOCK_LINE_WIDTH = LOCK_TITLE_WIDTH - 8;
+/** ②'s short words where the time goes (its column is a ring wide) */
+const LOCK_SHORT_WORDS = { [NOT_STARTED]: "First use", [RESET_UNKNOWN]: "Unknown" };
+
+/** The largest size (down to min, by 0.5pt) at which a text estimated with textWidth fits the width, beside extra points */
+function fitSize(text, size, width, extra = 0, min = 8) {
+  let s = size;
+  while (s > min && extra + textWidth(text, s) * 0.8 > width) s -= 0.5;
+  return s;
+}
+
+/**
+ * The width of a running countdown (pt) as iOS draws it: "mm:ss" within the hour, else "h:mm:ss" (digits about 0.6 of the size, colons
+ * about 0.3), and a little room. An estimate a little wide, so the countdown never needs more than its box
+ */
+function countdownWidth(date, now, size) {
+  const hours = Math.floor(Math.max(0, date.getTime() - now.getTime()) / 3600000);
+  const digits = hours === 0 ? 4 : String(hours).length + 4;
+  const colons = hours === 0 ? 1 : 2;
+  return (digits * 0.6 + colons * 0.3) * size + 3;
+}
+
+/**
+ * ②'s time line, fitted to its column's whole width (LOCK_TITLE_WIDTH), its right edge on the column's:
+ * - a countdown keeps counting: a fixed space, the mark, and a box as wide as the countdown with the countdown right-aligned in it
+ *   (a countdown fills its box, so it aligns in it; no flexible space, so nothing of the column is lost), at a size that fits;
+ * - a text (a weekday and time, or a word: short words here) is pushed right by a flexible space, at a size that fits what that
+ *   space leaves (LOCK_LINE_WIDTH).
+ * Never cut. A warning or a reset asks for a redraw at its time
+ */
+function addLockTimeFitted(stack, w, now, size, outs) {
+  const time = timeShort(w, now);
+  if (!time) return;
+  if (time.warn && outs) {
+    const p = projectionOf(w, now);
+    if (p?.at) outs.push(p.at);
+  }
+  if (time.kind === "timer") {
+    if (outs) outs.push(time.date.getTime());
+    let fitted = size;
+    while (fitted > 8 && fitted + 3 + countdownWidth(time.date, now, fitted) > LOCK_TITLE_WIDTH) fitted -= 0.5;
+    const box = countdownWidth(time.date, now, fitted);
+    const lead = LOCK_TITLE_WIDTH - fitted - 3 - box;
+    if (lead > 0) stack.addSpacer(lead);
+    addTimeMark(stack, timeMarkOf(time), fitted, SUB(), 3);
+    const holder = stack.addStack();
+    holder.size = new Size(box, 0);
+    const d = holder.addDate(time.date);
+    d.applyTimerStyle();
+    d.font = Font.systemFont(fitted);
+    d.textColor = SUB();
+    d.lineLimit = 1;
+    d.rightAlignText();
+    return;
+  }
+  stack.addSpacer(null);
+  const text = LOCK_SHORT_WORDS[time.text] ?? time.text;
+  const fitted = fitSize(text, size, LOCK_LINE_WIDTH, size + 3);
+  addTimeMark(stack, timeMarkOf(time), fitted, SUB(), 3);
+  addSmallText(stack, text, fitted, SUB(), 0.8);
+}
+
+/**
+ * ②'s text beside its ring (pt): the heading, what is left, the time row and the marks beside what is left. One factor over the sizes
+ * before (12 : 22 : 11 : 10), so the rows keep their proportions: a little larger, the heading being the limit alone
+ */
+const LOCK_TEXT_SCALE = 1.1;
+const LOCK_TEXT = Object.fromEntries(Object.entries({ head: 12, pct: 22, time: 11, mark: 10 }).map(([k, v]) => [k, Math.round(v * LOCK_TEXT_SCALE * 10) / 10]));
 
 /** Lock screen time row (same as home: ⚠ and the run-out time if it will run out, otherwise ↻ and the reset time; ⚠ Limit and ↻ Reset once passed) */
 function addLockTime(stack, w, now, size, outs = null) {
@@ -4242,15 +4659,7 @@ function addLockTime(stack, w, now, size, outs = null) {
   }
   // A countdown keeps counting up after zero, so the widget asks to be redrawn then (the row then shows the reset as passed)
   if (time.kind === "timer" && outs) outs.push(time.date.getTime());
-  const symbol = symbolImage(time.warn ? TIME_SYMBOLS.warn : TIME_SYMBOLS.reset);
-  if (symbol) {
-    const a = stack.addImage(symbol);
-    a.imageSize = new Size(size, size);
-    a.tintColor = SUB();
-    stack.addSpacer(3);
-  } else if (time.warn) {
-    addSmallText(stack, `${WARN_MARK} `, size, SUB(), 1);
-  }
+  addTimeMark(stack, timeMarkOf(time), size, SUB(), 3);
   if (time.kind === "timer") {
     const box = stack.addStack();
     box.size = new Size(timerWidth(time.date, now, size), 0);
@@ -4260,7 +4669,7 @@ function addLockTime(stack, w, now, size, outs = null) {
     d.textColor = SUB();
     d.lineLimit = 1;
   } else {
-    addSmallText(stack, time.text, size, SUB(), 1);
+    addSmallText(stack, time.text, size, SUB(), 0.85);
   }
 }
 
@@ -4271,13 +4680,21 @@ function addHeader(stack, group, opts) {
   row.centerAlignContent();
   // Fix the row width to the column width so the freshness dot is right-aligned. Also fix the height so headers line up across columns
   if (opts.width) row.size = new Size(opts.width, s.header);
+  // The icon centred in a slot as wide as the widest icon in use: every provider's name starts at the same place
   const icon = iconImage(group.provider);
+  const slot = s.icon * iconSlot();
   if (icon) {
+    const box = iconBox(icon.aspect, s.icon);
+    const side = (slot - box.w) / 2;
+    if (side > 0.01) row.addSpacer(side);
     const img = row.addImage(icon.image);
-    img.imageSize = new Size(s.icon, s.icon);
+    img.imageSize = new Size(box.w, box.h);
     if (icon.tint) img.tintColor = new Color(BRAND_COLORS[group.provider]);
-    row.addSpacer(5);
+    if (side > 0.01) row.addSpacer(side);
+  } else {
+    row.addSpacer(slot);
   }
+  row.addSpacer(5);
   // Align the name and plan (and Demo) on their bottom edge (on the same line even with different font sizes)
   const names = row.addStack();
   names.layoutHorizontally();
@@ -4294,7 +4711,7 @@ function addHeader(stack, group, opts) {
   // The staleness text beside the dot. A demo keeps its mark longer than this text (the dot stays): a narrow column of three still says Demo
   let freshText = f?.text ?? "";
   if (opts.width) {
-    const fixed = () => (icon ? s.icon + 5 : 0) + textWidth(group.name, s.name, true) + 2 + (f ? 6 + (freshText ? textWidth(freshText, s.headerSmall) + 3 : 0) : 0) + 4;
+    const fixed = () => slot + 5 + textWidth(group.name, s.name, true) + 2 + (f ? 6 + (freshText ? textWidth(freshText, s.headerSmall) + 3 : 0) : 0) + 4;
     const over = () => fixed() + extras.reduce((sum, t) => sum + 5 + textWidth(t, s.headerSmall), 0) > opts.width;
     while (extras.length > 0 && over()) {
       if (extras.length === 1 && extras[0] === "Demo" && freshText) freshText = "";
@@ -4353,7 +4770,9 @@ function rowPlan(row, opts) {
   const pace = !missing && c.pace && paceText(w) && opts.width >= 140 ? paceText(w) : "";
   return {
     missing, w,
-    label: missing ? "5h limit" : limitLabel(w),
+    label: missing ? row.label ?? "5h limit" : rowLabel(w),
+    // The text size is fitted between this and the long name (Weekly limit, Fable weekly)
+    fitLabel: missing ? row.fitLabel ?? row.label ?? "5h limit" : limitLabel(w),
     showPct: true,
     pct: lead ? `${lead} ${value}` : value,
     sub: c.reset || c.marks || c.pace || c.forecastTime,
@@ -4392,7 +4811,8 @@ function fittedSizes(groups, opts) {
     for (const row of visibleRows(group.rows, opts.rows)) {
       const p = rowPlan(row, opts);
       const pctW = p.showPct ? 8 + textWidth(p.pct, s.pct, !p.missing) : 0;
-      const labelW = textWidth(p.label, s.label);
+      // Sized between the short name drawn and the long one (Wk limit / Weekly limit): a little smaller than the short alone gives
+      const labelW = (textWidth(p.label, s.label) + textWidth(p.fitLabel ?? p.label, s.label)) / 2;
       if (labelW > 0) label = Math.min(label, (opts.width - pctW) / labelW);
       if (!p.sub) continue;
       const resetW = p.reset
@@ -4477,6 +4897,7 @@ function addRow(stack, group, row, opts) {
   // Fix the row width to the column width so the rate sits at the right end (otherwise the row is only as wide as its content and doesn't reach the right)
   sub.size = new Size(opts.width, subHeight(s));
   if (p.missing) {
+    addTimeMark(sub, "none", fit.small - 1, SUB(), 2);
     addSmallText(sub, p.missingText, fit.small, SUB(), 1);
     // The row width is fixed, so push left with a flexible spacer (otherwise it is centered)
     sub.addSpacer(null);
@@ -4484,15 +4905,7 @@ function addRow(stack, group, row, opts) {
   }
   if (p.reset) {
     const color = SUB; // the run-out time uses the same color as the reset time
-    const symbol = symbolImage(p.reset.warn ? TIME_SYMBOLS.warn : TIME_SYMBOLS.reset);
-    if (symbol) {
-      const a = sub.addImage(symbol);
-      a.imageSize = new Size(fit.small - 1, fit.small - 1);
-      a.tintColor = color();
-      sub.addSpacer(2);
-    } else if (p.reset.warn) {
-      addSmallText(sub, `${WARN_MARK} `, fit.small, color(), 1);
-    }
+    addTimeMark(sub, timeMarkOf(p.reset), fit.small - 1, color(), 2);
     if (p.reset.kind === "timer") {
       // The timer text expands to the full row width, so put it in a box as wide as the digits (no gap before the rate after it)
       const box = sub.addStack();
@@ -4843,11 +5256,11 @@ function drawCombinedTrend(stack, groups, opts) {
     // What the chart is (the weekly limit, this week) is said by the heading and the day labels; the legend shows only the providers
     for (const [i, s] of series.entries()) {
       if (i > 0) legend.addSpacer(10);
-      // Providers without a trend get a gray dot and "–" (kept short)
-      const dot = legend.addImage(dotImage(has(s) ? BRAND_COLORS[s.provider] : BAR_COLORS.track, 7));
+      // Each provider's own color and name, also without a trend this week
+      const dot = legend.addImage(dotImage(BRAND_COLORS[s.provider], 7));
       dot.imageSize = new Size(7, 7);
       legend.addSpacer(4);
-      addSmallText(legend, `${s.name}${has(s) ? "" : " –"}`, opts.scale.small, SUB());
+      addSmallText(legend, s.name, opts.scale.small, SUB());
     }
   }
   stack.addSpacer(4);
@@ -4886,8 +5299,10 @@ function trendDrawOrder(series) {
 /** Window to read the trend for (each provider's weekly limit). { provider: windowId } */
 function trendWindows(view, family, parameter, now, screen = null) {
   const out = {};
-  // Same choice as when drawing (the weekly limit of each shown provider)
-  for (const s of trendSeries(layoutGroups(view, family, parameter, now, { screen }).groups, null, view)) {
+  // Same choice as when drawing (the weekly limit of each shown provider); none when the layout draws no chart (most, too small)
+  const layout = layoutGroups(view, family, parameter, now, { screen });
+  if (!(layout.trendHeight > 0)) return out;
+  for (const s of trendSeries(layout.groups, null, view)) {
     if (s.window) out[s.provider] = s.window.id;
   }
   return out;
@@ -4916,13 +5331,25 @@ function layoutGroups(view, family, parameter, now, { cached = false, screen = n
   const large = family === "large" || family === "extraLarge";
   // In small, two stacked groups pull the visual center down, so add a little space below to lift them
   const lift = family === "small" ? 2 : 0;
-  const groups = groupsOf(view, String(parameter ?? "").trim(), now, { allScoped: content.scoped });
+  const param = String(parameter ?? "").trim();
+  const q = parseParameter(param);
+  // Most (large): the providers by how much of the limit named (5h when none) they use. The first shows all its own limits, the others
+  // their overall ones, side by side under it (mostFirst)
+  const most = large && q.most;
+  const compared = q.limits[0] ?? "five_hour";
+  const chosen = most
+    ? mostFirst(groupsOf(view, q.providers.join(","), now, { allScoped: true }), compared, now)
+    : groupsOf(view, param, now, { allScoped: content.scoped });
+  // Small with several providers by default (or named): one limit each, the same length for all (shortestShared)
+  const groups = family === "small" && chosen.length >= 2 && q.limits.length === 0 ? shortestShared(chosen) : chosen;
   const two = groups.length >= 2;
   const smallThree = family === "small" && groups.length >= 3;
   if (smallThree) scale = SCALES.smallThree;
   // Three columns leave a header no room for Demo: the demo says so in the note row at the bottom instead (as the offline notice)
   const demoNote = demo && groups.length >= 3 && family !== "small";
-  const showNote = (cached || demoNote) && family !== "small";
+  // Words of the parameter not understood are said in the note row (small has none)
+  const unknownNote = q.unknown.length > 0 ? `Unknown: ${q.unknown.join(", ")}` : "";
+  const showNote = (cached || demoNote || Boolean(unknownNote)) && family !== "small";
   // Height budget: the inside of the padding minus the visual correction, the note row and estimation error (2pt)
   const available = size.height - 2 * pad - lift - (showNote ? 4 + scale.small * 1.25 : 0) - 2;
   const message = scale.label * 1.25;
@@ -4931,16 +5358,27 @@ function layoutGroups(view, family, parameter, now, { cached = false, screen = n
   let limits;
   let between = 0;
   // Reserve the large chart's share first (spacing, legend, minimum height). Not if it isn't drawn (no shown provider has a weekly limit)
-  const withChart = large && content.trend && groups.some((g) => view?.[g.provider]?.windows?.[TREND_WINDOW]);
+  const withChart = large && !most && content.trend && groups.some((g) => view?.[g.provider]?.windows?.[TREND_WINDOW]);
   const chart = withChart ? trendChrome(scale) + TREND_MIN_HEIGHT : 0;
-  if (large && !two) {
+  if (most) {
+    // The others: their overall limits (as a medium column, two at most). The first: what the rest of the height holds
+    const others = groups.slice(1).map((g) => Math.min(MAX_WINDOWS.medium, g.rows.filter((r) => r.kind === "missing" || r.window.scope === null).length));
+    const othersHeight = groups.length > 1
+      ? MOST_GAP + Math.max(0, ...groups.slice(1).map((g, i) => groupHeight(scale, others[i], g.rows.length > 0 ? 0 : message)))
+      : 0;
+    const first = groups[0];
+    const firstLimit = first
+      ? fitRows([Math.min(MAX_WINDOWS_SINGLE.large, first.rows.length)], scale, available - othersHeight, 0, first.rows.length > 0 ? 0 : message, [ranks[0]])[0]
+      : 0;
+    limits = [firstLimit, ...others];
+  } else if (large && !two) {
     limits = fitRows(counts(MAX_WINDOWS_SINGLE.large), scale, available - chart, 0, groups.map((g) => (g.rows.length > 0 ? 0 : message)), ranks);
   } else if (large) {
     limits = groups.map((g, i) => fitRows([Math.min(MAX_WINDOWS.large, g.rows.length)], scale, available - chart, 0, g.rows.length > 0 ? 0 : message, [ranks[i]])[0]);
   } else if (two && family !== "small") {
     limits = groups.map((g) => fitRows([Math.min(MAX_WINDOWS[family] ?? 2, g.rows.length)], scale, available, 0, g.rows.length > 0 ? 0 : message)[0]);
   } else {
-    between = smallThree ? 4 : family === "small" ? 8 : 12;
+    between = smallThree ? 6 : family === "small" ? 10 : 12;
     const mins = groups.map((g) => (g.rows.length > 0 ? 0 : message));
     limits = fitRows(counts(family === "small" && two ? MAX_WINDOWS.small : MAX_WINDOWS_SINGLE[family] ?? 4), scale, available, between, mins, ranks);
   }
@@ -4959,10 +5397,49 @@ function layoutGroups(view, family, parameter, now, { cached = false, screen = n
     // Allow 10% extra column height for estimation error (the chart can shrink, so the bars don't disappear on overflow)
     ? Math.max(TREND_MIN_HEIGHT, Math.min(TREND_MAX_HEIGHT, Math.floor(available - columns * 1.1 - trendChrome(scale))))
     : 0;
-  // Side by side (medium and large): columns of a fixed equal width (long text doesn't widen one), closer together when three
-  const gap = groups.length >= 3 ? 10 : 14;
-  const colWidth = two ? Math.floor((inner - gap * (groups.length - 1)) / groups.length) : inner;
-  return { content, scale, pad, size, inner, large, lift, showNote, demoNote, two, between, trendHeight, gap, colWidth, groups: laid };
+  // Side by side (medium and large): columns of a fixed equal width (long text doesn't widen one), closer together when three. In most,
+  // the others under the first
+  const side = most ? groups.length - 1 : groups.length;
+  const gap = side >= 3 ? 10 : 14;
+  const colWidth = most ? (side > 0 ? Math.floor((inner - gap * (side - 1)) / side) : inner)
+    : two ? Math.floor((inner - gap * (groups.length - 1)) / groups.length) : inner;
+  return { content, scale, pad, size, inner, large, lift, showNote, demoNote, unknownNote, most, two: most ? false : two, between, trendHeight, gap, colWidth, groups: laid };
+}
+
+/** The parameter's word for a limit */
+const LIMIT_NAMES = { five_hour: "5h", seven_day: "wk" };
+
+/** Space between the first provider of most and the others under it */
+const MOST_GAP = 14;
+
+/** Most: the groups by how much of the limit compared they use, the most first (those without it, or without values, after them) */
+function mostFirst(groups, compared, now) {
+  const used = (g) => {
+    const r = g.rows.find((x) => x.kind === "window" && x.window.id === compared);
+    return r ? atDisplayTime(r.window, now).used_percent : -1;
+  };
+  return groups.map((g, i) => ({ g, i })).sort((a, b) => used(b.g) - used(a.g) || a.i - b.i).map((x) => x.g);
+}
+
+/**
+ * One limit per provider, of one length for all: the shortest overall limit that every provider with limits has (5h, else weekly,
+ * ...), so the small widget compares like with like and shows no "Not available". Only when no length is shared, the shortest some
+ * provider has (one without it says so). A provider without values keeps its message
+ */
+function shortestShared(groups) {
+  const length = (w) => (w.id.includes("five_hour") ? 0 : w.id.includes("seven_day") ? 1 : w.id.includes("monthly") ? 2 : 3);
+  const overall = (r) => r.kind === "window" && r.window.scope === null;
+  const each = groups.map((g) => new Set(g.rows.filter(overall).map((r) => length(r.window)))).filter((l) => l.size > 0);
+  if (each.length === 0) return groups;
+  const all = [...new Set(each.flatMap((l) => [...l]))].sort((a, b) => a - b);
+  const pick = all.find((n) => each.every((l) => l.has(n))) ?? all[0];
+  const label = ["5h limit", "Wk limit", "Mo limit", "Limit"][pick];
+  const fitLabel = ["5h limit", "Weekly limit", "Monthly limit", "Limit"][pick];
+  return groups.map((g) => {
+    if (g.rows.length === 0) return g;
+    const row = g.rows.find((r) => overall(r) && length(r.window) === pick);
+    return { ...g, rows: [row ?? { kind: "missing", text: NOT_AVAILABLE, label, fitLabel }] };
+  });
 }
 
 /** Estimated height of one group (header, rows, spacing) */
@@ -5039,6 +5516,7 @@ function drawWidget(result, family, parameter, now) {
   // Same padding on all sides
   const pad = PADDING[family] ?? 0;
   widget.setPadding(pad, pad, pad, pad);
+  if (!accessory) widget.backgroundColor = themed(WIDGET_BG.light, WIDGET_BG.dark);
   if (result.error) {
     addSmallText(widget, family === "accessoryInline" ? `Headroom: ${result.error}` : result.error, 12, SUB());
     return widget;
@@ -5051,20 +5529,10 @@ function drawWidget(result, family, parameter, now) {
   const note = cached ? cachedNote(result.cachedAt, now) : "";
   const param = String(parameter ?? "").trim();
   if (family === "accessoryInline") {
-    const items = param && param.toLowerCase() !== "top" ? lockPicks(result.view, param, now, MAX_PROVIDERS) : selectWindows(result.view, "top", now);
-    if (!(param && param.toLowerCase() !== "top")) {
-      for (const p of PROVIDER_ORDER) {
-        // A failure without a reason code is also No data
-        const v = result.view?.[p];
-        const failed = Boolean(v?.error_code) || v?.status === "error";
-        if (failed && !items.some((x) => x.provider === p)) {
-          items.push({ missing: true, provider: p, providerName: PROVIDER_NAMES[p], label: ERROR_NAMES[v.error_code] ?? "No data", short: SHORT_ERROR_NAMES[v.error_code] ?? "No data" });
-        }
-      }
-      items.sort((a, b) => PROVIDER_ORDER.indexOf(a.provider) - PROVIDER_ORDER.indexOf(b.provider));
-    }
+    // The limits the parameter names (nothing named: the tightest for its time left), as one line
+    const items = lockPicks(result.view, param, now, MAX_PROVIDERS);
     if (tap && items.length > 0 && items.every((x) => x.provider === items[0].provider)) widget.url = tapTo(items[0].provider);
-    widget.addText(inlineText(items, cached, result.demo ? "Demo · " : ""));
+    widget.addText(inlineText(items, cached, result.demo ? "Demo · " : "", now));
     return widget;
   }
   if (family === "accessoryCircular") {
@@ -5074,13 +5542,14 @@ function drawWidget(result, family, parameter, now) {
     const icon = iconImage(provider);
     const ring = top ? ringOf(top.window) : null;
     if (tap && pick) widget.url = tapTo(provider);
-    const img = widget.addImage(ringImage(icon, ring, BRAND_COLORS[provider], LOCK_RINGS.circular, provider, top ? compactPercent(top.window) : "–"));
+    const img = widget.addImage(ringImage(icon, ring, BRAND_COLORS[provider], LOCK_RINGS.circular, provider, top ? LIMIT_NAMES[top.window.id] ?? shortName(top.window) : "–"));
     img.imageSize = new Size(LOCK_RINGS.circular.size, LOCK_RINGS.circular.size);
     img.centerAlignImage?.();
     // Limit name and marks (⚠ for previous values, reset estimate, staleness). Demo for the demo
     const mark = top ? [cached ? WARN_MARK : "", shortMark(top.window)].filter(Boolean).join(" ") : "";
     const reason = !top && pick?.missing ? pick.short : "";
-    const name = reason ? (result.demo ? `Demo · ${reason}` : reason) : result.demo ? "Demo" : top ? shortName(top.window) : "";
+    const left = top ? compactPercent(top.window) : "";
+    const name = reason ? (result.demo ? `Demo · ${reason}` : reason) : result.demo ? `${left} · Demo` : left;
     if (name || mark) {
       const s = widget.addText(mark ? `${name} ${mark}`.trim() : name);
       s.font = Font.systemFont(9);
@@ -5092,11 +5561,14 @@ function drawWidget(result, family, parameter, now) {
   }
   if (accessory) {
     widget.__outs = [];
-    // Lock screen (rectangle): the limits chosen by the parameter. One: ring on the left, text on the right; two: side by side
+    // Lock screen (rectangle): the limits chosen by the parameter. One: ring on the left, text on the right; two: side by side; others:
+    // always rings (beside a rectangle of the tightest one), also when one is left
     const picks = lockPicks(result.view, param, now);
-    if (picks.length >= 2) {
+    const asked = parseParameter(param);
+    if (picks.length >= 2 || (asked.others && picks.length > 0)) {
       if (tap && picks.every((x) => x.provider === picks[0].provider)) widget.url = tapTo(picks[0].provider);
-      drawLockPair(widget, picks, result, now, cached);
+      if (asked.others) drawLockOthers(widget, picks);
+      else drawLockPair(widget, picks, result, now, cached);
       return widget;
     }
     const top = picks[0] && !picks[0].missing ? picks[0] : null;
@@ -5105,43 +5577,61 @@ function drawWidget(result, family, parameter, now) {
         ? `${picks[0].providerName}${picks[0].label.startsWith("5h:") ? " " : ": "}${picks[0].label}`
         : "No data yet";
       if (tap && picks[0]?.missing) widget.url = tapTo(picks[0].provider);
-      addSmallText(widget, result.demo ? `Demo · ${missing}` : missing, 11, SUB());
+      addSmallText(widget, result.demo ? `Demo · ${missing}` : missing, LOCK_TEXT.time, SUB());
       return widget;
     }
     const w = top.window;
     if (tap) widget.url = tapTo(top.provider);
+    // ③'s two slots, with the same spaces: the ring in the left one, the text in the right one (a column of the ring's width, its
+    // lines to the right). Side by side, the two rectangles' rings and text line up
     const row = widget.addStack();
     row.layoutHorizontally();
     row.centerAlignContent();
+    row.addSpacer(null);
     const ringImg = row.addImage(ringImage(iconImage(top.provider), ringOf(w), BRAND_COLORS[top.provider], LOCK_RINGS.rectangular, top.provider));
     ringImg.imageSize = new Size(LOCK_RINGS.rectangular.size, LOCK_RINGS.rectangular.size);
-    row.addSpacer(8);
+    row.addSpacer(null);
     const col = row.addStack();
     col.layoutVertically();
+    col.size = new Size(LOCK_RINGS.others.size, 0);
+    row.addSpacer(null);
+    // A line of the column, pushed to its right
+    const line = (align = null) => {
+      const l = col.addStack();
+      l.layoutHorizontally();
+      if (align === "bottom") l.bottomAlignContent();
+      else l.centerAlignContent();
+      l.addSpacer(null);
+      return l;
+    };
     const mark = shortMark(w, !note);
-    // The heading is "Codex · Weekly". If it doesn't fit, drop the provider name (the icon in the ring identifies it)
-    const full = `${top.providerName} · ${limitName(w)}`;
-    const head = col.addText(textWidth(full, 12) * 0.8 <= LOCK_TITLE_WIDTH ? full : limitName(w));
-    head.font = Font.semiboldSystemFont(12);
+    // The heading is the limit alone ("Wk limit"): the icon in the ring says whose it is, and with the name the limit was cut
+    const head = line().addText(rowLabel(w));
+    head.font = Font.semiboldSystemFont(LOCK_TEXT.head);
     head.lineLimit = 1;
     head.minimumScaleFactor = 0.8;
     // Next to the large remaining value, small staleness and reset-estimate marks (keeps the heading short)
-    const value = col.addStack();
-    value.layoutHorizontally();
-    value.bottomAlignContent();
+    const value = line("bottom");
     const pct = value.addText(compactPercent(w));
-    pct.font = Font.boldSystemFont(22);
+    pct.font = Font.boldSystemFont(LOCK_TEXT.pct);
     pct.textColor = TEXT();
     pct.lineLimit = 1;
+    // 100% with a mark beside it in the narrowest column: a little smaller rather than cut
+    pct.minimumScaleFactor = 0.7;
     if (mark || result.demo) {
       value.addSpacer(4);
-      addSmallText(value, [result.demo ? mark.replace(/ ago$/, "") : mark, result.demo ? "Demo" : ""].filter(Boolean).join(" · "), 10, SUB());
+      addSmallText(value, [result.demo ? mark.replace(/ ago$/, "") : mark, result.demo ? "Demo" : ""].filter(Boolean).join(" · "), LOCK_TEXT.mark, SUB());
     }
+    // The time line places itself in the column (a countdown uses the whole width)
     const sub = col.addStack();
     sub.layoutHorizontally();
     sub.centerAlignContent();
-    if (note) addSmallText(sub, `${WARN_MARK} Can't update`, 11, SUB());
-    else addLockTime(sub, w, now, 11, widget.__outs);
+    if (note) {
+      sub.addSpacer(null);
+      addSmallText(sub, `${WARN_MARK} Can't update`, fitSize(`${WARN_MARK} Can't update`, LOCK_TEXT.time, LOCK_LINE_WIDTH), SUB(), 0.8);
+    } else {
+      addLockTimeFitted(sub, w, now, LOCK_TEXT.time, widget.__outs);
+    }
 
     return widget;
   }
@@ -5153,9 +5643,32 @@ function drawWidget(result, family, parameter, now) {
   if (tap && groups.length === 1) widget.url = tapTo(groups[0].provider);
   // A demo says Demo in each header, or once in the note row when three columns leave the headers no room
   const base = { content, now, trends: result.trends ?? null, rows: Infinity, demo: Boolean(result.demo) && !layout.demoNote, outs: [] };
-  const namesNothing = param === "" || param.toLowerCase() === "top";
+  const named = parseParameter(param);
+  const namesNothing = named.providers.length === 0 && named.limits.length === 0;
   if (groups.length === 0 || (namesNothing && groups.every((g) => g.rows.length === 0 && g.message === "No data"))) {
     addSmallText(body, "No data yet", 12, SUB());
+  } else if (layout.most) {
+    // Most (large): the provider using most of the limit named, with all its own limits, full width; the others side by side under it
+    const [first, ...rest] = groups;
+    const box = body.addStack();
+    box.layoutVertically();
+    box.size = new Size(inner, 0);
+    if (tap) box.url = tapTo(first.provider);
+    drawGroup(box, first, withFit([first], { ...base, scale, width: inner }));
+    if (rest.length > 0) {
+      body.addSpacer(MOST_GAP);
+      const cols = body.addStack();
+      cols.layoutHorizontally();
+      cols.topAlignContent();
+      for (const [index, group] of rest.entries()) {
+        if (index > 0) cols.addSpacer(layout.gap);
+        const col = cols.addStack();
+        col.layoutVertically();
+        col.size = new Size(layout.colWidth, 0);
+        if (tap) col.url = tapTo(group.provider);
+        drawGroup(col, group, withFit(rest, { ...base, scale, width: layout.colWidth }));
+      }
+    }
   } else if (large || (two && family !== "small")) {
     // Medium and large: the providers side by side (two or three columns of a fixed equal width); large adds one full-width chart
     // below overlaying their weekly trends
@@ -5192,7 +5705,7 @@ function drawWidget(result, family, parameter, now) {
     const row = body.addStack();
     row.layoutHorizontally();
     row.addSpacer(null);
-    addSmallText(row, [layout.demoNote ? "Demo" : "", note].filter(Boolean).join(" · "), 9, SUB());
+    addSmallText(row, [layout.demoNote ? "Demo" : "", note, layout.unknownNote].filter(Boolean).join(" · "), 9, SUB());
   }
   return widget;
 }
@@ -5208,12 +5721,12 @@ if (typeof Script !== "undefined" && typeof ListWidget !== "undefined") {
   module.exports = {
     HEADROOM_VERSION, VIEW_VERSION, KEYCHAIN_CONFIG, KEYCHAIN_CURRENT, KEYCHAIN_LEGACY, MAX_WINDOWS, normalizeBaseUrl, buildRequest, validateSetup, sanitizeView,
     atDisplayTime, recentSettledAt, shortMark, selectWindows, groupsOf, barSegments, barWidths, windowName, limitLabel, shortName,
-    percentText, compactPercent, demoName, withoutDemo, demoResult, DEMO_SCENARIOS, rowPlan, textWidth, fittedSizes, ringOf, ringImage, LOCK_RINGS, lockPicks, drawLockPair, LOCK_TITLE_WIDTH, INLINE_WIDTH, SHORT_ERROR_NAMES, timeShort, whenShort, TIME_SYMBOLS, limitName, refreshAfter, inlineText, segmentShape, BRAND_COLORS, ICONS,
+    percentText, compactPercent, parseParameter, lockMissing, LIMIT_NAMES, mostFirst, sortRows, demoResult, DEMO_SCENARIOS, rowPlan, textWidth, fittedSizes, ringOf, ringImage, LOCK_RINGS, lockPicks, drawLockPair, drawLockOthers, othersMissing, LOCK_TITLE_WIDTH, LOCK_TEXT, LOCK_LINE_WIDTH, LOCK_SHORT_WORDS, fitSize, countdownWidth, INLINE_WIDTH, SHORT_ERROR_NAMES, timeShort, whenShort, TIME_SYMBOLS, limitName, refreshAfter, inlineText, segmentShape, BRAND_COLORS, ICONS, ALT_ICONS, KEYCHAIN_ICONS, readIconChoice, currentIcons, pngAspect, iconBox, iconSlot, lockSlack, lockOrder, KEYCHAIN_APPEARANCE, readAppearance, themed, pageAppearance, WIDGET_BG,
     SIZE_CONTENT, paceText, sanitizeHistory, sparkLines, trendWindows, clockText, widgetSize, PADDING, drawnJunction,
     projectionOf, barSegmentsAt, barPieces, freshnessOf, resetShort, rowMark, SCALES, WARN_MARK, BAR_COLORS, PROVIDER_ORDER, NOT_AVAILABLE, trendDrawOrder, lineHeight, subHeight, rowHeightOf, FRESH_COLORS, fitRows, groupHeight, thinPoints, paceOf, visibleRows, sanitizeBoundaries, layoutGroups, rowRank, trendSeries, timerWidth, remainingText, trendY, TREND_HOURS, weekRange, dayStarts, trendX, WEEKDAYS, resetTimes, cycleEnd, scopeName, RESET_MARK, limitLifted, clipSegment, paceGuide, forecastSegment, trendMarks,
     splitNotify, notifyPrefs, reminderPlan, reconcileReminders, reminderId, sanitizeEvents, selectAlerts, alertNotifications, sampleNotifications, eventPhrase, notifyTitle, SYMBOLS, eventsFileName, eventsCursor,
     readNotifyState, readRecords, forgetSwitched, withdrawnAt, accountMark, emptyViewAt, recordName, parseRecord, eventMark, lockFree, holdsLock, withoutCancelled, orphanFiles, fileTag, deliveredSeqs, keepTold, readConfigState, LOCK_SETTLE_MS, detailUrl, parameterGuideHtml, buildParameter, PARAMETER_CHOICES, PARAMETER_GUIDE, detailHtml, detailTiles, tilesHtml, tileTime, providerAge, worstText, fullLimitName, detailChart, dayLabel, iconCss, missingFiveHour, esc, KEYCHAIN_NOTIFY, RUNOUT_LEAD_MINUTES,
     resetDate, errorText, cachedNote, readCache, originTag, cacheTag, sameConfig, DEFAULT_CONFIG_ID, cacheFileName, seenFileName, pickCache, seenFrom, OWN_FILE, formatDuration,
-    providerList, defaultProviders, missingText, demoParameter, MAX_REMINDERS, KEPT_REMINDERS, SHORT_PROVIDER_NAMES, NOT_SUPPORTED, UNVERIFIED_PROVIDERS, DEFAULT_PROVIDERS, MAX_PROVIDERS, VIEW_PROVIDERS, FALLBACK_MARKS, PROVIDER_NAMES,
+    TIME_MARKS, timeMarkOf, providerList, defaultProviders, missingText, demoParameter, MAX_REMINDERS, KEPT_REMINDERS, SHORT_PROVIDER_NAMES, NOT_SUPPORTED, UNVERIFIED_PROVIDERS, DEFAULT_PROVIDERS, MAX_PROVIDERS, VIEW_PROVIDERS, FALLBACK_MARKS, PROVIDER_NAMES,
   };
 }

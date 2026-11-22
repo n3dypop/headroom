@@ -47,7 +47,7 @@ pub fn make_providers(home: &Path, cfg: &Config, log: &Logger) -> Vec<Box<dyn Pr
         )),
     ];
     // Gemini only when turned on: an earlier destination refuses an upload with its values (the other providers' values with it)
-    if cfg.gemini.enabled {
+    if cfg.gemini.enabled == Some(true) {
         list.push(Box::new(crate::providers::gemini::GeminiProvider::new(
             home,
             crate::config::GeminiConfig {
@@ -135,13 +135,14 @@ pub fn run(home: &Path) -> i32 {
     // The session file is published together with the schedule below, with the same retry
     let _ = std::fs::remove_file(home.join(SCHEDULE_FILE));
     let session = new_session_id();
-    let cfg = match config::load(home) {
+    let mut cfg = match config::load(home) {
         Ok(c) => c,
         Err(e) => {
             log.log(&e);
             return 2;
         }
     };
+    decide_defaults(&mut cfg, &log);
     // Published once the agent can run (its config read; tried again with the schedule if it fails): `start` reports the agent up
     // only then, a manual collect hands requests to this session only, and a stop names it
     let mut session_file: Option<std::fs::File> = publish_session(home, &session).ok();
@@ -415,8 +416,53 @@ pub(crate) fn provider_enabled(cfg: &Config, id: &str) -> bool {
     match id {
         "claude" => cfg.claude.enabled,
         "codex" => cfg.codex.enabled,
-        "gemini" => cfg.gemini.enabled,
+        // Left out of config.toml: off until the agent decides it at its start (decide_defaults)
+        "gemini" => cfg.gemini.enabled == Some(true),
         _ => true,
+    }
+}
+
+/// Whether config.toml leaves the provider's on or off to the agent's start (Gemini's `enabled` left out)
+pub(crate) fn decided_at_start(cfg: &Config, id: &str) -> bool {
+    id == "gemini" && cfg.gemini.enabled.is_none()
+}
+
+/// The config a command reads a provider's saved state with: one whose on or off the running agent decides at its start counts as on
+/// (nothing of its CLI runs from reading what it saved)
+pub(crate) fn reading_saved(cfg: &Config, id: &str) -> Config {
+    let mut cfg = cfg.clone();
+    if decided_at_start(&cfg, id) {
+        cfg.gemini.enabled = Some(true);
+    }
+    cfg
+}
+
+/// Where a provider whose on or off is decided at the start is on by default (None: no such provider)
+pub(crate) fn default_on_note(id: &str) -> Option<String> {
+    (id == "gemini").then(|| {
+        format!(
+            "on by default only on Windows 11 with agy {}",
+            crate::providers::gemini::DEFAULT_ON_VERSIONS.join(" or ")
+        )
+    })
+}
+
+/// What the agent's run decides once at its start, for the config it keeps for the run: Gemini left out of config.toml is on only
+/// where its fetch was verified (providers::gemini::default_on)
+pub(crate) fn decide_defaults(cfg: &mut Config, log: &Logger) {
+    if cfg.gemini.enabled.is_none() {
+        let mut cli = crate::providers::gemini::RealCli::new(cfg.gemini.clone());
+        let on = crate::providers::gemini::default_on(
+            &mut cli,
+            crate::providers::gemini::default_on_os(),
+        );
+        log.log(if on {
+            "gemini: on by default (agy is a version verified on this OS; set enabled = false under [gemini] to turn it off)"
+        } else {
+            "gemini: off (on by default only with a verified agy version on a verified OS; set enabled = true under [gemini] to turn it on)"
+        });
+        cfg.gemini.enabled = Some(on);
+        cfg.gemini.by_default = on;
     }
 }
 
@@ -2118,7 +2164,7 @@ mod tests {
         let mut cfg = Config::default();
         cfg.claude.enabled = false;
         cfg.codex.enabled = false;
-        cfg.gemini.enabled = false;
+        cfg.gemini.enabled = Some(false);
         up.borrow_mut().cached = true;
         let mut r = Round::new(&cfg, "mac", Logger::stderr(), clock, &h);
         NOW.with(|n| n.set(T0));

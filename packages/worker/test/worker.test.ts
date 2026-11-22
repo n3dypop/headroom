@@ -2278,7 +2278,7 @@ test("old-format derived values (without rate_pace) are recomputed by the next C
     if (v && typeof v === "object") return Object.fromEntries(Object.entries(v).filter(([k]) => k !== "rate_pace").map(([k, x]) => [k, drop(x)]));
     return v;
   };
-  assert.match(row.basis, /^4:/, "format version in the basis");
+  assert.match(row.basis, /^5:/, "format version in the basis (5: the forecast's rate picked by reliability)");
   raw.prepare("UPDATE derived_metrics SET body = ?, basis = ? WHERE provider = 'claude'").run(JSON.stringify(drop(JSON.parse(row.body))), row.basis.replace(/^\d+:/, ""));
   // (the read endpoint's row taken from it, as this version's Cron does with a row an earlier Worker saved)
   raw.exec(DERIVED_PUBLIC_SQL);
@@ -2792,12 +2792,12 @@ test("a PC row only an earlier Worker kept from a clock off leaves nothing behin
   assert.deepEqual(JSON.parse(left.body).providers, {}, "no provider's value (and no error state) is left");
 });
 
-// ---- Guarantees G1 and G2: each counterexample with its control
+// ---- Guarantees: each counterexample with its control
 const migration0014 = cleanup;
 const rateOf = async (call: Awaited<ReturnType<typeof setup>>["call"], at = NOW) =>
   (((await (await call("GET", "/v2/view", READ, undefined, at)).json()) as { claude: { windows: Record<string, { rate_60m: number | null }> } | null }).claude?.windows.five_hour?.rate_60m ?? null);
 
-test("G1-a: removed observations leave no speed behind (at once after the migration, after the next Cron, and against a late save)", async () => {
+test("removed observations leave no speed behind (at once after the migration, after the next Cron, and against a late save)", async () => {
   // every 5 minutes for the last hour, 1% at a time
   const good = Array.from({ length: 12 }, (_, i) => obs("five_hour", i, new Date(Date.parse("2026-11-16T11:59:00.000Z") + i * 5 * 60_000).toISOString()));
   // the control: the speed from the kept observations alone
@@ -2837,7 +2837,7 @@ test("G1-a: removed observations leave no speed behind (at once after the migrat
   assert.equal(await rateOf(first.call), expected);
 });
 
-test("G1-c: after the migration, the same PC's new fetches on a fixed clock are taken into history and speed", async () => {
+test("after the migration, the same PC's new fetches on a fixed clock are taken into history and speed", async () => {
   const { call, env, raw } = await setup();
   // a marker recorded by a clock far ahead; the migration cuts it to now (the real clock)
   raw.prepare("INSERT INTO boundary_watermarks (provider, collector, until) VALUES ('claude', 'win-desktop', '2999-01-01T00:00:00.000Z')").run();
@@ -2859,7 +2859,7 @@ test("G1-c: after the migration, the same PC's new fetches on a fixed clock are 
   assert.notEqual(await rateOf(call, at), null, "and used for the speed");
 });
 
-test("G2-b: boundaries put again by Cron (no upload) go under a strictly newer data version", async () => {
+test("boundaries put again by Cron (no upload) go under a strictly newer data version", async () => {
   const { call, env, raw, db } = await setup();
   await call("PUT", "/v2/snapshots/win-desktop", WIN, upload(1, fixture()));
   const versionOf = async () => ((await (await call("GET", "/v2/view", READ)).json()) as { data_version: number; boundaries: Record<string, string> });
@@ -2873,7 +2873,7 @@ test("G2-b: boundaries put again by Cron (no upload) go under a strictly newer d
   assert.notEqual(after.boundaries.claude, before.boundaries.claude);
 });
 
-test("G2-d: after a withdrawal, a new upload's value comes under a newer version than the empty one", async () => {
+test("after a withdrawal, a new upload's value comes under a newer version than the empty one", async () => {
   const { call, env } = await setup();
   await call("PUT", "/v2/snapshots/mac", MAC, upload(1, fixture()));
   const later = new Date(NOW.getTime() + 32 * 24 * 3_600_000);
@@ -2965,7 +2965,7 @@ test("a weekly series computed before the migration and saved after it doesn't c
 
 // ---- The upgrade: older agents refused, the data generation, the served version and a used database
 
-test("G1-h: an upload or a turn from an older agent is refused before D1 is touched; this version's agent writes", async () => {
+test("an upload or a turn from an older agent is refused before D1 is touched; this version's agent writes", async () => {
   const { env, raw } = await setup();
   const before = (raw.prepare("SELECT count(*) AS n FROM collector_snapshots").get() as { n: number }).n;
   const send = (path: string, method: string, body: unknown, protocol: string | null) => {
@@ -2985,7 +2985,7 @@ test("G1-h: an upload or a turn from an older agent is refused before D1 is touc
   assert.equal((await send("/v2/snapshots/win-desktop", "PUT", sentAt(upload(1, fixture()), NOW), AGENT_PROTOCOL)).status, 204);
 });
 
-test("G1-d: a speed of an older generation is not shown and is replaced by the next Cron, also without a provider counter and with a higher one", async () => {
+test("a speed of an older generation is not shown and is replaced by the next Cron, also without a provider counter and with a higher one", async () => {
   const good = Array.from({ length: 12 }, (_, i) => obs("five_hour", i, new Date(Date.parse("2026-11-16T11:59:00.000Z") + i * 5 * 60_000).toISOString()));
   const { call, env, raw } = await setup();
   await call("PUT", "/v2/snapshots/win-desktop", WIN, upload(1, fixture(), good));
@@ -3001,7 +3001,7 @@ test("G1-d: a speed of an older generation is not shown and is replaced by the n
   assert.equal(await rateOf(call), expected, "computed again in this generation, whatever its counter");
 });
 
-test("G1-e: a first weekly series whose representatives were read before the cleanup is not saved after it", async () => {
+test("a first weekly series whose representatives were read before the cleanup is not saved after it", async () => {
   const { raw, db } = await setup();
   const hour = new Date(Date.now() - 60_000).toISOString().slice(0, 13);
   const read = (raw.prepare("SELECT generation FROM data_generation").get() as { generation: number }).generation;
@@ -3013,7 +3013,7 @@ test("G1-e: a first weekly series whose representatives were read before the cle
   assert.equal((await loadWeekly(db, "claude"))!.series.length, 1);
 });
 
-test("G2-e: right after the cleanup the served version is above every one served before, with no value; the values left come back above it", async () => {
+test("right after the cleanup the served version is above every one served before, with no value; the values left come back above it", async () => {
   for (const boundaryOnly of [false, true]) {
     const { call, env, raw } = await setup();
     await call("PUT", "/v2/snapshots/win-desktop", WIN, upload(1, fixture()));
@@ -3035,7 +3035,7 @@ test("G2-e: right after the cleanup the served version is above every one served
   }
 });
 
-test("G2-f: a used database with nothing left answers with an empty view, also when no counter or public row is left; a new one with 404", async () => {
+test("a used database with nothing left answers with an empty view, also when no counter or public row is left; a new one with 404", async () => {
   for (const left of ["names", "observations", "hourly", "derived"] as const) {
     const { call, env, raw } = await setup();
     raw.exec("DELETE FROM data_generation");
@@ -3061,7 +3061,7 @@ test("G2-f: a used database with nothing left answers with an empty view, also w
   assert.equal((await fresh.call("GET", "/v2/view", READ)).status, 404);
 });
 
-test("G1-h: after the cleanup, a write a request of the earlier Worker was still making is refused; this Worker's writes go through", async () => {
+test("after the cleanup, a write a request of the earlier Worker was still making is refused; this Worker's writes go through", async () => {
   const { call, raw } = await setup();
   await call("PUT", "/v2/snapshots/win-desktop", WIN, upload(1, fixture()));
   raw.exec(cleanup());
@@ -3096,7 +3096,7 @@ test("the cleanup run a second time changes nothing and doesn't fail on its own 
   assert.equal((await call("PUT", "/v2/snapshots/win-desktop", WIN, upload(2, fixture()))).status, 204);
 });
 
-test("G2-f: a used database whose public row is already gone answers with the empty view right after the cleanup", async () => {
+test("a used database whose public row is already gone answers with the empty view right after the cleanup", async () => {
   const { call, raw } = await setup();
   await call("PUT", "/v2/snapshots/win-desktop", WIN, upload(1, fixture()));
   // an earlier Worker removed the public row and the PC's row
@@ -3109,7 +3109,7 @@ test("G2-f: a used database whose public row is already gone answers with the em
   assert.deepEqual([body.claude, body.codex], [null, null]);
 });
 
-test("G1-h: after the cleanup, an earlier Worker's late DELETE of the withdrawn public row is refused", async () => {
+test("after the cleanup, an earlier Worker's late DELETE of the withdrawn public row is refused", async () => {
   const { call, raw } = await setup();
   await call("PUT", "/v2/snapshots/win-desktop", WIN, upload(1, fixture()));
   raw.exec(cleanup());

@@ -3181,7 +3181,7 @@ Current session limit for org: 100% used
     }
 
     #[test]
-    fn g3_nothing_is_fetched_without_a_trusted_clock_and_no_value_of_an_earlier_epoch_shows() {
+    fn nothing_is_fetched_without_a_trusted_clock_and_no_value_of_an_earlier_epoch_shows() {
         let (mut p, _fake, h) = provider("epochs", vec![Ok(usage_text(10)), Ok(usage_text(20))]);
         let first = p.collect(NOW, false);
         let five = |s: &ProviderSnapshot| {
@@ -3211,8 +3211,8 @@ Current session limit for org: 100% used
     }
 
     #[test]
-    fn g3_b_values_of_an_epoch_gone_show_nowhere_also_between_collects_and_a_new_statusline_value_stays()
-     {
+    fn values_of_an_epoch_gone_show_nowhere_also_between_collects_and_a_new_statusline_value_stays()
+    {
         let (mut p, _fake, h) = provider("epoch-between", vec![Ok(usage_text(100))]);
         p.collect(NOW, false);
         let five = |s: &ProviderSnapshot| {
@@ -3245,7 +3245,7 @@ Current session limit for org: 100% used
     }
 
     #[test]
-    fn g3_e_tidying_waits_while_the_clock_state_cant_be_read_so_a_new_statusline_value_stays() {
+    fn tidying_waits_while_the_clock_state_cant_be_read_so_a_new_statusline_value_stays() {
         let (mut p, _fake, h) = provider("epoch-unreadable", vec![Ok(usage_text(100))]);
         p.collect(NOW, false);
         let five = |s: &ProviderSnapshot| {
@@ -3311,7 +3311,7 @@ Current session limit for org: 100% used
     }
 
     #[test]
-    fn g3_i_an_acceptance_that_cant_be_saved_isnt_made_and_one_that_can_is_said() {
+    fn an_acceptance_that_cant_be_saved_isnt_made_and_one_that_can_is_said() {
         let (mut p, _fake, h) =
             provider("accept-save", vec![Ok(usage_text(10)), Ok(usage_text(10))]);
         signed_in_as(&mut p, &h, "b");

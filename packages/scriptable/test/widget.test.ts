@@ -152,8 +152,10 @@ test("Overall limits come first; per-model and per-group limits are appended onl
   const keys = (v: unknown, param: string) => plain(lib.selectWindows(lib.sanitizeView(v), param, NOW).map((x: any) => `${x.provider}.${x.window.id}`));
   assert.deepEqual(keys(view, ""), ["codex.seven_day", "claude.five_hour", "claude.seven_day"]);
   assert.deepEqual(keys(view, "codex"), ["codex.seven_day"]);
-  assert.deepEqual(keys(view, "claude.seven_day, codex.seven_day"), ["claude.seven_day", "codex.seven_day"]);
-  assert.deepEqual(keys(view, "top"), ["codex.seven_day", "claude.five_hour"]);
+  // a limit named: that one of each provider named, in their order (Codex has no 5h)
+  assert.deepEqual(keys(view, "claude, codex, wk"), ["claude.seven_day", "codex.seven_day"]);
+  assert.deepEqual(keys(view, "5h"), ["claude.five_hour"]);
+  assert.deepEqual(keys(view, "WK  Claude"), ["claude.seven_day"], "any order, case and separator");
   const full = structuredClone(view);
   full.claude!.windows.seven_day_fable!.used_percent = 100;
   assert.deepEqual(keys(full, ""), ["codex.seven_day", "claude.five_hour", "claude.seven_day", "claude.seven_day_fable"],
@@ -195,10 +197,11 @@ function makeStack(kind: string): any {
   const node = new Node(kind);
   return {
     node,
-    layoutHorizontally() {}, layoutVertically() {},
+    layoutHorizontally() { node.props.dir = "h"; }, layoutVertically() { node.props.dir = "v"; },
     centerAlignContent() { node.props.align = "center"; }, topAlignContent() { node.props.align = "top"; }, bottomAlignContent() { node.props.align = "bottom"; },
     setPadding(...a: number[]) { node.props.padding = a; },
     set size(v: any) { node.props.size = v; },
+    set backgroundColor(v: any) { node.props.background = v; },
     set url(v: string) { node.props.url = v; },
     get url() { return node.props.url as string; },
     addText(text: string) {
@@ -217,14 +220,15 @@ function makeStack(kind: string): any {
     addSpacer(length?: number) { node.children.push(new Node("spacer", { length })); },
     addImage(img: any) {
       // Icons drawn inside the circular progress also count as icon symbols/data
-      const n = new Node("image", { fills: img.fills, symbol: img.symbol ?? img.icon?.symbol, data: img.data ?? img.icon?.data, strokes: img.strokes, size: img.size, widths: img.widths, ellipses: img.ellipses, ring: img.ellipses > 0, drawnTexts: img.texts });
+      const n = new Node("image", { fills: img.fills, symbol: img.symbol ?? img.icon?.symbol, data: img.data ?? img.icon?.data, strokes: img.strokes, size: img.size, widths: img.widths, ellipses: img.ellipses, ring: img.ellipses > 0, drawnTexts: img.texts, iconRect: img.iconRect });
       node.children.push(n);
       return { set resizable(v: boolean) { n.props.resizable = v; }, set imageSize(v: unknown) { n.props.imageSize = v; }, set tintColor(v: any) { n.props.tint = v?.hex; } };
     },
     addDate(date: Date) {
       const d = new Node("date", { date: date.toISOString() });
       node.children.push(d);
-      return { applyTimerStyle() { d.props.timer = true; }, set font(_v: unknown) {}, set textColor(_v: unknown) {} };
+      return { applyTimerStyle() { d.props.timer = true; }, set font(v: any) { d.props.font = v; }, set textColor(_v: unknown) {}, set lineLimit(_v: unknown) {},
+        set minimumScaleFactor(v: number) { d.props.minScale = v; }, rightAlignText() { d.props.align = "right"; } };
     },
   };
 }
@@ -289,6 +293,11 @@ interface RunOptions {
   extraFiles?: string[];
   /** Script to run (Headroom.js by default; e.g. a build with icons embedded) */
   code?: string;
+  /**
+   * Test only: draw this sample as the app's Widget › Preview sample data does (render(demoResult(...)) with the parameter given, else
+   * the sample's own), in place of the widget's run
+   */
+  demo?: string;
   /** Device screen width (Device.screenSize; omit for no Device) */
   screen?: number;
   /** Image.fromData returns null (broken image) */
@@ -344,7 +353,7 @@ async function runWidget(opts: RunOptions) {
     hex: string;
     alpha: number;
     constructor(hex: string, alpha = 1) { this.hex = hex; this.alpha = alpha; }
-    static dynamic(light: Color) { return Object.assign(new Color(light.hex), { dynamic: true }); }
+    static dynamic(light: Color, dark?: Color) { return Object.assign(new Color(light.hex), { dynamic: true, dark: dark?.hex }); }
   }
   const presented: any[] = [];
   const clock = { now: opts.now ?? NOW };
@@ -463,9 +472,9 @@ async function runWidget(opts: RunOptions) {
       size: unknown; opaque = true; respectScreenScale = false; fills: unknown[] = []; strokes = 0; widths: number[] = [];
       addPath() {} setFillColor(c: unknown) { this.fills.push(c); } fillPath() {}
       setStrokeColor() {} setLineWidth(w: number) { this.widths.push(w); } strokePath() { this.strokes++; } fillEllipse() {}
-      strokeEllipse() { this.ellipses++; } ellipses = 0; drawn: any[] = []; drawImageInRect(img: any) { this.drawn.push(img); }
+      strokeEllipse() { this.ellipses++; } ellipses = 0; drawn: any[] = []; iconRects: any[] = []; drawImageInRect(img: any, rect: any) { this.drawn.push(img); this.iconRects.push(rect); }
       texts: string[] = []; setFont() {} setTextColor() {} setTextAlignedCenter() {} drawTextInRect(text: string) { this.texts.push(text); }
-      getImage() { return { fills: this.fills, strokes: this.strokes, size: this.size, widths: this.widths, ellipses: this.ellipses, icon: this.drawn[0], texts: this.texts }; }
+      getImage() { return { fills: this.fills, strokes: this.strokes, size: this.size, widths: this.widths, ellipses: this.ellipses, icon: this.drawn[0], iconRect: this.iconRects[0], texts: this.texts }; }
     },
     Size: class { w: number; h: number; constructor(w: number, h: number) { this.w = w; this.h = h; } },
     Rect: class { x: number; y: number; w: number; h: number; constructor(x: number, y: number, w: number, h: number) { this.x = x; this.y = y; this.w = w; this.h = h; } },
@@ -495,10 +504,19 @@ async function runWidget(opts: RunOptions) {
       textFieldValue(i: number) { return opts.app?.form?.[i] ?? ""; }
     },
   };
-  const context = vm.createContext({ ...globals, ...((opts as any).globals ?? {}) });
+  const demoHook = `async function main() {
+  if (typeof __demo !== "undefined") {
+    const now = new Date();
+    Script.setWidget(render(demoResult(__demo.name, now), config.widgetFamily, __demo.parameter ?? demoParameter(__demo.name), now));
+    Script.complete();
+    return;
+  }`;
+  const source = opts.demo ? (opts.code ?? code).replace("async function main() {", demoHook) : opts.code ?? code;
+  const demoGlobals = opts.demo ? { __demo: { name: opts.demo, parameter: opts.parameter ?? null } } : {};
+  const context = vm.createContext({ ...globals, ...demoGlobals, ...((opts as any).globals ?? {}) });
   let error: unknown = null;
   try {
-    await vm.runInContext(`(async () => {\n${opts.code ?? code}\n})()`, context);
+    await vm.runInContext(`(async () => {\n${source}\n})()`, context);
   } catch (e) {
     error = e;
   }
@@ -514,7 +532,8 @@ test("Widget (medium): shows headings, usage, bars and reset timers, doesn't fol
   assert.equal(requests[0].onRedirect({}), null, "redirects are stopped");
   const all = texts(widget.node);
   // Claude and Codex groups showing remaining (Claude 5h 10% used -> 90%, Codex weekly 29% -> 71%)
-  assert.ok(all.includes("Claude") && all.includes("Max") && all.includes("Codex") && all.includes("Pro Lite"), all.join(" | "));
+  assert.ok(all.includes("Claude") && all.includes("Codex"), all.join(" | "));
+  assert.ok(!all.includes("Max") && !all.includes("Pro Lite"), "the plans are in the details only");
   assert.equal(all[all.indexOf("5h limit", all.indexOf("Claude")) + 1], "90%");
   assert.ok(all.includes("71%"));
   assert.ok(all.includes("Not available"), "shows that Codex has no 5h limit");
@@ -583,7 +602,7 @@ test("When setting up again, older Access items are deleted, and changing the se
   assert.ok(currentId(empty.keychain) === null && !empty.keychain.has("headroom.config"), "not saved when the token is empty");
   assert.equal(empty.keychain.get("headroom.url"), "https://old.example");
   // Delete settings
-  const removed = await runWidget({ family: "medium", keychain, cached, app: { menu: [3, 2] } });
+  const removed = await runWidget({ family: "medium", keychain, cached, app: { menu: [3, 2, 1] } });
   assert.equal(removed.keychain.size, 0);
   assert.equal(removed.files.size, 0);
 });
@@ -724,7 +743,7 @@ test("Deleting settings removes only Headroom's files (user scripts with the sam
   const keychain = { "headroom.config": JSON.stringify({ url: "https://headroom.example.com", token: "t", accessId: "", accessSecret: "" }) };
   const own = [lib.seenFileName(TAG, 100), lib.cacheFileName(TAG, 100), "headroom-view.json"];
   const user = ["headroom-notes.js", "headroom-view-backup.json", "headroom-seen-mine.txt"];
-  const removed = await runWidget({ family: "medium", keychain, extraFiles: [...own, ...user], app: { menu: [3, 2] } });
+  const removed = await runWidget({ family: "medium", keychain, extraFiles: [...own, ...user], app: { menu: [3, 2, 1] } });
   assert.deepEqual([...removed.files.keys()].map((p) => p.split("/").pop()).sort(), [...user].sort());
   for (const name of user) assert.equal(lib.OWN_FILE.test(name), false, name);
   // Register the same URL again (D1 recreated, numbers start from 1)
@@ -782,7 +801,7 @@ test("If settings are deleted or re-saved during a fetch, the old settings' valu
 });
 
 
-test("Shows there is no 5h limit only for providers whose values were fetched; not when fetching failed or windows are named", async () => {
+test("Shows there is no 5h limit only for providers whose values were fetched; not when fetching failed; a limit named says so in its place", async () => {
   const groups = (v: unknown, param = "") => plain(lib.groupsOf(lib.sanitizeView(v), param, NOW));
   const view = sampleView();
   const codex = groups(view).find((g: any) => g.provider === "codex");
@@ -791,14 +810,13 @@ test("Shows there is no 5h limit only for providers whose values were fetched; n
   const failed = structuredClone(view);
   failed.codex!.status = "error";
   assert.ok(!JSON.stringify(groups(failed)).includes("Not available"), "doesn't claim it's missing when fetching failed");
-  assert.ok(!JSON.stringify(groups(view, "top")).includes("Not available"));
-  assert.ok(!JSON.stringify(groups(view, "codex.seven_day")).includes("Not available"));
+  assert.ok(!JSON.stringify(groups(view, "codex, wk")).includes("Not available"), "Codex has its weekly limit");
+  assert.deepEqual(groups(view, "codex, 5h")[0].rows, [{ kind: "missing", text: "Not available", label: "5h limit", fitLabel: "5h limit" }], "the 5h named: none");
   assert.ok(JSON.stringify(groups(view, "codex")).includes("Not available"));
-  // Shown in the small widget too
+  // Small uses the shortest limit every provider has (the weekly, Codex having no 5h), so it never needs Not available
   const small = await runWidget({ family: "small" });
   const st = texts(small.widget.node);
-  const i = st.indexOf("5h limit", st.indexOf("Codex"));
-  assert.ok(i >= 0 && st[i + 1] === "—", st.join(" | "));
+  assert.ok(st.filter((x) => x === "Wk limit").length === 2 && !st.includes("—"), st.join(" | "));
 });
 
 test("Headings are English, built from window length and scope; a missing provider value shows the reason", () => {
@@ -849,7 +867,7 @@ test("Large stacks full-width groups top to bottom (no confidence row); small pa
   assert.equal(large.widget.node.children.some((c: Node) => c.kind === "stack" && c.children.filter((x) => x.kind === "stack").length === 2 && texts(c).includes("Claude") && texts(c).includes("Codex")), false, "not two side-by-side columns");
   const small = await runWidget({ family: "small" });
   const all = texts(small.widget.node);
-  assert.ok(all.includes("Claude") && all.includes("Codex") && all.includes("90%"));
+  assert.ok(all.includes("Claude") && all.includes("Codex") && all.includes("98%"), all.join(" | "));
   assert.equal(JSON.stringify(small.widget.node).includes('"timer":true'), false);
 });
 
@@ -859,7 +877,156 @@ test("Icons: there is a line for scripts/build.ts to embed into, and embedded im
   const embedded = code.replace(marker, () => `const ICONS = {"claude":"QUJD","codex":"","gemini":""};`);
   const run = await runWidget({ family: "medium", code: embedded });
   const icons = images(run.widget.node).filter((n) => n.props.data || n.props.symbol);
-  assert.deepEqual(icons.filter((n) => n.props.symbol !== "arrow.clockwise").map((n) => n.props.data ?? n.props.symbol), ["terminal", "QUJD"], "Claude uses the embedded image, Codex SF Symbols");
+  const statusSymbols = Object.values(lib.TIME_SYMBOLS) as string[];
+  assert.deepEqual(icons.filter((n) => !statusSymbols.includes(n.props.symbol as string)).map((n) => n.props.data ?? n.props.symbol), ["terminal", "QUJD"], "Claude uses the embedded image, Codex SF Symbols");
+});
+
+test("Icons: a second set embedded beside the first; Settings › Display switches each provider's icon on every widget, for the whole iPhone", async () => {
+  const marker = /^const ICONS = \{ claude: "", codex: "", gemini: "" \}; \/\/ @icons$/m;
+  const altMarker = /^const ALT_ICONS = \{ claude: "", codex: "", gemini: "" \}; \/\/ @alt-icons$/m;
+  assert.ok(altMarker.test(code), "the line build.ts replaces");
+  const embedded = code.replace(marker, () => `const ICONS = {"claude":"QUJD","codex":"","gemini":""};`)
+    .replace(altMarker, () => `const ALT_ICONS = {"claude":"Q0w=","codex":"T1BFTg==","gemini":""};`);
+  const statusSymbols = Object.values(lib.TIME_SYMBOLS) as string[];
+  const used = (run: any) => images(run.widget.node).filter((n) => (n.props.data || n.props.symbol) && !statusSymbols.includes(n.props.symbol as string))
+    .map((n) => n.props.data ?? n.props.symbol);
+  const signedIn = { "headroom.url": "https://headroom.example.com", "headroom.token": "read-token-xyz" };
+  // not chosen: the default set
+  assert.deepEqual(plain(used(await runWidget({ family: "medium", code: embedded }))), ["terminal", "QUJD"]);
+  // chosen for Codex only: Codex's second icon, Claude its first
+  const chosen = await runWidget({ family: "medium", code: embedded, keychain: { ...signedIn, [lib.KEYCHAIN_ICONS]: "codex" } });
+  assert.deepEqual(plain(used(chosen)), ["T1BFTg==", "QUJD"]);
+  // for Claude only
+  const claudeOnly = await runWidget({ family: "medium", code: embedded, keychain: { ...signedIn, [lib.KEYCHAIN_ICONS]: "claude" } });
+  assert.deepEqual(plain(used(claudeOnly)), ["terminal", "Q0w="]);
+  // saved by an earlier version ("alt"): every provider's second, where it has one
+  const all = await runWidget({ family: "medium", code: embedded, keychain: { ...signedIn, [lib.KEYCHAIN_ICONS]: "alt" } });
+  assert.deepEqual(plain(used(all)), ["T1BFTg==", "Q0w="]);
+  // the lock screen too
+  const lock = await runWidget({ family: "accessoryRectangular", parameter: "codex, wk", code: embedded, keychain: { ...signedIn, [lib.KEYCHAIN_ICONS]: "alt" } });
+  assert.ok(images(lock.widget.node).some((n) => n.props.ring && n.props.data === "T1BFTg=="), "the ring's icon");
+  // without a second set the choice changes nothing, and Settings has no switch
+  const noSecond = await runWidget({ family: "medium", keychain: { ...signedIn, [lib.KEYCHAIN_ICONS]: "alt" } });
+  assert.deepEqual(plain(used(noSecond)), plain(used(await runWidget({ family: "medium" }))));
+  const plainMenu = await runWidget({ family: "medium", app: { menu: [3, 1] } });
+  assert.ok(!plainMenu.actionLabels.some((l: string) => l.includes(" icon: ")), plainMenu.actionLabels.join(" | "));
+  // Settings › Display: a line for each provider with a second icon (Codex, then Claude), each switched on its own
+  const on = await runWidget({ family: "medium", code: embedded, app: { menu: [3, 1, 2] } });
+  assert.ok(on.actionLabels.includes("Codex icon: Default") && on.actionLabels.includes("Claude icon: Default"), on.actionLabels.join(" | "));
+  assert.ok(!on.actionLabels.some((l: string) => l.startsWith("Gemini icon")), "no line without a second icon");
+  assert.equal(on.keychain.get(lib.KEYCHAIN_ICONS), "claude");
+  assert.ok(on.actionLabels.includes("Claude icon: Alternate"), "the menu shows the new choice");
+  const both = await runWidget({ family: "medium", code: embedded, keychain: { ...signedIn, [lib.KEYCHAIN_ICONS]: "claude" }, app: { menu: [3, 1, 1] } });
+  assert.equal(both.keychain.get(lib.KEYCHAIN_ICONS), "codex,claude");
+  const off = await runWidget({ family: "medium", code: embedded, keychain: { ...signedIn, [lib.KEYCHAIN_ICONS]: "claude" }, app: { menu: [3, 1, 2] } });
+  assert.equal(off.keychain.has(lib.KEYCHAIN_ICONS), false, "all on their first: no item left");
+  // Remove all settings also removes the choice
+  const removed = await runWidget({ family: "medium", code: embedded, keychain: { ...signedIn, [lib.KEYCHAIN_ICONS]: "codex" }, app: { menu: [3, 2, 1] } });
+  assert.ok(!removed.keychain.has("headroom.url") && !removed.keychain.has(lib.KEYCHAIN_ICONS), [...removed.keychain.keys()].join(" | "));
+});
+
+test("Icons: each is cut to what is visible; a wide one is drawn wider and shorter, as large to the eye as a square one", async () => {
+  // a PNG header of the given size, as base64 (the widget reads the shape from it)
+  const png = (w: number, h: number) => {
+    const head = Buffer.alloc(24);
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).copy(head, 0);
+    head.writeUInt32BE(13, 8);
+    head.write("IHDR", 12, "latin1");
+    head.writeUInt32BE(w, 16);
+    head.writeUInt32BE(h, 20);
+    return Buffer.concat([head, Buffer.from([8, 6, 0, 0, 0, 0, 0, 0])]).toString("base64");
+  };
+  assert.equal(lib.pngAspect(png(128, 82)), 128 / 82);
+  assert.equal(lib.pngAspect(png(128, 128)), 1);
+  assert.equal(lib.pngAspect("QUJD"), 1, "too short to read: square");
+  assert.equal(lib.pngAspect("!!!!" + png(128, 82).slice(4)), 1, "not base64: square");
+  // the same area as the square: wider and shorter; at most 1.5 × as wide; a tall one fits the height
+  const near = (a: number, b: number) => Math.abs(a - b) < 1e-9;
+  const wide = lib.iconBox(1.6, 20);
+  assert.ok(near(wide.w * wide.h, 400) && near(wide.w / wide.h, 1.6), JSON.stringify(wide));
+  assert.deepEqual(plain(lib.iconBox(1, 20)), { w: 20, h: 20 });
+  const long = lib.iconBox(4, 20);
+  assert.ok(near(long.w, 30) && near(long.w / long.h, 4), JSON.stringify(long));
+  assert.deepEqual(plain(lib.iconBox(0.5, 20)), { w: 10, h: 20 });
+  // on the widget: a wide Claude icon in the header, drawn wider at the square's area
+  const marker = /^const ICONS = \{ claude: "", codex: "", gemini: "" \}; \/\/ @icons$/m;
+  const embedded = code.replace(marker, () => `const ICONS = {"claude":"${png(128, 80)}","codex":"${png(64, 64)}","gemini":""};`);
+  const run = await runWidget({ family: "medium", code: embedded });
+  const sizeOf = (data: string) => images(run.widget.node).find((n) => n.props.data === data)!.props.imageSize as any;
+  const claude = sizeOf(png(128, 80)), codex = sizeOf(png(64, 64));
+  assert.ok(near(claude.w / claude.h, 1.6) && near(claude.w * claude.h, codex.w * codex.h), JSON.stringify([claude, codex]));
+  assert.equal(codex.w, codex.h, "a square one as before");
+  // in a ring: the same shape, centred where the square icon was
+  const lock = await runWidget({ family: "accessoryRectangular", parameter: "claude, wk", code: embedded });
+  const ring = images(lock.widget.node).find((n) => n.props.ring)!;
+  const rect = ring.props.iconRect as any;
+  const geom = lib.LOCK_RINGS.rectangular;
+  assert.ok(near(rect.w / rect.h, 1.6) && near(rect.w * rect.h, geom.icon ** 2), JSON.stringify(rect));
+  assert.ok(near(rect.x + rect.w / 2, geom.size / 2) && near(rect.y + rect.h / 2, geom.size / 2), "centred");
+  // on the details page: the wide one's box is wider at the same height
+  assert.ok(!/width:calc/.test(lib.iconCss()), "no embedded icons: tiles as before");
+  const module = { exports: {} as Lib };
+  vm.runInContext(`(async () => {\n${embedded}\n})()`, vm.createContext({ module, console, Intl, Date, Math, JSON, encodeURIComponent, Number, String, Object, Boolean }));
+  const css: string = module.exports.iconCss();
+  const factor = Math.round(Math.sqrt(1.6) * 1000) / 1000;
+  assert.ok(css.includes(`center/contain no-repeat;width:calc(var(--s)*${factor});margin:0 calc(var(--s)*0)}`), css.replace(/base64,[^)]*/g, "…"));
+  // every icon in the slot of the widest (its width and side margins add up to it): a square one centred with margins, and an
+  // element without a provider's icon too; so in the history's rows and the headers, what follows an icon starts at one place
+  const margin = Math.round(((factor - 1) / 2) * 1000) / 1000;
+  assert.ok(new RegExp(`\\.ic-codex\\{background:url\\([^)]*\\) center/contain no-repeat;margin:0 calc\\(var\\(--s\\)\\*${margin}\\)\\}`).test(css), css.replace(/base64,[^)]*/g, "…"));
+  assert.ok(css.startsWith(`.ic{margin:0 calc(var(--s)*${margin})}`), "the base (an event without a provider)");
+  assert.ok(new RegExp(`\\.ic-gemini\\{background:#[0-9A-Fa-f]{6};border-radius:28%;margin:0 calc\\(var\\(--s\\)\\*${margin}\\)\\}`).test(css), "a tile too");
+  assert.equal(module.exports.iconSlot(), Math.sqrt(1.6));
+  assert.equal(lib.iconSlot(), 1, "all square: no slot wider than the icon");
+  // the home header: the square icon centred in a slot as wide as the wide one, so the names start at the same place
+  const stacks = (node: any): any[] => [...(node.kind === "stack" ? [node] : []), ...node.children.flatMap(stacks)];
+  const before = (data: string) => {
+    const header = stacks(run.widget.node).find((x) => x.children.some((c: any) => c.kind === "image" && c.props.data === data))!;
+    const lead = header.children.slice(0, header.children.findIndex((c: any) => c.kind === "stack"));
+    return lead.reduce((sum: number, c: any) => sum + (c.kind === "spacer" ? c.props.length : (c.props.imageSize as any).w), 0);
+  };
+  assert.ok(near(before(png(128, 80)), before(png(64, 64))), String([before(png(128, 80)), before(png(64, 64))]));
+});
+
+test("A limit named that a provider hasn't, with another named, draws in every size; notify after spaces; only the table's words; no history without a chart", async () => {
+  const now = new Date("2026-11-16T13:05:00.000Z");
+  const view = lib.demoResult("no5h", now).view;
+  const no5h = { status: 200, body: { ...view, data_version: 1, view_version: 1 } };
+  for (const [parameter, rows] of [["codex, 5h, wk", ["missing", "seven_day"]], ["codex, wk, 5h", ["seven_day", "missing"]]] as const) {
+    for (const family of ["small", "medium", "large"]) {
+      const run = await runWidget({ family, parameter, response: no5h, now });
+      assert.equal(run.error, null, `${parameter} ${family}: ${run.error}`);
+    }
+    const codex = lib.groupsOf(view, parameter, now).find((g: any) => g.provider === "codex");
+    assert.deepEqual(plain(codex.rows.map((r: any) => (r.kind === "window" ? r.window.id : r.kind))), rows, parameter);
+  }
+  // notify after spaces, as after commas (as the parameter is read)
+  assert.deepEqual(plain(lib.splitNotify("claude 5h notify")), { display: "claude, 5h", notify: true });
+  assert.deepEqual(plain(lib.splitNotify("claude, 5h, notify")), { display: "claude, 5h", notify: true });
+  assert.equal(lib.splitNotify("claude 5h").notify, false);
+  // a word an object has of its own (constructor) is unknown, not a limit
+  const q = lib.parseParameter("codex, constructor");
+  assert.deepEqual(plain([q.limits, q.unknown]), [[], ["constructor"]]);
+  // no weekly history is read for a large widget that draws no chart (most)
+  const three = lib.demoResult("three", now).view;
+  assert.deepEqual(plain(lib.trendWindows(three, "large", "most, 5h", now)), {});
+  assert.ok(Object.keys(lib.trendWindows(three, "large", "", now)).length > 0, "the chart's histories otherwise");
+});
+
+test("Settings › Display: an icon setting that can't be read is left as it is; a saved provider without a second icon keeps its place", async () => {
+  const marker = /^const ICONS = \{ claude: "", codex: "", gemini: "" \}; \/\/ @icons$/m;
+  const altMarker = /^const ALT_ICONS = \{ claude: "", codex: "", gemini: "" \}; \/\/ @alt-icons$/m;
+  const embedded = code.replace(marker, () => `const ICONS = {"claude":"QUJD","codex":"","gemini":""};`)
+    .replace(altMarker, () => `const ALT_ICONS = {"claude":"Q0w=","codex":"T1BFTg==","gemini":""};`);
+  const signedIn = { "headroom.url": "https://headroom.example.com", "headroom.token": "read-token-xyz" };
+  // Codex's line while the setting can't be read: nothing written, said so
+  const unread = await runWidget({ family: "medium", code: embedded, keychain: { ...signedIn, [lib.KEYCHAIN_ICONS]: "codex,claude" },
+    keychainGetFailsFor: lib.KEYCHAIN_ICONS, app: { menu: [3, 1, 1] } } as any);
+  assert.equal(unread.keychain.get(lib.KEYCHAIN_ICONS), "codex,claude");
+  assert.ok(unread.alertTitles.includes("Can't read"), unread.alertTitles.join(" | "));
+  // Gemini saved (no second icon in this build) stays when Claude is switched
+  const kept = await runWidget({ family: "medium", code: embedded, keychain: { ...signedIn, [lib.KEYCHAIN_ICONS]: "gemini,codex" }, app: { menu: [3, 1, 2] } });
+  assert.equal(kept.keychain.get(lib.KEYCHAIN_ICONS), "codex,claude,gemini");
 });
 
 test("Bar joins: the previous piece's right end is rounded and the next piece's left end is concave along it (neither is a vertical line)", () => {
@@ -923,22 +1090,25 @@ test("7-day weekly trend: validates the response and splits lines at each break"
   assert.deepEqual(lines[0][1], [99.4, 15.1], "12:00 (167/168 of 7 days; default is the weekly limit's 7 days), 20% (inside the 1.5 margin top and bottom)");
 });
 
-test("Per-size content: small is compact with one forecast; medium adds reset, marks, forecast and last update; large also adds rate, scoped limits and trend", async () => {
+test("Per-size content: small is compact with one forecast; medium adds reset, marks, forecast and last update; large also adds scoped limits and trend", async () => {
   const later = new Date("2026-11-16T13:05:00.000Z");
   const small = await runWidget({ family: "small", response: { status: 200, body: forecastView() }, now: later });
   const s = texts(small.widget.node);
   assert.ok(!s.some((x) => x.startsWith("Resets")) && !s.includes("Max") && !s.some((x) => x.startsWith("Updated")), s.join(" | "));
   assert.ok(!s.some((x) => /runs out|Runs out|[AP]M/.test(x)), "small doesn't show the run-out time");
+  // one limit each, the shortest every provider has: Codex has no 5h, so the weekly for both (no Not available)
+  assert.deepEqual(s.filter((x) => /limit$/.test(x)), ["Wk limit", "Wk limit"], s.join(" | "));
+  assert.ok(!s.includes("—"), s.join(" | "));
   assert.ok(s.includes(`${lib.WARN_MARK} 71%`), "small puts ⚠️ on the remaining number of a limit likely to run out");
 
   const medium = await runWidget({ family: "medium", response: { status: 200, body: forecastView() }, now: later });
   const m = texts(medium.widget.node);
-  assert.ok(m.includes("Max") && images(medium.widget.node).some((n) => n.props.symbol === lib.TIME_SYMBOLS.warn), m.join(" | "));
+  assert.ok(!m.includes("Max") && images(medium.widget.node).some((n) => n.props.symbol === lib.TIME_SYMBOLS.warn), m.join(" | "));
   assert.equal(images(medium.widget.node).filter((n) => n.props.symbol === lib.TIME_SYMBOLS.warn).length, 1, "only limits likely to run out replace the reset time with ⚠ and the run-out time");
   assert.ok(!m.some((x) => x.startsWith("⚠")), "no ⚠ on the remaining number (medium, large)");
   assert.ok(!m.some((x) => x.startsWith("Updated") || x === "Lasts until reset"), "less text");
   assert.ok(!m.some((x) => x.includes("%/h")), "medium doesn't show the rate");
-  assert.ok(!m.includes("Fable weekly"), "medium shows scoped limits only at 100%");
+  assert.ok(!m.includes("Fable wk"), "medium shows scoped limits only at 100%");
 
   const history = (url: string) => {
     if (!url.includes("/v2/history")) return undefined;
@@ -951,8 +1121,8 @@ test("Per-size content: small is compact with one forecast; medium adds reset, m
   };
   const large = await runWidget({ family: "large", response: { status: 200, body: forecastView() }, responder: history, now: later });
   const l = texts(large.widget.node);
-  assert.ok(l.some((x) => x.includes("%/h")), l.join(" | "));
-  assert.ok(l.includes("Fable weekly"), "large always shows scoped limits");
+  assert.ok(!l.some((x) => x.includes("%/h")) && !l.includes("Max"), "the rate and the plan are in the details only");
+  assert.ok(l.includes("Fable wk") && !l.includes("Fable weekly"), "large always shows scoped limits, their length short");
   assert.ok(l.includes("Weekly usage") && l.includes("Claude") && l.includes("Codex"), l.join(" | "));
   const asked = large.requests.map((r: any) => r.url).filter((u: string) => u.includes("/v2/history")).map((u: string) => new URL(u).searchParams.get("window"));
   assert.deepEqual(asked, ["seven_day", "seven_day"], "Claude and Codex overlay the same weekly trend (Codex has no 5h)");
@@ -1001,7 +1171,7 @@ test("Small: content is centered (even padding) with a fixed gap between Claude 
   assert.deepEqual(page.children.map((c: Node) => (c.kind === "spacer" ? `spacer:${c.props.length ?? "flex"}` : c.kind)), ["spacer:flex", "stack", "spacer:flex"], "centered horizontally too");
   const body = page.children[1]!;
   assert.equal((body.props.size as any).w, 158 - 2 * lib.PADDING.small, "inner width (the 390 row when the screen width is unknown)");
-  const gapIndex = body.children.findIndex((c: Node) => c.kind === "spacer" && c.props.length === 8);
+  const gapIndex = body.children.findIndex((c: Node) => c.kind === "spacer" && c.props.length === 10);
   assert.ok(gapIndex > 0 && texts({ kind: "x", children: body.children.slice(0, gapIndex), props: {} } as Node).includes("Codex"));
   assert.ok(texts({ kind: "x", children: body.children.slice(gapIndex), props: {} } as Node).includes("Claude"));
   const large = await runWidget({ family: "large" });
@@ -1036,7 +1206,7 @@ test("Medium: freshness dots are inside the content frame too. Large: two column
   const inner = 338 - 2 * lib.PADDING.large;
   const cols = columnsOf(large.widget.node);
   assert.equal(cols.length, 2, "large also puts Claude and Codex side by side");
-  assert.ok(texts(cols[0]!).includes("5h limit") && texts(cols[1]!).includes("Weekly limit"));
+  assert.ok(texts(cols[0]!).includes("5h limit") && texts(cols[1]!).includes("Wk limit"));
   const chart = images(large.widget.node).find((n) => (n.props.size as any)?.w === inner && (n.props.strokes as number) > 0);
   assert.ok(chart, "lines are drawn in one full-width chart");
   assert.ok((chart!.props.strokes as number) >= 2 + 3, "two lines (plus guide lines) are overlaid");
@@ -1117,7 +1287,8 @@ test("Even small puts ↻ before limits that are reset (estimated), and the head
   const view = sampleView();
   view.claude!.windows.five_hour!.fetched_at = "2026-11-16T15:35:00.000Z";
   view.claude!.windows.seven_day!.fetched_at = "2026-11-16T16:00:00.000Z";
-  const run = await runWidget({ family: "small", response: { status: 200, body: view }, now: new Date("2026-11-16T16:01:00.000Z") });
+  // Claude alone keeps its rows, its 5h reset among them
+  const run = await runWidget({ family: "small", parameter: "claude", response: { status: 200, body: view }, now: new Date("2026-11-16T16:01:00.000Z") });
   assert.ok(texts(run.widget.node).includes("↻ 100%"), texts(run.widget.node).join(" | "));
   assert.deepEqual(plain(lib.freshnessOf(lib.sanitizeView(view), "claude", new Date("2026-11-16T16:01:00.000Z"))), { level: "stale", text: "26m" });
 });
@@ -1191,10 +1362,10 @@ test("When rows run short, keep overall limits -> the no-5h row -> scoped limits
   assert.deepEqual(ids(3), ["missing", "seven_day", "codex_other_seven_day"]);
 });
 
-test("When limits are named, the freshness dot uses the fetch times of the shown limits", async () => {
+test("When a limit is named, the freshness dot uses the fetch times of the shown limits", async () => {
   const view = sampleView();
-  view.claude!.windows.seven_day_fable!.fetched_at = "2026-11-16T12:30:00.000Z";
-  const run = await runWidget({ family: "small", parameter: "claude.seven_day_fable", response: { status: 200, body: view } });
+  view.claude!.windows.seven_day!.fetched_at = "2026-11-16T12:30:00.000Z";
+  const run = await runWidget({ family: "small", parameter: "claude, wk", response: { status: 200, body: view } });
   assert.ok(texts(run.widget.node).includes("30m"), texts(run.widget.node).join(" | "));
 });
 
@@ -1259,7 +1430,9 @@ test("The forecast rate is the server's rate_pace as is, not re-selected from ro
 test("After limiting rows, the shown limits decide the header dot and the trend window", async () => {
   const view = sampleView();
   view.claude!.windows.seven_day_fable!.fetched_at = "2026-11-16T11:00:00.000Z";
-  const param = "claude.seven_day_fable,claude.five_hour,claude.seven_day,codex.seven_day";
+  // Fable at 100% is shown after the overall limits (medium shows per-model limits only at 100%)
+  view.claude!.windows.seven_day_fable!.used_percent = 100;
+  const param = "claude, codex";
   const layout = lib.layoutGroups(lib.sanitizeView(view), "medium", param, NOW, { screen: { width: 320, height: 568 } });
   const claude = layout.groups.find((g: any) => g.provider === "claude");
   assert.deepEqual(plain(claude.rows.map((r: any) => r.window.id)), ["five_hour", "seven_day"], "scoped limits dropped for lack of height");
@@ -1309,10 +1482,10 @@ test("All chart lines have the same width", async () => {
   assert.deepEqual(lineWidths, [2.5, 2.5], "same width");
 });
 
-test("(After fixing the chart to weekly) even when only a scoped limit is named, the chart shows that provider's weekly limit for 7 days", async () => {
-  const run = await runWidget({ family: "large", parameter: "claude.seven_day_fable", responder: historyFor([{ at: "2026-11-16T12:00:00.000Z", used_percent: 1 }]) });
+test("(After fixing the chart to weekly) with one provider named, the chart shows that provider's weekly limit for 7 days", async () => {
+  const run = await runWidget({ family: "large", parameter: "claude", responder: historyFor([{ at: "2026-11-16T12:00:00.000Z", used_percent: 1 }]) });
   const all = texts(run.widget.node);
-  assert.ok(all.includes("Fable weekly") && all.includes("Weekly usage") && all.includes("Claude"), all.join(" | "));
+  assert.ok(all.includes("Fable wk") && all.includes("Weekly usage") && all.includes("Claude"), all.join(" | "));
   const asked = run.requests.map((r: any) => r.url).filter((u: string) => u.includes("/v2/history")).map((u: string) => new URL(u).searchParams.get("window"));
   assert.deepEqual(asked, ["seven_day"]);
 });
@@ -1331,13 +1504,12 @@ test("Widening the first piece stays inside the bar, below 1% shows a decimal, a
   assert.equal(point, lib.trendY(25, height, 3), "the 25% point and guide line are at the same height");
 });
 
-test("The rate is omitted when showing the run-out time or when the column is narrow", async () => {
+test("The rate is in the details only (the widget shows the run-out time, never the rate)", async () => {
   const view = forecastView();
   const wide = await runWidget({ family: "large", response: { status: 200, body: view }, now: new Date("2026-11-16T13:05:00.000Z") });
   const all = texts(wide.widget.node);
   assert.ok(images(wide.widget.node).some((n) => n.props.symbol === lib.TIME_SYMBOLS.warn), "Codex shows the run-out time");
-  assert.ok(all.includes("33%/h"), "the rate is at the right end of the time row (also on rows likely to run out)");
-  assert.ok(all.some((x) => x.includes("0.4%/h")), "shown on Claude's row");
+  assert.ok(!all.some((x) => x.includes("%/h")), "no rate on the widget");
   const narrow = await runWidget({ family: "large", response: { status: 200, body: view }, now: new Date("2026-11-16T13:05:00.000Z"), screen: 320 });
   assert.ok(!texts(narrow.widget.node).some((x) => x.includes("%/h")), "the rate is omitted on devices with columns narrower than 140pt");
 });
@@ -1345,7 +1517,7 @@ test("The rate is omitted when showing the run-out time or when the column is na
 test("If one trend is missing it uses a short label; if both are missing, one line", async () => {
   const partial = await runWidget({ family: "large", responder: (url) => (url.includes("provider=codex") ? { status: 503, body: "" } : historyFor([{ at: "2026-11-16T12:00:00.000Z", used_percent: 4 }])(url)) });
   const p = texts(partial.widget.node);
-  assert.ok(p.includes("Weekly usage") && p.includes("Claude") && p.includes("Codex –"), p.join(" | "));
+  assert.ok(p.includes("Weekly usage") && p.includes("Claude") && p.includes("Codex") && !p.some((x) => x.endsWith(" –")), p.join(" | "));
   const none = await runWidget({ family: "large", responder: (url) => (url.includes("/v2/history") ? { status: 503, body: "" } : undefined) });
   assert.ok(texts(none.widget.node).includes("No weekly data yet") && !texts(none.widget.node).includes("Last 24h"));
 });
@@ -1483,13 +1655,13 @@ test("Large/medium: limit names and time rows use the same font size across the 
 test("Demo: draws every state with made-up values only (no network, no saving; Demo in the header and on the lock screen)", async () => {
   const now = new Date("2026-11-16T13:05:00.000Z");
   const expect: Record<string, RegExp> = {
-    normal: /Fable weekly/, runout: /Weekly limit/, no5h: /Not available|5h limit/, stale: /^30m$|30m ago/,
+    normal: /Fable wk/, runout: /Wk limit/, no5h: /Not available|5h limit/, stale: /^30m$|30m ago/,
     reset: /Reset \(est\.\)|^0%$/, offline: /Can't update/, error: /Sign in required/, nochart: /No weekly data yet/,
-    three: /^Argon weekly$/, unsupported: /^Not supported$/,
+    three: /^Argon wk$/, unsupported: /^Not supported$/, reached: /^0%$/, firstuse: /On first use/, attention: /Paused|Sign in required/,
   };
   for (const s of lib.DEMO_SCENARIOS) {
     for (const family of ["small", "medium", "large", "accessoryRectangular", "accessoryCircular", "accessoryInline"]) {
-      const run = await runWidget({ family, parameter: `demo:${s.name}`, now });
+      const run = await runWidget({ family, demo: s.name, now });
       assert.equal(run.error, null, `${s.name} ${family}: ${run.error}`);
       assert.equal(run.requests.length, 0, `${s.name} ${family}: no network`);
       assert.equal([...run.files.keys()].filter((p) => p.includes("headroom-view")).length, 0, `${s.name} ${family}: no saving`);
@@ -1498,17 +1670,17 @@ test("Demo: draws every state with made-up values only (no network, no saving; D
       if (family === "large") assert.ok(all.some((x) => expect[s.name]!.test(x)), `${s.name}: ${all.join(" | ")}`);
     }
   }
-  assert.equal(lib.demoName("demo"), "runout");
-  assert.equal(lib.demoName(" Demo:Stale "), "stale");
-  assert.equal(lib.demoName("demo:unknown"), "runout");
-  assert.equal(lib.demoName("claude"), null);
-  const chart = await runWidget({ family: "large", parameter: "demo:normal", now });
+  // The widget's parameter has no demo (the app's Preview sample data shows the samples): the word is said to be unknown, and the
+  // values are the real ones
+  const word = await runWidget({ family: "medium", parameter: "demo:normal" });
+  assert.ok(texts(word.widget.node).includes("Unknown: demo:normal") && word.requests.length === 1, texts(word.widget.node).join(" | "));
+  const chart = await runWidget({ family: "large", demo: "normal", now });
   assert.ok(images(chart.widget.node).some((n) => (n.props.strokes as number) >= 5), "draws the demo 7-day trend");
 });
 
 test("The app menu's 'Preview widget' > 'Sample data': choose a sample and sizes to show, and choose again after closing (no network)", async () => {
-  // Menu: Preview widget -> Sample data -> runs out -> Large -> Back -> stale -> Small -> Back, Back, Back, Close
-  const run = await runWidget({ family: "medium", runsInWidget: false, app: { menu: [1, 1, 1, 2, -1, 3, 0] } } as any);
+  // Menu: Preview widget -> Sample data -> runs out -> Large -> Back -> old values -> Small -> Back, Back, Back, Close
+  const run = await runWidget({ family: "medium", runsInWidget: false, app: { menu: [1, 1, 2, 2, -1, 7, 0] } } as any);
   assert.equal(run.error, null, String(run.error));
   assert.deepEqual(run.shownSizes, ["large", "small"]);
   assert.equal(run.requests.length, 0);
@@ -1528,7 +1700,7 @@ test("If it will run out, the run-out time replaces the reset time in the same f
   assert.deepEqual(plain(lib.timeShort(five, now)), { warn: true, kind: "timer", date: new Date(p5.at).toISOString() });
   assert.deepEqual(plain(lib.timeShort(week, now)), { warn: true, kind: "text", text: lib.clockText(new Date(pw.at), now).replace(":00 ", " ") });
   assert.equal(lib.timeShort(view.claude.windows.seven_day, now).warn, false, "a limit that lasts shows the reset time");
-  const run = await runWidget({ family: "medium", parameter: "demo:runout", now });
+  const run = await runWidget({ family: "medium", demo: "runout", now });
   assert.equal(images(run.widget.node).filter((n) => n.props.symbol === lib.TIME_SYMBOLS.warn).length, 2, "Claude 5h and Codex weekly");
   assert.equal(images(run.widget.node).filter((n) => n.props.symbol === lib.TIME_SYMBOLS.reset).length, 2, "the others show reset");
   assert.ok(JSON.stringify(run.widget.node).includes(`"date":"${new Date(p5.at).toISOString()}","timer":true`), "countdown to run-out");
@@ -1547,7 +1719,7 @@ test("Asks to be redrawn at the drawn warning's run-out time; limits not shown d
   const body = { ...view, data_version: 1, view_version: 1 };
   const run = await runWidget({ family: "medium", response: { status: 200, body }, now });
   assert.equal((run.widget as any).refreshAfterDate.getTime(), Date.parse(view.claude.windows.five_hour.fetched_at) + 6 * 60000);
-  const only = await runWidget({ family: "medium", parameter: "codex.five_hour", response: { status: 200, body }, now });
+  const only = await runWidget({ family: "medium", parameter: "codex, 5h", response: { status: 200, body }, now });
   assert.equal((only.widget as any).refreshAfterDate.getTime(), now.getTime() + 15 * 60000, texts(only.widget.node).join(" | "));
 });
 
@@ -1556,11 +1728,11 @@ test("Weekday times in narrow columns stay at 0.7x or more; demos that failed to
   const s = lib.SCALES.large;
   const need = s.small + 1 + lib.textWidth("Fri 22:01", s.small);
   assert.ok(123 / need >= 0.7, String(need));
-  const off = await runWidget({ family: "large", parameter: "demo:offline", now });
+  const off = await runWidget({ family: "large", demo: "offline", now });
   assert.ok(texts(off.widget.node).includes("No weekly data yet"), texts(off.widget.node).join(" | "));
 });
 
-test("Lock screen: circular progress around the icon. The rectangle shows the one limit with the least remaining; the circle shows remaining inside", async () => {
+test("Lock screen: circular progress around the icon. The rectangle shows the one limit with the least remaining; the circle shows the limit's name inside", async () => {
   const later = new Date("2026-11-16T13:30:00.000Z"); // 30 minutes after the fetch
   const rect = await runWidget({ family: "accessoryRectangular", now: later });
   const rings = images(rect.widget.node).filter((n) => n.props.ring);
@@ -1568,14 +1740,14 @@ test("Lock screen: circular progress around the icon. The rectangle shows the on
   // The test script has no PNG embedded, so the ring holds the initial (the icon if there is a PNG)
   assert.ok(rings[0]!.props.data || (rings[0]!.props.drawnTexts as string[]).includes("X"), "the icon is inside the ring");
   const r = texts(rect.widget.node);
-  assert.ok(r.includes("Codex · Weekly") && r.includes("71%") && r.includes("31m"), r.join(" | "));
+  assert.ok(r.includes("Wk limit") && !r.some((x) => x.includes("Codex")) && r.includes("71%") && r.includes("31m"), r.join(" | "));
   assert.ok(images(rect.widget.node).some((n) => n.props.symbol === lib.TIME_SYMBOLS.reset), "reset time");
   const inline = await runWidget({ family: "accessoryInline", parameter: "codex" });
-  assert.deepEqual(texts(inline.widget.node), ["Codex Wk 71%"]);
+  assert.deepEqual(texts(inline.widget.node), ["Codex wk 71% · ↻ Fri 19:51"], "one limit: the provider, the limit, what is left and its time");
   const circular = await runWidget({ family: "accessoryCircular", now: later });
   const ring = images(circular.widget.node).find((n) => n.props.ring);
-  assert.equal((ring?.props.drawnTexts as string[]).at(-1), "71%", "remaining is inside the ring (below the icon)");
-  assert.deepEqual(texts(circular.widget.node), ["Wk 31m"]);
+  assert.equal((ring?.props.drawnTexts as string[]).at(-1), "wk", "the limit's name is inside the ring (below the icon)");
+  assert.deepEqual(texts(circular.widget.node), ["71% 31m"], "what is left under it");
   // The ring is the shown limit's remaining (matches the number)
   const now = new Date("2026-11-16T13:05:00.000Z");
   const view = lib.demoResult("runout", now).view;
@@ -1585,7 +1757,7 @@ test("Lock screen: circular progress around the icon. The rectangle shows the on
   // The icon is small to leave space inside the ring
   for (const g of Object.values(lib.LOCK_RINGS) as any[]) assert.ok(g.icon <= (g.size - 2 * g.width) * 0.5, JSON.stringify(g));
   // If it will run out, the rectangle also shows ⚠ in place of the reset time
-  const warn = await runWidget({ family: "accessoryRectangular", parameter: "demo:runout", now });
+  const warn = await runWidget({ family: "accessoryRectangular", demo: "runout", now });
   assert.ok(images(warn.widget.node).some((n) => n.props.symbol === lib.TIME_SYMBOLS.warn), texts(warn.widget.node).join(" | "));
 });
 
@@ -1600,16 +1772,16 @@ test("Lock screen marks stack reset estimate, staleness and approximation (also 
   assert.equal(lib.shortMark({ value_status: "reset_estimated" }, true), "", "left to the time row (↻ Reset) where there is one");
   const cached = JSON.stringify({ saved_at: NOW.toISOString(), origin: "https://headroom.example.com", view: lib.sanitizeView(sampleView()) });
   const late = new Date("2026-11-16T16:30:00.000Z");
-  const inline = await runWidget({ family: "accessoryInline", parameter: "claude.five_hour", response: null, cached, now: late });
+  const inline = await runWidget({ family: "accessoryInline", parameter: "claude, 5h", response: null, cached, now: late });
   assert.equal(texts(inline.widget.node)[0], "⚠︎ Claude 5h ↻100%");
-  const circular = await runWidget({ family: "accessoryCircular", parameter: "claude.five_hour", response: null, cached, now: late });
-  assert.deepEqual(texts(circular.widget.node), ["5h ⚠︎ ↻"]);
-  assert.equal((images(circular.widget.node).find((n) => n.props.ring)?.props.drawnTexts as string[]).at(-1), "100%");
-  const rect = await runWidget({ family: "accessoryRectangular", parameter: "claude.five_hour", response: null, cached, now: late });
+  const circular = await runWidget({ family: "accessoryCircular", parameter: "claude, 5h", response: null, cached, now: late });
+  assert.deepEqual(texts(circular.widget.node), ["100% ⚠︎ ↻"]);
+  assert.equal((images(circular.widget.node).find((n) => n.props.ring)?.props.drawnTexts as string[]).at(-1), "5h");
+  const rect = await runWidget({ family: "accessoryRectangular", parameter: "claude, 5h", response: null, cached, now: late });
   assert.ok(texts(rect.widget.node).some((x) => x.includes("Can't update")), texts(rect.widget.node).join(" | "));
   assert.ok(texts(rect.widget.node).includes("↻"), "with no time row (the failure note instead), ↻ goes next to the value");
   const fresh = { ...lib.sanitizeView(sampleView()), data_version: 1, view_version: 1 };
-  const reset = await runWidget({ family: "accessoryRectangular", parameter: "claude.five_hour", response: { status: 200, body: fresh }, now: late });
+  const reset = await runWidget({ family: "accessoryRectangular", parameter: "claude, 5h", response: { status: 200, body: fresh }, now: late });
   const all = texts(reset.widget.node);
   assert.ok(all.includes("Reset") && !all.includes("↻"), all.join(" | "));
 });
@@ -1620,53 +1792,129 @@ test("Without embedded icons, the provider's initial is drawn inside the ring (n
   assert.ok((ring?.props.drawnTexts as string[] | undefined)?.some((x: string) => x === "C" || x === "X"), JSON.stringify(ring?.props.drawnTexts));
 });
 
-test("Lock screen parameter: choose 5h, weekly or a provider; up to two with a comma, + or both", () => {
+test("Lock screen parameter: only the providers' own 5h and weekly limits; providers named, a limit named, and others", () => {
   const now = new Date("2026-11-16T13:05:00.000Z");
-  const view = lib.demoResult("runout", now).view; // Claude 5h 30%, weekly 70%; Codex 5h 85%, weekly 35%
-  const pick = (p: string) => [...lib.lockPicks(view, p, now)].map((x: any) => (x.missing ? `${x.provider}:missing` : `${x.provider}.${x.window.id}`));
+  const view = lib.demoResult("runout", now).view; // left: Claude 5h 30%, weekly 70%; Codex 5h 85%, weekly 35%
+  const pick = (p: string, v: any = view) => [...lib.lockPicks(v, p, now)].map((x: any) => (x.missing ? `${x.provider}:missing` : `${x.provider}.${x.window.id}`));
   assert.deepEqual(pick(""), ["claude.five_hour"], "empty is the limit with the least remaining");
-  assert.deepEqual(pick("weekly"), ["codex.seven_day"], "the weekly limit with less remaining");
+  assert.deepEqual(pick("wk"), ["codex.seven_day"], "that limit, of the provider with the least left");
+  assert.deepEqual(pick("weekly"), ["codex.seven_day"], "weekly reads as wk");
   assert.deepEqual(pick("5h"), ["claude.five_hour"]);
-  assert.deepEqual(pick("Codex Weekly"), ["codex.seven_day"]);
-  assert.deepEqual(pick("claude"), ["claude.five_hour"], "without a limit, the provider's limit with the least remaining");
-  assert.deepEqual(pick("claude 5h, codex 5h"), ["claude.five_hour", "codex.five_hour"]);
-  assert.deepEqual(pick("codex 5h + codex weekly"), ["codex.five_hour", "codex.seven_day"]);
-  assert.deepEqual(pick("both weekly"), ["codex.seven_day", "claude.seven_day"], "both is Codex -> Claude");
-  assert.deepEqual(pick("both"), ["codex.seven_day", "claude.five_hour"]);
-  assert.deepEqual(pick("claude.seven_day"), ["claude.seven_day"], "older form");
-  assert.deepEqual(pick("a, b, c"), ["claude.five_hour", "claude.five_hour"], "a third and later are ignored");
+  assert.deepEqual(pick("Codex WK"), ["codex.seven_day"], "any order, case and separator");
+  assert.deepEqual(pick("claude"), ["claude.five_hour"], "a provider named: its tightest");
+  assert.deepEqual(pick("claude, codex, 5h"), ["claude.five_hour", "codex.five_hour"], "two named: side by side, in their order");
+  assert.deepEqual(pick("codex claude"), ["codex.seven_day", "claude.five_hour"]);
+  // others: the providers other than the one with the least left (a rectangle beside one of that one)
+  assert.deepEqual(pick("5h, others"), ["codex.five_hour"]);
+  assert.deepEqual(pick("wk, others"), ["claude.seven_day"]);
+  assert.deepEqual(pick("others"), ["codex.seven_day"]);
+  assert.deepEqual(pick("a, b, c"), ["claude.five_hour"], "words not understood are left out");
+  // per-model limits never, even at 100%
+  const normal = lib.demoResult("normal", now).view;
+  normal.claude.windows.seven_day_fable.used_percent = 100;
+  assert.ok(pick("claude", normal).every((k) => k === "claude.five_hour" || k === "claude.seven_day"), JSON.stringify(pick("claude", normal)));
   const no5h = lib.demoResult("no5h", now).view;
-  assert.deepEqual([...lib.lockPicks(no5h, "codex 5h", now)].map((x: any) => x.missing), [true], "pair without the limit");
+  assert.deepEqual(pick("codex, 5h", no5h), ["codex:missing"], "a limit the provider hasn't");
 });
 
 test("Two side by side in the lock screen rectangle: each has a ring (icon and remaining), limit name and time row; each ring shows its own remaining", async () => {
   const now = new Date("2026-11-16T13:05:00.000Z");
-  const run = await runWidget({ family: "accessoryRectangular", parameter: "demo:runout", now });
+  const run = await runWidget({ family: "accessoryRectangular", demo: "runout", now });
   assert.equal(images(run.widget.node).filter((n) => n.props.ring).length, 1, "the demo default is one");
   const view = lib.demoResult("runout", now).view;
   const body = { ...view, data_version: 1, view_version: 1 };
-  const pair = await runWidget({ family: "accessoryRectangular", parameter: "claude 5h + claude weekly", response: { status: 200, body }, now });
+  const pair = await runWidget({ family: "accessoryRectangular", parameter: "claude, codex, 5h", response: { status: 200, body }, now });
   const rings = images(pair.widget.node).filter((n) => n.props.ring);
   assert.equal(rings.length, 2);
-  assert.deepEqual(rings.map((n) => (n.props.drawnTexts as string[]).at(-1)), ["30%", "70%"], "each ring shows its limit's remaining");
+  assert.deepEqual(rings.map((n) => (n.props.drawnTexts as string[]).at(-1)), ["30%", "85%"], "each ring shows its limit's remaining");
   const all = texts(pair.widget.node);
-  assert.ok(all.includes("5h") && all.includes("Weekly"), all.join(" | "));
+  assert.equal(all.filter((x) => x === "5h limit").length, 2, all.join(" | "));
   assert.ok(images(pair.widget.node).some((n) => n.props.symbol === lib.TIME_SYMBOLS.warn), "Claude 5h will likely run out (⚠)");
-  assert.ok(images(pair.widget.node).some((n) => n.props.symbol === lib.TIME_SYMBOLS.reset), "weekly shows reset (↻)");
-  const both = await runWidget({ family: "accessoryRectangular", parameter: "both 5h", response: { status: 200, body }, now });
-  assert.equal(images(both.widget.node).filter((n) => n.props.ring).length, 2);
+  // others: the rings of the providers other than the one with the least left
+  const others = await runWidget({ family: "accessoryRectangular", parameter: "wk, others", response: { status: 200, body }, now });
+  // one alone (Claude, beside Codex at 35%): ②'s ring alone, no text
+  const ringOf = (run: any) => images(run.widget.node).filter((n) => n.props.ring);
+  assert.equal(ringOf(others).length, 1);
+  assert.equal((ringOf(others)[0]!.props.imageSize as any).w, lib.LOCK_RINGS.rectangular.size);
+  assert.deepEqual(plain(texts(others.widget.node)), [], "no name, percentage or time");
+  assert.ok(!images(others.widget.node).some((n) => n.props.symbol === lib.TIME_SYMBOLS.reset || n.props.symbol === lib.TIME_SYMBOLS.warn), "no time");
   // Codex without a 5-hour limit shows "5h Not available"
   const no5h = lib.demoResult("no5h", now).view;
-  const missing = await runWidget({ family: "accessoryRectangular", parameter: "both 5h", response: { status: 200, body: { ...no5h, data_version: 1, view_version: 1 } }, now });
+  const missing = await runWidget({ family: "accessoryRectangular", parameter: "codex, claude, 5h", response: { status: 200, body: { ...no5h, data_version: 1, view_version: 1 } }, now });
   assert.ok(texts(missing.widget.node).includes("5h Not available"), texts(missing.widget.node).join(" | "));
   // The circle and inline widgets are chosen with the same parameter
-  const circ = await runWidget({ family: "accessoryCircular", parameter: "codex weekly", response: { status: 200, body }, now });
-  assert.equal((images(circ.widget.node).find((n) => n.props.ring)?.props.drawnTexts as string[]).at(-1), "35%");
-  const inline = await runWidget({ family: "accessoryInline", parameter: "both weekly", response: { status: 200, body }, now });
-  assert.ok(/Codex Wk 35%.*Claude Wk 70%/.test(texts(inline.widget.node)[0]!), texts(inline.widget.node).join(" | "));
+  const circ = await runWidget({ family: "accessoryCircular", parameter: "codex, wk", response: { status: 200, body }, now });
+  assert.equal((images(circ.widget.node).find((n) => n.props.ring)?.props.drawnTexts as string[]).at(-1), "wk");
+  assert.ok(texts(circ.widget.node)[0]!.startsWith("35%"), texts(circ.widget.node).join(" | "));
+  const inline = await runWidget({ family: "accessoryInline", parameter: "codex, claude, wk", response: { status: 200, body }, now });
+  assert.ok(/Codex wk 35%.*Claude wk 70%/.test(texts(inline.widget.node)[0]!), texts(inline.widget.node).join(" | "));
 });
 
-test("Lock screen ⚠ times also trigger a redraw; long headings drop the provider name", async () => {
+test("Lock screen ② and ③ rings fill the rectangle's height, the same size, ②'s where ③'s left one is; what is left inside ③'s", async () => {
+  const now = new Date("2026-11-16T13:05:00.000Z");
+  const view = lib.demoResult("three", now).view;
+  const body = { status: 200, body: { ...view, data_version: 1, view_version: 1 } };
+  const rings = (run: any) => images(run.widget.node).filter((n) => n.props.ring);
+  // the same size, near the lowest rectangle's height (about 67pt)
+  assert.equal(lib.LOCK_RINGS.others.size, lib.LOCK_RINGS.rectangular.size);
+  assert.ok(lib.LOCK_RINGS.rectangular.size >= 60 && lib.LOCK_RINGS.rectangular.size <= 64, String(lib.LOCK_RINGS.rectangular.size));
+  // ②: the ring, its heading beside it (fitted to the narrower column)
+  const least = await runWidget({ family: "accessoryRectangular", parameter: "5h", response: body, now });
+  assert.equal((rings(least)[0]!.props.imageSize as any).w, lib.LOCK_RINGS.rectangular.size);
+  assert.ok(texts(least.widget.node).some((x) => x.includes("5h limit")), texts(least.widget.node).join(" | "));
+  assert.equal(lib.LOCK_TITLE_WIDTH, lib.LOCK_RINGS.others.size);
+  // ③: two rings of ②'s size with the icon and what is left inside; no name or time beside them (no text squeezes the rings)
+  const others = await runWidget({ family: "accessoryRectangular", parameter: "5h, others", response: body, now });
+  assert.equal(rings(others).length, 2);
+  const picksInside = lib.lockPicks(view, "5h, others", now);
+  rings(others).forEach((r, i) => {
+    assert.equal((r.props.imageSize as any).w, lib.LOCK_RINGS.rectangular.size, "②'s size");
+    assert.equal((r.props.drawnTexts as string[]).at(-1), lib.compactPercent(picksInside[i].window), "what is left inside");
+  });
+  assert.deepEqual(plain(texts(others.widget.node)), [], "no text beside the rings");
+  assert.equal(images(others.widget.node).filter((n) => !n.props.ring).length, 0, "no time marks");
+  // side by side with flexible space around each (evenly spaced), centred top to bottom
+  const stacks = (node: any): any[] => [...(node.kind === "stack" ? [node] : []), ...node.children.flatMap(stacks)];
+  const kinds = (node: any) => node.children.map((c: any) => (c.kind === "spacer" ? (c.props.length == null ? "flex" : "gap") : c.kind));
+  // ③: two ring-wide slots with the same space before, between and after them
+  const row = stacks(others.widget.node).find((x) => kinds(x).join() === "flex,image,flex,image,flex");
+  assert.ok(row, "rings evenly spaced");
+  // ②: the same slots (equal flexible spaces around two pieces of the ring's width): its ring in the left one, where ③'s left ring
+  // is, and its text in the right one, a column of the ring's width (its centre on ③'s right ring's), lines to the right
+  const twoRow = stacks(least.widget.node).find((x) => x.children.some((c: any) => c.kind === "image" && c.props.ring));
+  assert.deepEqual(kinds(twoRow), ["flex", "image", "flex", "stack", "flex"]);
+  const column = twoRow.children[3];
+  assert.equal((column.props.size as any).w, lib.LOCK_RINGS.others.size);
+  assert.equal((twoRow.children[1].props.imageSize as any).w, lib.LOCK_RINGS.others.size, "the same width as ③'s ring");
+  assert.equal(column.props.dir, "v");
+  // each line to the right: a flexible space before a text, or (a countdown) a fixed one sized to end the line at the column's edge
+  for (const l of column.children) {
+    const countdown = l.children.some((c: any) => c.kind === "stack" && c.children.some((d: any) => d.kind === "date"));
+    assert.ok(countdown ? !kinds(l).includes("flex") : kinds(l)[0] === "flex", JSON.stringify(kinds(l)));
+  }
+  assert.deepEqual(column.children.map((l: any) => texts(l)[0]), ["5h limit", texts(least.widget.node)[1], texts(least.widget.node)[2]].slice(0, column.children.length));
+  // one alone: in the left slot, where ②'s ring is (the right slot kept empty)
+  const one = await runWidget({ family: "accessoryRectangular", parameter: "wk, others",
+    response: { status: 200, body: { ...lib.demoResult("runout", now).view, data_version: 1, view_version: 1 } }, now });
+  const oneRow = stacks(one.widget.node).find((x) => x.children.some((c: any) => c.kind === "image" && c.props.ring));
+  assert.deepEqual(kinds(oneRow), ["flex", "image", "flex", "gap", "flex"]);
+  assert.equal(oneRow.children[3].props.length, lib.LOCK_RINGS.others.size);
+  assert.deepEqual([row.props.dir, row.props.align], ["h", "center"]);
+  // each ring is its provider's, in order
+  const picks = lib.lockPicks(view, "5h, others", now);
+  const letters: Record<string, string> = { claude: "C", codex: "X", gemini: "G" };
+  const drawn = row.children.filter((c: any) => c.kind === "image").map((c: any) => c.props.drawnTexts as string[]);
+  picks.forEach((p: any, i: number) => assert.ok(drawn[i]!.includes(letters[p.provider]!), p.provider));
+  // without a value, the empty ring says why inside (it doesn't read as nothing left)
+  assert.equal(lib.othersMissing({ label: "5h: Not available", short: "5h Not available" }), "N/A");
+  assert.equal(lib.othersMissing({ label: "Not supported", short: "Not supported" }), "N/A");
+  assert.equal(lib.othersMissing({ label: "No data", short: "No data" }), "–");
+  const no5h = { status: 200, body: { ...lib.demoResult("no5h", now).view, data_version: 1, view_version: 1 } };
+  const missing = await runWidget({ family: "accessoryRectangular", parameter: "5h, others", response: no5h, now });
+  assert.ok(rings(missing).some((r) => (r.props.drawnTexts as string[]).includes("N/A")), JSON.stringify(rings(missing).map((r) => r.props.drawnTexts)));
+});
+
+test("Lock screen ⚠ times also trigger a redraw; ②'s heading is the limit alone (the ring's icon says whose), its rows a little larger", async () => {
   const now = new Date("2026-11-16T13:05:00.000Z");
   const view = lib.demoResult("runout", now).view;
   view.claude.windows.five_hour.rate_pace = 300; // runs out 6 minutes after the fetch (1 minute ago)
@@ -1678,47 +1926,51 @@ test("Lock screen ⚠ times also trigger a redraw; long headings drop the provid
   }
   const calm = await runWidget({ family: "accessoryRectangular", parameter: "claude weekly", response: { status: 200, body }, now });
   assert.equal((calm.widget as any).refreshAfterDate.getTime(), now.getTime() + 15 * 60000);
-  // Long heading (Fable's weekly limit plus a staleness mark)
   const late = new Date("2026-11-16T13:30:00.000Z");
-  const long = await runWidget({ family: "accessoryRectangular", parameter: "claude.seven_day_fable", now: late });
-  const head = texts(long.widget.node)[0]!;
-  assert.equal(head, "Fable weekly", "the provider name is dropped");
-  assert.ok(texts(long.widget.node).some((x) => /^\d+m$/.test(x)), "the staleness mark is next to the remaining value");
-  assert.ok(lib.textWidth(head, 12) * 0.8 <= lib.LOCK_TITLE_WIDTH + 1, head);
-  const short = await runWidget({ family: "accessoryRectangular", parameter: "codex weekly", now: late });
-  assert.equal(texts(short.widget.node)[0], "Codex · Weekly", texts(short.widget.node).join(" | "));
+  const short = await runWidget({ family: "accessoryRectangular", parameter: "codex, wk", now: late });
+  const head = texts(short.widget.node)[0]!;
+  assert.equal(head, "Wk limit", texts(short.widget.node).join(" | "));
+  // the rows keep their proportions (12 : 22 : 11 : 10), a little larger; the heading fits the narrowest column as it is
+  const ratios = [lib.LOCK_TEXT.head / 12, lib.LOCK_TEXT.pct / 22, lib.LOCK_TEXT.time / 11, lib.LOCK_TEXT.mark / 10];
+  assert.ok(ratios.every((r: number) => Math.abs(r - ratios[0]!) < 0.01) && ratios[0]! > 1 && ratios[0]! <= 1.15, JSON.stringify(plain(lib.LOCK_TEXT)));
+  for (const name of ["Wk limit", "5h limit"]) assert.ok(lib.textWidth(name, lib.LOCK_TEXT.head, true) * 0.8 <= lib.LOCK_TITLE_WIDTH, name);
+  // sizes as drawn: the heading and what is left
+  const fonts = (node: any): any[] => [...(node.kind === "text" ? [[node.props.text, node.props.font]] : []), ...node.children.flatMap(fonts)];
+  const drawn = Object.fromEntries(fonts(short.widget.node));
+  assert.equal((drawn["Wk limit"] as any)?.size, lib.LOCK_TEXT.head, JSON.stringify(drawn));
+  const left = texts(short.widget.node).find((x) => /^\d+(\.\d)?%$/.test(x))!;
+  assert.equal((drawn[left] as any)?.size, lib.LOCK_TEXT.pct, JSON.stringify(drawn));
+  assert.ok(texts(short.widget.node).some((x) => /^\d+m$/.test(x)), "the staleness mark is next to the remaining value");
 });
 
-test("Why a limit is missing (No 5h vs a failed fetch), mixing old and new forms, short marks for two side by side, and top", async () => {
+test("Why a limit is missing (No 5h vs a failed fetch), each provider named, and short marks for two side by side", async () => {
   const now = new Date("2026-11-16T13:05:00.000Z");
   const pick = (view: any, p: string) => [...lib.lockPicks(view, p, now)].map((x: any) => (x.missing ? `${x.provider}:${x.label}` : `${x.provider}.${x.window.id}`));
   const runout = lib.demoResult("runout", now).view;
-  assert.deepEqual(pick(runout, "claude 5h, codex.seven_day"), ["claude.five_hour", "codex.seven_day"], "mixing old and new forms");
-  assert.deepEqual(pick(runout, "claude.five_hour + codex.seven_day"), ["claude.five_hour", "codex.seven_day"]);
-  assert.deepEqual(pick(runout, "top"), ["claude.five_hour"], "top for the rectangle and circle is the same as empty");
+  assert.deepEqual(pick(runout, "claude, codex"), ["claude.five_hour", "codex.seven_day"], "each one's tightest");
   const no5h = lib.demoResult("no5h", now).view;
-  assert.deepEqual(pick(no5h, "codex 5h"), ["codex:5h: Not available"]);
+  assert.deepEqual(pick(no5h, "codex, 5h"), ["codex:5h: Not available"]);
   const error = lib.demoResult("error", now).view;
-  assert.deepEqual(pick(error, "claude 5h"), ["claude:Sign in required"], "a failed fetch isn't shown as No 5h");
+  assert.deepEqual(pick(error, "claude, 5h"), ["claude:Sign in required"], "a failed fetch isn't shown as No 5h");
   const body = (v: any) => ({ status: 200, body: { ...v, data_version: 1, view_version: 1 } });
   // The circle and inline widgets show the reason too
-  const circ = await runWidget({ family: "accessoryCircular", parameter: "codex 5h", response: body(no5h), now });
+  const circ = await runWidget({ family: "accessoryCircular", parameter: "codex, 5h", response: body(no5h), now });
   assert.ok(texts(circ.widget.node).includes("5h Not available"), texts(circ.widget.node).join(" | "));
-  const inline = await runWidget({ family: "accessoryInline", parameter: "both 5h", response: body(no5h), now });
-  assert.ok(/Codex 5h N\/A.*Claude 5h \d+%/.test(texts(inline.widget.node)[0]!), texts(inline.widget.node).join(" | "));
-  const top = await runWidget({ family: "accessoryInline", parameter: "top", response: body(runout), now });
-  assert.ok(/Codex .*Claude /.test(texts(top.widget.node)[0]!), "inline top is per provider");
-  const rect = await runWidget({ family: "accessoryRectangular", parameter: "claude 5h", response: body(error), now });
+  const inline = await runWidget({ family: "accessoryInline", parameter: "codex, claude, 5h", response: body(no5h), now });
+  assert.ok(/(Codex|Cx) 5h(: Not available| N\/A).*(Claude|Cl) 5h \d+%/.test(texts(inline.widget.node)[0]!), texts(inline.widget.node).join(" | "));
+  const least = await runWidget({ family: "accessoryInline", response: body(runout), now });
+  assert.ok(/^Claude 5h 30%/.test(texts(least.widget.node)[0]!), `nothing named: the one with the least left: ${texts(least.widget.node)[0]}`);
+  const rect = await runWidget({ family: "accessoryRectangular", parameter: "claude, 5h", response: body(error), now });
   assert.ok(texts(rect.widget.node).includes("Claude: Sign in required"), texts(rect.widget.node).join(" | "));
   // Staleness marks are short when two are side by side
   const late = new Date("2026-11-16T13:30:00.000Z");
-  const pair = await runWidget({ family: "accessoryRectangular", parameter: "claude.seven_day_fable + codex weekly", now: late });
+  const pair = await runWidget({ family: "accessoryRectangular", parameter: "claude, codex, wk", now: late });
   const labels = texts(pair.widget.node);
-  assert.ok(labels.some((x) => /^Fable weekly \d+m$/.test(x)), labels.join(" | "));
-  for (const x of labels.filter((x) => /weekly|Weekly/.test(x))) assert.ok(lib.textWidth(x, 9) * 0.8 <= 76, x);
+  assert.ok(labels.some((x) => /^Wk limit \d+m$/.test(x)), labels.join(" | "));
+  for (const x of labels.filter((x) => /Wk|wk/.test(x))) assert.ok(lib.textWidth(x, 9) * 0.8 <= 76, x);
 });
 
-test("Reasons when no provider is given, reasons for inline top and the circle demo, and label width when two are side by side", async () => {
+test("Reasons when no provider is given, reasons for providers named on the line and the circle demo, and label width when two are side by side", async () => {
   const now = new Date("2026-11-16T13:05:00.000Z");
   const body = (v: any) => ({ status: 200, body: { ...v, data_version: 1, view_version: 1 } });
   // No Claude values and Codex has only weekly: "Codex 5h: Not available"
@@ -1731,17 +1983,17 @@ test("Reasons when no provider is given, reasons for inline top and the circle d
   signIn.codex = { status: "error", plan: null, error_code: "login_required", main_window_ids: [], window_ids: [], windows: {} };
   const p2 = [...lib.lockPicks(signIn, "5h", now)][0] as any;
   assert.equal(`${p2.providerName}: ${p2.label}`, "Codex: Sign in required");
-  // Inline top also shows the reason for a provider whose fetch failed
+  // The line with providers named also shows the reason for one whose fetch failed
   const runout = JSON.parse(JSON.stringify(lib.demoResult("runout", now).view));
   runout.codex = { status: "error", plan: null, error_code: "login_required", main_window_ids: [], window_ids: [], windows: {} };
-  const inline = await runWidget({ family: "accessoryInline", parameter: "top", response: body(runout), now });
+  const inline = await runWidget({ family: "accessoryInline", parameter: "codex, claude", response: body(runout), now });
   assert.ok(/Codex Sign in required/.test(texts(inline.widget.node)[0]!), texts(inline.widget.node).join(" | "));
-  const demoCirc = await runWidget({ family: "accessoryCircular", parameter: "demo:error", now });
+  const demoCirc = await runWidget({ family: "accessoryCircular", demo: "error", now });
   assert.ok(texts(demoCirc.widget.node).some((x) => x.includes("Sign in")), texts(demoCirc.widget.node).join(" | "));
-  const demoInline = await runWidget({ family: "accessoryInline", parameter: "demo:error", now });
+  const demoInline = await runWidget({ family: "accessoryInline", demo: "error", now });
   assert.ok(texts(demoInline.widget.node)[0]!.includes("Sign in required"), texts(demoInline.widget.node).join(" | "));
   // Labels fit the column when two are side by side
-  const pair = await runWidget({ family: "accessoryRectangular", parameter: "claude weekly + codex weekly", response: body(signIn), now });
+  const pair = await runWidget({ family: "accessoryRectangular", parameter: "claude, codex, wk", response: body(signIn), now });
   for (const x of texts(pair.widget.node)) if (!/^\d|^[A-Z][a-z]{2} /.test(x)) assert.ok(lib.textWidth(x, 9, true) * 0.8 <= 76, x);
   assert.ok(texts(pair.widget.node).includes("Sign in"), texts(pair.widget.node).join(" | "));
 });
@@ -1758,39 +2010,30 @@ test("A provider whose fetch failed shows the reason first even if a weekly limi
   assert.ok(texts(circ.widget.node).includes("Sign in"), texts(circ.widget.node).join(" | "));
   const noCode = JSON.parse(JSON.stringify(lib.demoResult("runout", now).view));
   noCode.codex = { status: "error", plan: null, error_code: null, main_window_ids: [], window_ids: [], windows: {} };
-  for (const parameter of ["top", ""]) {
-    const inline = await runWidget({ family: "accessoryInline", parameter, response: body(noCode), now });
-    assert.ok(/Codex No data/.test(texts(inline.widget.node)[0]!), `${parameter}: ${texts(inline.widget.node).join(" | ")}`);
-  }
+  const inline = await runWidget({ family: "accessoryInline", parameter: "codex, claude", response: body(noCode), now });
+  assert.ok(/Codex No data/.test(texts(inline.widget.node)[0]!), texts(inline.widget.node).join(" | "));
 });
 
-test("Time row: the run-out time is the same gray as the reset time, and the rate is at the right end (also on rows likely to run out)", async () => {
+test("Time row: the run-out time is the same gray as the reset time, and no rate (details only)", async () => {
   const now = new Date("2026-11-16T13:05:00.000Z");
-  const run = await runWidget({ family: "large", parameter: "demo:runout", now });
+  const run = await runWidget({ family: "large", demo: "runout", now });
   const warn = images(run.widget.node).filter((n) => n.props.symbol === lib.TIME_SYMBOLS.warn);
   assert.ok(warn.length > 0 && warn.every((n) => n.props.tint === "#6e6e73"), "the ⚠ symbol is gray");
   const reset = images(run.widget.node).filter((n) => n.props.symbol === lib.TIME_SYMBOLS.reset);
   assert.ok(reset.every((n) => n.props.tint === "#6e6e73"), "same color as ↻");
   const all = texts(run.widget.node);
-  assert.ok(all.includes("1.2%/h") && all.includes("30%/h"), all.join(" | "));
-  // The rate is last in the time row (right end)
-  const rows = (node: any): any[] => [...(node.kind === "stack" ? [node] : []), ...node.children.flatMap(rows)];
-  const row = rows(run.widget.node).find((s) => s.children.some((c: any) => c.kind === "text" && c.props.text === "30%/h"));
-  assert.equal(row.children.at(-1).props.text, "30%/h");
-  assert.equal(row.children.at(-2).kind, "spacer");
+  assert.ok(!all.some((x) => x.includes("%/h")), all.join(" | "));
   assert.equal(lib.PROVIDER_ORDER.join(","), "codex,claude,gemini", "Codex on the left / top, Gemini last");
 });
 
-test("Inline default and top keep Codex first even with reasons added; the lock screen time row is gray too", async () => {
+test("The line keeps the providers' named order even with reasons; the lock screen time row is gray too", async () => {
   const now = new Date("2026-11-16T13:05:00.000Z");
   const body = (v: any) => ({ status: 200, body: { ...v, data_version: 1, view_version: 1 } });
   const view = JSON.parse(JSON.stringify(lib.demoResult("runout", now).view));
   view.codex = { status: "error", plan: null, error_code: "login_required", main_window_ids: [], window_ids: [], windows: {} };
-  for (const parameter of ["", "top"]) {
-    const inline = await runWidget({ family: "accessoryInline", parameter, response: body(view), now });
-    assert.ok(/^Codex Sign in required · Claude /.test(texts(inline.widget.node)[0]!), texts(inline.widget.node).join(" | "));
-  }
-  for (const parameter of ["claude 5h", "claude 5h + claude weekly"]) {
+  const inline = await runWidget({ family: "accessoryInline", parameter: "codex, claude", response: body(view), now });
+  assert.ok(/^Codex Sign in required · Claude /.test(texts(inline.widget.node)[0]!), texts(inline.widget.node).join(" | "));
+  for (const parameter of ["claude 5h", "claude, codex, 5h"]) {
     const rect = await runWidget({ family: "accessoryRectangular", parameter, response: body(lib.demoResult("runout", now).view), now });
     const symbols = images(rect.widget.node).filter((n) => n.props.symbol === lib.TIME_SYMBOLS.warn || n.props.symbol === lib.TIME_SYMBOLS.reset);
     assert.ok(symbols.length > 0 && symbols.every((n) => n.props.tint === "#6e6e73"), parameter);
@@ -1801,7 +2044,7 @@ test("Version 46: weekday times to the minute; chart heading (Usage) on the left
   const now = new Date("2026-11-16T13:05:00.000Z");
   assert.equal(lib.whenShort(new Date("2026-11-20T07:00:00.000Z"), now).text, lib.clockText(new Date("2026-11-20T07:00:00.000Z"), now));
   assert.match(lib.whenShort(new Date("2026-11-20T07:00:00.000Z"), now).text, /^\w{3} \d{2}:\d{2}$/, "Fri 16:00 form");
-  const run = await runWidget({ family: "large", parameter: "demo:normal", now });
+  const run = await runWidget({ family: "large", demo: "normal", now });
   const all = texts(run.widget.node);
   const usage = all.indexOf("Weekly usage");
   assert.ok(usage >= 0 && !all.some((t) => t.includes("This week")), all.join(" | "));
@@ -1820,18 +2063,19 @@ test("Version 46: weekday times to the minute; chart heading (Usage) on the left
     { provider: "claude", points: [{ used: 50 }, { used: 60 }] },
   ])].map((x: any) => x.provider);
   assert.deepEqual(order, ["claude", "codex"], "if Codex is lower, Codex goes last (in front)");
-  const small = await runWidget({ family: "small", parameter: "demo:no5h", now });
+  const small = await runWidget({ family: "small", demo: "no5h", now });
   const s = texts(small.widget.node);
-  assert.ok(s.includes("5h limit") && s.includes("—") && !s.includes("No 5h limit") && !s.includes(lib.NOT_AVAILABLE), "small shows '5h limit —' like medium and large, without the row below the bar");
-  const m = texts((await runWidget({ family: "medium", parameter: "demo:no5h", now })).widget.node);
+  assert.ok(s.filter((x) => x === "Wk limit").length === 2 && !s.includes("—") && !s.includes(lib.NOT_AVAILABLE), "small shows the weekly limit both have");
+  const m = texts((await runWidget({ family: "medium", demo: "no5h", now })).widget.node);
   assert.ok(m.includes(lib.NOT_AVAILABLE) && !m.includes("No 5h limit"), "medium and large show Not available");
 });
 
-test("Rows are fixed to the column width (remaining number and rate right-aligned; device feedback)", async () => {
+test("Rows are fixed to the column width (remaining number right-aligned; device feedback)", async () => {
   const now = new Date("2026-11-16T13:05:00.000Z");
-  const run = await runWidget({ family: "large", parameter: "demo:runout", now });
+  const run = await runWidget({ family: "large", demo: "runout", now });
   const rows = (node: any): any[] => [...(node.kind === "stack" ? [node] : []), ...node.children.flatMap(rows)];
-  const sub = rows(run.widget.node).find((s) => s.children.some((c: any) => c.kind === "text" && c.props.text === "30%/h"));
+  const timeSymbol = (c: any) => c.kind === "image" && (c.props.symbol === lib.TIME_SYMBOLS.warn || c.props.symbol === lib.TIME_SYMBOLS.reset);
+  const sub = rows(run.widget.node).find((s) => s.children.some(timeSymbol));
   const cols = columnsOf(run.widget.node);
   const width = (cols[0]!.props.size as any).w;
   assert.equal((sub.props.size as any)?.w, width, "time row is the column width");
@@ -1846,11 +2090,11 @@ test("Rows are fixed to the column width (remaining number and rate right-aligne
 
 test("Inline without a 5-hour limit is short (5h N/A). The rectangle demo's Demo goes next to the remaining value (not in the time row)", async () => {
   const now = new Date("2026-11-16T13:05:00.000Z");
-  const inline = await runWidget({ family: "accessoryInline", parameter: "both 5h", response: { status: 200, body: { ...lib.demoResult("no5h", now).view, data_version: 1, view_version: 1 } }, now });
+  const inline = await runWidget({ family: "accessoryInline", parameter: "codex, claude, 5h", response: { status: 200, body: { ...lib.demoResult("no5h", now).view, data_version: 1, view_version: 1 } }, now });
   const text = texts(inline.widget.node)[0]!;
-  assert.ok(text.startsWith("Codex 5h N/A · Claude 5h"), text);
+  assert.ok(/^(Codex|Cx) 5h(: Not available| N\/A) · (Claude|Cl) 5h/.test(text), text);
   assert.ok(lib.textWidth(text, 11) <= 225, `${text}: ${lib.textWidth(text, 11)}`);
-  const rect = await runWidget({ family: "accessoryRectangular", parameter: "demo:normal", now });
+  const rect = await runWidget({ family: "accessoryRectangular", demo: "normal", now });
   const rows = (node: any): any[] => [...(node.kind === "stack" ? [node] : []), ...node.children.flatMap(rows)];
   const timeRow = rows(rect.widget.node).find((s) => s.children.some((c: any) => c.kind === "image" && (c.props.symbol === lib.TIME_SYMBOLS.reset || c.props.symbol === lib.TIME_SYMBOLS.warn)));
   assert.ok(!texts(timeRow).includes("Demo"), "Demo is not in the time row");
@@ -1866,14 +2110,14 @@ test("When width is short, the staleness mark is shortened (inline, rectangle de
   const text = texts(inline.widget.node)[0]!;
   assert.ok(text.startsWith(lib.WARN_MARK), text);
   assert.ok(lib.textWidth(text, 11) <= lib.INLINE_WIDTH, `${text}: ${lib.textWidth(text, 11)}`);
-  const rect = await runWidget({ family: "accessoryRectangular", parameter: "demo:offline", now });
+  const rect = await runWidget({ family: "accessoryRectangular", demo: "offline", now });
   const side = texts(rect.widget.node).find((x) => x.includes("Demo"))!;
   assert.ok(!side.includes(" ago"), side);
 });
 
 test("Inline measures width including the demo prefix and drops the staleness mark if it doesn't fit (keeps ⚠ and remaining)", async () => {
   const now = new Date("2026-11-16T13:05:00.000Z");
-  const off = await runWidget({ family: "accessoryInline", parameter: "demo:offline", now });
+  const off = await runWidget({ family: "accessoryInline", demo: "offline", now });
   const text = texts(off.widget.node)[0]!;
   assert.ok(text.startsWith("Demo · ") && text.includes(lib.WARN_MARK), text);
   assert.ok(lib.textWidth(text, 11) <= lib.INLINE_WIDTH, `${text}: ${lib.textWidth(text, 11)}`);
@@ -1904,14 +2148,14 @@ test("Codex and Claude columns have equal heights: header, limit name and time r
   }
 });
 
-test("Header: icon, name and freshness dot are centered; the plan aligns with the name's bottom edge (device feedback)", async () => {
+test("Header: icon, name and freshness dot are centered; no plan (details only; device feedback)", async () => {
   const run = await runWidget({ family: "medium" });
   const rows = (node: any): any[] => [...(node.kind === "stack" ? [node] : []), ...node.children.flatMap(rows)];
   const nameBox = rows(run.widget.node).find((x) => x.children.some((c: any) => c.kind === "text" && c.props.text === "Codex"));
   const names = rows(run.widget.node).find((x) => x.children.includes(nameBox));
   assert.equal(names.props.align, "bottom", "name and plan at the bottom edge");
   assert.ok((nameBox.props.size as any)?.w >= lib.textWidth("Codex", lib.SCALES.medium.name, true), "the name has a box as wide as its text (never shortened)");
-  assert.ok(texts(names).includes("Pro Lite"), "the plan is in the same group as the name");
+  assert.ok(!texts(run.widget.node).includes("Pro Lite"), "the plan is in the details only");
   const header = rows(run.widget.node).find((x) => x.children.includes(names));
   assert.equal(header.props.align, "center", "the row is centered");
   assert.equal((header.props.size as any).h, lib.SCALES.medium.header, "header height is fixed");
@@ -1957,7 +2201,8 @@ test("Medium/large Not available is left-aligned (the row width is fixed, so a f
   for (const family of ["medium", "large"]) {
     const run = await runWidget({ family });
     const sub = rows(run.widget.node).find((x) => x.children.some((c: any) => c.kind === "text" && c.props.text === lib.NOT_AVAILABLE));
-    assert.equal(sub.children[0].props.text, lib.NOT_AVAILABLE, family);
+    assert.equal(sub.children[0].props.symbol, lib.TIME_SYMBOLS.none, `${family}: led by ✕`);
+    assert.equal(sub.children.find((c: any) => c.kind === "text").props.text, lib.NOT_AVAILABLE, family);
     assert.equal(sub.children.at(-1).kind, "spacer", `${family}: trailing flexible spacer`);
     assert.equal(sub.children.at(-1).props.length, null);
   }
@@ -2084,7 +2329,7 @@ test("After the run-out time passes with no newer value, the row keeps ⚠ and s
   assert.deepEqual(plain(lib.timeShort(lib.atDisplayTime(five, afterReset), afterReset)), { warn: false, kind: "text", text: "Reset" });
 });
 
-test("The provider name is never cut off: when the header is too narrow, the plan is left out first", async () => {
+test("The provider name is never cut off, and no plan beside it at any width (details only)", async () => {
   const now = new Date("2026-11-16T13:05:00.000Z");
   const view = lib.demoResult("normal", now).view;
   // Values 2 hours old: the header shows "2h" next to the dot
@@ -2094,7 +2339,7 @@ test("The provider name is never cut off: when the header is too narrow, the pla
   const all = texts(narrow.widget.node);
   assert.ok(all.includes("Codex") && all.includes("Claude"), all.join(" | "));
   const wide = await runWidget({ family: "medium", response: { status: 200, body }, now, screen: 430 });
-  assert.ok(texts(wide.widget.node).includes("Plus"), "the plan stays when it fits");
+  assert.ok(!texts(wide.widget.node).includes("Plus") && texts(wide.widget.node).includes("Codex"), "no plan even when it would fit");
 });
 
 test("Large uses medium's sizes throughout, and the chart takes the room left", () => {
@@ -2490,7 +2735,7 @@ test("Tapping the widget opens the details: each column its own provider, the lo
   assert.equal(single.widget.url, "scriptable:///run/Headroom?open=details&provider=claude");
   const lock = await runWidget({ family: "accessoryRectangular", parameter: "claude 5h" });
   assert.equal(lock.widget.url, "scriptable:///run/Headroom?open=details&provider=claude");
-  const demo = await runWidget({ family: "medium", parameter: "demo" });
+  const demo = await runWidget({ family: "medium", demo: "runout" });
   assert.equal(demo.widget.url, undefined);
   const noScheme = await runWidget({ family: "medium", scriptUrl: null });
   assert.equal(noScheme.widget.url, undefined);
@@ -2560,7 +2805,7 @@ test("The details page escapes what it shows and lists every limit with its pace
   assert.ok(html.includes(`<div class="tile wide"><em>${S.pace} Pace</em>`), "Pace takes two columns");
   // Not available, as on the widget
   const no5h = lib.detailHtml({ view: plain(lib.demoResult("no5h", now).view), events: null, trends: {}, now, provider: "codex", note: "" });
-  assert.ok(no5h.includes(`<span class="name">5h limit</span><b>—</b>`) && no5h.includes(`>${lib.NOT_AVAILABLE}<`));
+  assert.ok(no5h.includes(`<span class="name">5h limit</span><b>—</b>`) && no5h.includes(`>✕ ${lib.NOT_AVAILABLE}<`), "led by ✕");
   assert.ok(no5h.includes("Other weekly"), "per-group limits too");
   assert.ok(!/https?:\/\//.test(html), "nothing loaded from the network");
   assert.equal(lib.esc(`a&"'`), "a&amp;&quot;&#39;");
@@ -2609,6 +2854,160 @@ test("The app menu sends the sample notifications of the chosen provider right a
   assert.equal(run.requests.length, 0, "nothing is read");
 });
 
+test("The details list a provider's overall limits, then its model limits, then other providers' models; 5h before weekly", () => {
+  const now = new Date("2026-11-19T12:00:00");
+  const demo = lib.demoResult("three", now);
+  // in the order a PC reports them (other providers' models first, the weekly overall limit last)
+  const g = demo.view.gemini;
+  const view = { ...demo.view, gemini: { ...g,
+    window_ids: ["partner_seven_day", "partner_five_hour", "seven_day", "seven_day_argon", "five_hour"],
+    main_window_ids: ["seven_day", "five_hour"] } };
+  const html: string = lib.detailHtml({ view, events: [], trends: demo.trends, now, provider: "gemini", note: "" });
+  const names = [...html.matchAll(/<span class="name">([^<]*)<\/span>/g)].map((m) => m[1]);
+  assert.deepEqual(names, ["5h limit", "Weekly limit", "Argon weekly", "Claude/GPT 5h", "Claude/GPT weekly"]);
+});
+
+test("Small: one limit per provider, the shortest every provider has; a named provider keeps its rows", () => {
+  const now = new Date("2026-11-19T12:00:00");
+  const view = lib.demoResult("three", now).view;
+  const shown = (v: any, parameter = "") => plain(lib.layoutGroups(v, "small", parameter, now).groups)
+    .map((g: any) => `${g.provider}:${g.rows.map((r: any) => (r.kind === "missing" ? `${r.label}=NA` : r.window.id)).join("+")}`);
+  assert.deepEqual(shown(view), ["codex:five_hour", "claude:five_hour", "gemini:five_hour"]);
+  // no 5h anywhere: the weekly limit for all
+  const drop = (p: any) => ({ ...p, main_window_ids: p.main_window_ids.filter((id: string) => id !== "five_hour"),
+    window_ids: p.window_ids.filter((id: string) => id !== "five_hour") });
+  const weekly = { ...view, codex: drop(view.codex), claude: drop(view.claude), gemini: drop(view.gemini) };
+  assert.deepEqual(shown(weekly), ["codex:seven_day", "claude:seven_day", "gemini:seven_day"]);
+  // one provider without 5h: the weekly for all (no Not available)
+  const one = { ...view, codex: drop(view.codex) };
+  assert.deepEqual(shown(one), ["codex:seven_day", "claude:seven_day", "gemini:seven_day"]);
+  // none shared (one has only a 5h, another only a weekly): the shortest, the other says it has none
+  const only = (p: any, id: string) => ({ ...p, main_window_ids: [id], window_ids: [id] });
+  const apart = { ...view, codex: only(view.codex, "seven_day"), claude: only(view.claude, "five_hour"), gemini: only(view.gemini, "five_hour") };
+  assert.deepEqual(shown(apart), ["codex:5h limit=NA", "claude:five_hour", "gemini:five_hour"]);
+  // a single provider named: its limits as before (more than one row)
+  assert.ok(lib.layoutGroups(view, "small", "claude", now).groups[0].rows.length >= 2);
+});
+
+test("A limit not started yet (nothing used, no reset time) says its countdown starts on first use", async () => {
+  const now = new Date("2026-11-19T12:00:00");
+  const demo = lib.demoResult("three", now);
+  const unused = { ...demo.view.gemini.windows.five_hour, used_percent: 0, used_percent_int: 0, remaining_percent: 100,
+    remaining_percent_int: 100, resets_at: null, reset_passed: false, recent_consumed_percent: 0 };
+  assert.deepEqual(plain(lib.timeShort(unused, now)), { warn: false, kind: "text", text: "On first use", symbol: "start" });
+  // in use, or reset since its fetch: not this
+  const used = { ...unused, used_percent: 3, used_percent_int: 3, remaining_percent: 97, remaining_percent_int: 97 };
+  assert.notEqual(lib.timeShort(used, now)?.text, "On first use");
+  assert.notEqual(lib.timeShort({ ...unused, reset_passed: true }, now)?.text, "On first use");
+  const view = { ...demo.view, gemini: { ...demo.view.gemini, windows: { ...demo.view.gemini.windows, five_hour: unused } } };
+  const html: string = lib.detailHtml({ view, events: [], trends: demo.trends, now, provider: "gemini", note: "" });
+  assert.ok(html.includes("Not started") && html.includes("on first use"), "the details' reset tile");
+  const run = await runWidget({ family: "medium", response: { status: 200, body: { ...view, data_version: 1, view_version: 1 } }, now });
+  assert.ok(texts(run.widget.node).includes("On first use"), texts(run.widget.node).join(" | "));
+});
+
+test("Row labels are sized between the short name drawn and the long one (Wk limit and Weekly limit)", () => {
+  const now = new Date("2026-11-19T12:00:00");
+  const view = lib.demoResult("three", now).view;
+  const layout = lib.layoutGroups(view, "medium", "", now);
+  const opts = { scale: layout.scale, width: layout.colWidth, now, rows: Infinity, content: layout.content };
+  const fit = lib.fittedSizes(layout.groups, opts);
+  const plans = layout.groups.flatMap((g: any) => g.rows.map((r: any) => lib.rowPlan(r, opts)));
+  assert.ok(plans.some((p: any) => p.label === "Wk limit" && p.fitLabel === "Weekly limit"), JSON.stringify(plans.map((p: any) => p.label)));
+  const k = (v: number) => Math.max(0.7, Math.min(1, v));
+  const room = (p: any) => opts.width - (p.showPct ? 8 + lib.textWidth(p.pct, layout.scale.pct, !p.missing) : 0);
+  const sizeFor = (w: (p: any) => number) => Math.floor(layout.scale.label * k(Math.min(...plans.map((p: any) => room(p) / w(p)))) * 2) / 2;
+  const wide = (x: string) => lib.textWidth(x, layout.scale.label);
+  const long = sizeFor((p) => wide(p.fitLabel));
+  const short = sizeFor((p) => wide(p.label));
+  const mid = sizeFor((p) => (wide(p.label) + wide(p.fitLabel)) / 2);
+  assert.equal(fit.label, mid);
+  assert.ok(long <= mid && mid <= short && long < short, `${long} ${mid} ${short}`);
+});
+
+test("Every status under a bar is led by a monochrome mark: ↻ reset, ⚠ run-out, ✕ Not available, ⧗ On first use, ? Reset unknown", async () => {
+  const now = new Date("2026-11-19T12:00:00");
+  const demo = lib.demoResult("three", now);
+  const g = demo.view.gemini.windows;
+  const unused = { ...g.five_hour, used_percent: 0, used_percent_int: 0, remaining_percent: 100, remaining_percent_int: 100, resets_at: null, reset_passed: false, recent_consumed_percent: 0 };
+  const unknown = { ...g.seven_day, resets_at: null, reset_passed: false };
+  assert.equal(lib.timeMarkOf(lib.timeShort(unused, now)), "start");
+  assert.deepEqual(plain(lib.timeShort(unknown, now)), { warn: false, kind: "text", text: "Reset unknown", symbol: "unknown" });
+  assert.equal(lib.timeMarkOf(lib.timeShort(g.seven_day, now)), "reset");
+  for (const key of Object.keys(lib.TIME_SYMBOLS)) assert.ok(lib.TIME_MARKS[key], `a text mark for ${key}`);
+  // drawn: each text status follows its symbol in the same row
+  const view = { ...demo.view, gemini: { ...demo.view.gemini, windows: { ...g, five_hour: unused, seven_day: unknown } } };
+  const run = await runWidget({ family: "medium", response: { status: 200, body: { ...view, data_version: 1, view_version: 1 } }, now });
+  const rows = (node: any): any[] => [...(node.kind === "stack" ? [node] : []), ...node.children.flatMap(rows)];
+  for (const [text, key] of [["On first use", "start"], ["Reset unknown", "unknown"]] as const) {
+    const row = rows(run.widget.node).find((x) => x.children.some((c: any) => c.kind === "text" && c.props.text === text));
+    assert.ok(row, text);
+    assert.equal(row.children[0].props.symbol, lib.TIME_SYMBOLS[key], text);
+  }
+});
+
+test("Most (large): by the limit named, the provider using most of it with all its own limits, then the others side by side; no chart", async () => {
+  const now = new Date("2026-11-19T12:00:00");
+  const view = lib.demoResult("three", now).view;
+  const used = (p: string, id: string) => lib.atDisplayTime(view[p].windows[id], now).used_percent;
+  for (const [parameter, id] of [["most, 5h", "five_hour"], ["most", "five_hour"], ["wk most", "seven_day"]] as const) {
+    const layout = lib.layoutGroups(view, "large", parameter, now);
+    assert.equal(layout.most, true, parameter);
+    assert.equal(layout.trendHeight, 0, `${parameter}: no chart`);
+    const expected = ["codex", "claude", "gemini"].sort((a, b) => used(b, id) - used(a, id));
+    assert.deepEqual(plain(layout.groups.map((g: any) => g.provider)), expected, parameter);
+    const [first, ...rest] = layout.groups;
+    const ids = plain(first.rows.map((r: any) => r.window?.id));
+    assert.ok(ids.includes("five_hour") && ids.includes("seven_day"), `${parameter}: the first shows all its own limits: ${ids}`);
+    // its own per-model limits too, also below 100%
+    const own = view[first.provider].window_ids.filter((w: string) => view[first.provider].windows[w].scope !== null && !view[first.provider].windows[w].detail_only);
+    for (const w of own) assert.ok(ids.includes(w), `${parameter}: ${w} of ${first.provider} (${ids})`);
+    assert.ok(own.length > 0 || parameter !== "most, 5h", "the sample's first has one");
+    assert.ok(!ids.some((x: string) => x?.startsWith("partner_")), "never another provider's models");
+    for (const g of rest) assert.ok(g.rows.length <= 2 && g.rows.every((r: any) => r.kind === "missing" || r.window.scope === null), `${parameter}: ${g.provider}`);
+    assert.equal(layout.colWidth, Math.floor((layout.inner - layout.gap * (rest.length - 1)) / rest.length), "the others side by side");
+  }
+  assert.deepEqual(plain(lib.layoutGroups(view, "large", "most, claude, gemini", now).groups.map((g: any) => g.provider)).sort(), ["claude", "gemini"], "among those named");
+  assert.equal(lib.layoutGroups(view, "medium", "most, 5h", now).most, false, "medium: not a mode there");
+  const run = await runWidget({ family: "large", demo: "three", parameter: "most, 5h", now });
+  assert.equal(run.error, null, String(run.error));
+  const all = texts(run.widget.node);
+  assert.ok(!all.includes("Weekly usage"), all.join(" | "));
+  const order = ["Codex", "Claude", "Gemini"].sort((a, b) => all.indexOf(a) - all.indexOf(b));
+  assert.equal(order[0], lib.PROVIDER_NAMES[lib.layoutGroups(view, "large", "most, 5h", now).groups[0].provider], "the first drawn first");
+});
+
+test("Widget rows: the overall limits first (5h, then weekly), then the provider's own per-model ones, whatever the view's order", () => {
+  const now = new Date("2026-11-19T12:00:00");
+  const demo = lib.demoResult("three", now).view;
+  const g = demo.gemini;
+  const view = { ...demo, gemini: { ...g, window_ids: ["partner_seven_day", "seven_day_argon", "seven_day", "partner_five_hour", "five_hour"], main_window_ids: ["seven_day", "five_hour"] } };
+  const rows = plain(lib.groupsOf(view, "gemini", now, { allScoped: true })[0].rows.map((r: any) => r.window.id));
+  assert.deepEqual(rows, ["five_hour", "seven_day", "seven_day_argon"]);
+});
+
+test("Legend dots keep the provider's color also without a trend this week (details and the large widget)", async () => {
+  const now = new Date("2026-11-19T12:00:00");
+  const demo = lib.demoResult("normal", now);
+  const html: string = lib.detailHtml({ view: demo.view, events: [], trends: { ...demo.trends, codex: null }, now, provider: null, note: "" });
+  assert.ok(html.includes(`<i class="dot" style="background:${lib.BRAND_COLORS.codex}"></i>Codex</span>`) && !html.includes("Codex –"),
+    "Codex without a trend: its color and name, no –");
+  const history = (url: string) => {
+    if (!url.includes("/v2/history")) return undefined;
+    const q = new URL(url).searchParams;
+    const points = q.get("provider") === "claude" ? [{ at: "2026-11-16T12:00:00.000Z", used_percent: 8, resets_at: null, break: null }] : [];
+    return { status: 200, body: { provider: q.get("provider"), since: null, boundary: "#0", windows: { [q.get("window")!]: points } } };
+  };
+  const run = await runWidget({ family: "large", responder: history });
+  const find = (node: Node): Node | null =>
+    node.children.some((c) => c.kind === "text" && c.props.text === "Weekly usage") ? node : node.children.map(find).find(Boolean) ?? null;
+  const legend = find(run.widget.node);
+  assert.ok(legend && !texts(legend).some((x) => x.endsWith(" –")), "the legend, no –");
+  const at = legend!.children.findIndex((c) => c.kind === "text" && c.props.text === "Codex");
+  const dot = legend!.children.slice(0, at).reverse().find((c) => c.kind === "image")!;
+  assert.deepEqual((dot.props.fills as any[]).map((c) => c.hex), [lib.BRAND_COLORS.codex]);
+});
+
 test("The details page heads the chart with the providers' dots and lines up the history's times", () => {
   const now = new Date("2026-11-19T12:00:00");
   const demo = lib.demoResult("normal", now);
@@ -2638,7 +3037,7 @@ test("The app menu: Details, Preview widget, Notifications and Settings, each co
   assert.deepEqual(plain(lib.notifyPrefs(savedSwitches(toggled.keychain))), { events: false, times: true, rev: 1, times_off_at: null, cancel_pending: false, cancelled: [], cancels: [] }, "each change moves the counter");
   // Settings -> Reset saved data (confirmed): the saved files go, the server and token stay (under a new generation)
   const files = new Map<string, string>([[`/docs/headroom-events-${TAG}-3`, ""], [`/docs/headroom-notify-${TAG}.json`, "{}"]]);
-  const reset = await runWidget({ family: "medium", files, app: { menu: [3, 1] } });
+  const reset = await runWidget({ family: "medium", files, app: { menu: [3, 2, 0] } });
   assert.equal(files.size, 0);
   const kept = savedConfig(reset.keychain);
   assert.deepEqual([kept.url, kept.token], ["https://headroom.example.com", "read-token-xyz"]);
@@ -2659,31 +3058,41 @@ test("The parameter guide lists what the Parameter can say; every builder choice
   const lock = Object.fromEntries(plain(lib.PARAMETER_CHOICES.lock).map(([label, p]: [string, string]) => [label, picks(p)]));
   assert.deepEqual(lock["Claude 5h"], ["claude.five_hour"]);
   assert.deepEqual(lock["Codex weekly"], ["codex.seven_day"]);
-  assert.deepEqual(lock["5h of Codex and Claude, side by side"], ["codex.five_hour", "claude.five_hour"]);
   assert.deepEqual(lock["Gemini weekly"], ["gemini.seven_day"]);
-  assert.deepEqual(lock["Claude 5h and weekly"], ["claude.five_hour", "claude.seven_day"]);
-  assert.equal(lock["Tightest limit"].length, 1);
+  assert.equal(lock["The tightest limit for its time left"].length, 1);
+  assert.equal(lock["5h, of the tightest provider"].length, 1);
+  assert.equal(lock["5h of the others (beside the one above)"].length, 2, "the three but the tightest");
+  assert.ok(!lock["5h of the others (beside the one above)"].includes(lock["5h, of the tightest provider"][0]));
   // Home screen choices show the right groups
   const groups = (p: string) => plain(lib.groupsOf(view, lib.splitNotify(lib.buildParameter(p, true)).display, now).map((g: any) => g.provider));
   const home = Object.fromEntries(plain(lib.PARAMETER_CHOICES.home).map(([label, p]: [string, string]) => [label, groups(p)]));
   assert.deepEqual(home, {
     "Codex and Claude (and any other with values)": ["codex", "claude", "gemini"], "All three": ["codex", "claude", "gemini"],
     "Claude only": ["claude"], "Codex only": ["codex"], "Gemini only": ["gemini"], "Codex and Claude only": ["codex", "claude"],
-    "Claude and Gemini": ["claude", "gemini"], "Codex and Gemini": ["codex", "gemini"], "Tightest limit of each": ["codex", "claude", "gemini"],
+    "Claude and Gemini": ["claude", "gemini"], "Codex and Gemini": ["codex", "gemini"],
+    "The 5h limit of each": ["codex", "claude", "gemini"], "The weekly limit of each": ["codex", "claude", "gemini"],
+    "Large: most used 5h first": ["codex", "claude", "gemini"], "Large: most used weekly first": ["codex", "claude", "gemini"],
   });
+  // every choice is read whole (no word left unknown)
+  for (const [, p] of [...plain(lib.PARAMETER_CHOICES.home), ...plain(lib.PARAMETER_CHOICES.lock)] as [string, string][]) {
+    assert.deepEqual(plain(lib.parseParameter(p).unknown), [], p);
+  }
   // Without Gemini's values: the default is the two; Gemini named shows as not supported
   const two = lib.demoResult("normal", now).view;
   assert.deepEqual(plain(lib.groupsOf(two, "", now).map((g: any) => g.provider)), ["codex", "claude"]);
   assert.deepEqual(plain(lib.groupsOf(two, "claude, gemini", now).map((g: any) => [g.provider, g.message])), [["claude", null], ["gemini", "Not supported"]]);
   const html: string = lib.parameterGuideHtml();
-  for (const p of ["top", "claude 5h, codex 5h", "both weekly", "notify", "demo:runout", "claude.five_hour, gemini.seven_day", "codex, claude, gemini"]) assert.ok(html.includes(`<code>${p}</code>`), p);
+  for (const p of ["claude", "5h", "wk", "notify", "most, 5h", "claude, 5h", "5h, others", "claude, codex, 5h"]) assert.ok(html.includes(`<code>${p}</code>`), p);
+  for (const p of ["top", "both", "demo", "claude.five_hour", "+"]) assert.ok(!html.includes(`<code>${p}`) && !html.includes(`${p}</code>`), `no ${p}`);
+  assert.ok(!/\bdemo\b/i.test(html), "no demo word");
+  assert.ok(html.includes("Preview sample data"), "the samples are in the app");
   assert.ok(html.includes("Edit Widget") && !/https?:\/\//.test(html));
 });
 
 test("The app menu's Widget > Make a parameter copies the parameter or previews it; the guide opens as a page", async () => {
   // Widget -> Make a parameter -> Lock screen -> Claude 5h -> Yes (notifications) -> Copy
-  const copy = await runWidget({ family: "medium", app: { menu: [1, 2, 1, 1, 1, 0] } });
-  assert.deepEqual(copy.copied, ["claude 5h, notify"]);
+  const copy = await runWidget({ family: "medium", app: { menu: [1, 2, 1, 5, 1, 0] } });
+  assert.deepEqual(copy.copied, ["claude, 5h, notify"]);
   assert.equal(copy.requests.length, 0, "nothing read just to copy");
   // Widget -> Make a parameter -> Home screen -> Claude only -> No -> Preview -> Medium (home sizes only)
   const preview = await runWidget({ family: "medium", app: { menu: [1, 2, 0, 2, 0, 1, 1] } });
@@ -2762,7 +3171,7 @@ test("after the server's database is recreated, Reset saved data lets the new nu
   const before = await runWidget({ family: "medium", keychain, files: new Map(files), response: { status: 200, body: sampleView(1) } });
   assert.ok(texts(before.widget.node).includes("90%"), "the old view (number 900) is shown instead");
   // Settings -> Reset saved data
-  const reset = await runWidget({ family: "medium", keychain, files, notifier, app: { menu: [3, 1] } });
+  const reset = await runWidget({ family: "medium", keychain, files, notifier, app: { menu: [3, 2, 0] } });
   const saved = savedConfig(reset.keychain);
   assert.notEqual(saved.id, "1111111111111111", "a new generation");
   assert.deepEqual([saved.url, saved.token], ["https://headroom.example.com", "t"]);
@@ -2870,7 +3279,7 @@ test("no reset reminder without every reset time; monthly cycles are kept; faile
   assert.equal(JSON.parse(files.get(`/docs/headroom-notify-${TAG}.json`)!).checked_at, null);
 });
 
-test("the details show nothing of settings changed while reading; demo works as one item of a parameter", async () => {
+test("the details show nothing of settings changed while reading; a sample drawn with a parameter never notifies", async () => {
   // Settings removed while the details read the events
   const run = await runWidget({ family: "medium", inApp: true, query: { open: "details" }, now: NOTE_NOW,
     responder: eventsAt(feed(0, [])), onLoad: (k, url) => { if (url.includes("/v2/events")) k.clear(); } });
@@ -2878,13 +3287,13 @@ test("the details show nothing of settings changed while reading; demo works as 
   assert.ok(html.includes("Settings changed") && !html.includes("<div class=\"tiles\">"), "no values of the removed settings");
   // claude, demo:normal, notify: the sample (no network, no notifications), showing Claude only
   const notifier = newNotifier();
-  const demo = await runWidget({ family: "medium", parameter: "claude, demo:normal, notify", notifier });
+  const demo = await runWidget({ family: "medium", demo: "normal", parameter: "claude, notify", notifier });
   assert.equal(demo.requests.length, 0);
   assert.equal(notifier.log.length, 0);
   const all = texts(demo.widget.node);
   assert.ok(all.includes("Claude") && !all.includes("Codex"));
-  assert.equal(lib.demoName("claude, demo:stale"), "stale");
-  assert.equal(lib.withoutDemo("claude, demo:stale, notify"), "claude, notify");
+  // notify is a word of the parameter, never an unknown one
+  assert.deepEqual(plain(lib.parseParameter("claude, notify")), { providers: ["claude"], limits: [], most: false, others: false, notify: true, unknown: [] });
 });
 
 test("lock screen taps open the one provider shown; reset lines follow the cycle of now; saving survives a failed cleanup", async () => {
@@ -2945,7 +3354,7 @@ test("Reset saved data works only on the generation it replaces, says what it co
   const notifier = newNotifier();
   notifier.pending.set(`headroom.${id}.back.claude.all.1`, { id: `headroom.${id}.back.claude.all.1` });
   const files = new Map<string, string>([[`/docs/headroom-events-${oldTag}-800`, ""]]);
-  const run = await runWidget({ family: "medium", keychain, files, notifier, app: { menu: [3, 1] },
+  const run = await runWidget({ family: "medium", keychain, files, notifier, app: { menu: [3, 2, 0] },
     onWrite: () => {} });
   const newGen = savedConfig(run.keychain).id;
   const newTag = lib.cacheTag({ id: newGen }, "https://headroom.example.com");
@@ -2954,15 +3363,15 @@ test("Reset saved data works only on the generation it replaces, says what it co
   // The same reset with a new generation's reminder and files already there: they stay
   notifier.pending.set(`headroom.${newGen}.back.codex.all.2`, { id: `headroom.${newGen}.back.codex.all.2` });
   files.set(`/docs/headroom-events-${newTag}-3`, "");
-  const again = await runWidget({ family: "medium", keychain: Object.fromEntries(run.keychain), files, notifier, app: { menu: [3, 1] } });
+  const again = await runWidget({ family: "medium", keychain: Object.fromEntries(run.keychain), files, notifier, app: { menu: [3, 2, 0] } });
   const third = savedConfig(again.keychain).id;
   assert.notEqual(third, newGen);
   assert.ok(!notifier.pending.has(`headroom.${newGen}.back.codex.all.2`), "a generation it replaces is cleared");
   // a removal that fails is reported
-  const failing = await runWidget({ family: "medium", keychain, files: new Map([[`/docs/headroom-events-${oldTag}-9`, ""]]), removeFails: true, app: { menu: [3, 1] } });
+  const failing = await runWidget({ family: "medium", keychain, files: new Map([[`/docs/headroom-events-${oldTag}-9`, ""]]), removeFails: true, app: { menu: [3, 2, 0] } });
   assert.ok(failing.alertTitles.includes("Partly reset"), "a removal that failed is reported");
   // the settings changed while the confirmation was open: nothing is reset
-  const changed = await runWidget({ family: "medium", keychain, app: { menu: [3, 1] },
+  const changed = await runWidget({ family: "medium", keychain, app: { menu: [3, 2, 0] },
     onLoad: () => {}, beforeConfirm: (k: Map<string, string>) => k.set(lib.KEYCHAIN_CONFIG, JSON.stringify({ url: "https://other.example", token: "x", id: "2222222222222222" })) } as any);
   assert.equal(savedConfig(changed.keychain).url, "https://other.example", "the newer settings are kept");
 });
@@ -3044,7 +3453,7 @@ test("settings saved or removed meanwhile by another run are neither overwritten
   assert.equal(edit.keychain.get(lib.KEYCHAIN_CONFIG), other);
   assert.ok(edit.alertTitles.includes("Not saved"));
   // Remove all settings: the same
-  const removed = await runWidget({ family: "medium", keychain, app: { menu: [3, 2] },
+  const removed = await runWidget({ family: "medium", keychain, app: { menu: [3, 2, 1] },
     beforeConfirm: (k: Map<string, string>) => { if (k.get(lib.KEYCHAIN_CONFIG) !== other) k.set(lib.KEYCHAIN_CONFIG, other); } } as any);
   assert.equal(removed.keychain.get(lib.KEYCHAIN_CONFIG), other);
   assert.ok(removed.alertTitles.includes("Not removed"));
@@ -3136,7 +3545,7 @@ test("Remove all settings offers to try the Keychain again at once", async () =>
   const gen = lib.DEFAULT_CONFIG_ID;
   notifier.pending.set(`headroom.${gen}.back.claude.all.1`, { id: `headroom.${gen}.back.claude.all.1` });
   let pendingAtRetry = -1;
-  const ok = await runWidget({ family: "medium", app: { menu: [3, 2] }, notifier,
+  const ok = await runWidget({ family: "medium", app: { menu: [3, 2, 1] }, notifier,
     keychainRemove: () => { if (fails-- > 0) throw new Error("keychain"); },
     // at the retry question (the first try has failed)
     beforeConfirm: () => { if (pendingAtRetry < 0 && fails <= 0) pendingAtRetry = notifier.pending.size; } } as any);
@@ -3223,7 +3632,7 @@ test("Remove all keeps the notifications of settings saved while it lists them",
   const old = lib.DEFAULT_CONFIG_ID;
   notifier.pending.set(`headroom.${old}.back.claude.all.1`, { id: `headroom.${old}.back.claude.all.1` });
   const newer = "2222222222222222";
-  const run = await runWidget({ family: "medium", app: { menu: [3, 2] }, notifier,
+  const run = await runWidget({ family: "medium", app: { menu: [3, 2, 1] }, notifier,
     onAllPending: (k: Map<string, string>, n: any) => {
       if (n.pending.has(`headroom.${newer}.back.codex.all.2`)) return;
       k.set(lib.KEYCHAIN_CONFIG, JSON.stringify({ url: "https://other.example", token: "x", id: newer }));
@@ -3248,7 +3657,7 @@ test("a run whose lock only expired takes it again to take back what the new swi
   assert.equal(notifier.pending.size, 0, "time reminders are off now: taken back");
 });
 
-test("G5-e: a notification whose told record couldn't be saved is told again only when the device shows no trace of it and its run is gone", async () => {
+test("a notification whose told record couldn't be saved is told again only when the device shows no trace of it and its run is gone", async () => {
   const files = new Map<string, string>([[`/docs/headroom-events-${TAG}-3`, ""]]);
   const notifier = newNotifier();
   const keychain = { "headroom.url": "https://headroom.example.com", "headroom.token": "read-token-xyz" };
@@ -3364,7 +3773,7 @@ test("Remove all retries only the values it found, and never keeps the settings 
   const other = JSON.stringify({ url: "https://other.example", token: "x", id: "2222222222222222" });
   let fails = 1;
   let questions = 0;
-  const run = await runWidget({ family: "medium", app: { menu: [3, 2] }, keychain, notifier,
+  const run = await runWidget({ family: "medium", app: { menu: [3, 2, 1] }, keychain, notifier,
     keychainRemove: () => { if (fails-- > 0) throw new Error("keychain"); },
     // another run saves new settings while the retry question is open (the second question)
     beforeConfirm: (k: Map<string, string>) => { if (++questions === 2) saveAs(k, other); } } as any);
@@ -3416,7 +3825,7 @@ test("Remove all removes nothing it can't tell apart when the Keychain can't be 
   notifier.pending.set(`headroom.${newer}.back.claude.all.1`, { id: `headroom.${newer}.back.claude.all.1` });
   // while the reminders are listed, another run saves new settings, and then the Keychain can't be read
   let failing = false;
-  await runWidget({ family: "medium", app: { menu: [3, 2] }, keychain, notifier,
+  await runWidget({ family: "medium", app: { menu: [3, 2, 1] }, keychain, notifier,
     onAllPending: (k: Map<string, string>) => {
       k.set(lib.KEYCHAIN_CONFIG, JSON.stringify({ url: "https://other.example", token: "x", id: newer }));
       failing = true;
@@ -3516,19 +3925,19 @@ test("the notification menu checks again once it holds the lock, and an item Rem
   assert.equal(lib.notifyPrefs(savedSwitches(run.keychain))!.rev, 7, "the other menu's change stays");
   // Remove all: the settings item can't be removed the first time
   let fails = 1;
-  const removed = await runWidget({ family: "medium", app: { menu: [3, 2] },
+  const removed = await runWidget({ family: "medium", app: { menu: [3, 2, 1] },
     keychain: { [lib.KEYCHAIN_CONFIG]: JSON.stringify({ url: "https://headroom.example.com", token: "t", id: "1111111111111111" }) },
     keychainRemove: (k: string) => { if (k === lib.KEYCHAIN_CONFIG && fails-- > 0) throw new Error("keychain"); } } as any);
   assert.ok(removed.alertTitles.includes("Not fully removed"), "offered to try again");
   assert.equal(savedConfig(removed.keychain), null, "removed on the retry");
 });
 
-// ---- Guarantees G2 on the iPhone
+// ---- Guarantees on the iPhone: withdrawn values and late responses
 const emptyView = (dataVersion: number) => ({ view_version: 1, data_version: dataVersion, claude: null, codex: null, boundaries: { claude: "#0", codex: "#0" } });
 const notifyWith = (files: Map<string, string>, notifier: Notifier, response: { status: number; body: unknown }) =>
   runWidget({ family: "medium", inApp: true, shortcut: "notify", files, notifier, now: NOTE_NOW, response, responder: eventsAt(feed(3, [])) });
 
-test("G2-a: a withdrawn value reaches the iPhone; a late old response or a failure after it plans nothing from the old value", async () => {
+test("a withdrawn value reaches the iPhone; a late old response or a failure after it plans nothing from the old value", async () => {
   const files = new Map<string, string>([[`/docs/headroom-events-${TAG}-3`, ""]]);
   const notifier = newNotifier();
   const withValues = { ...demoBody("reset", NOTE_NOW), data_version: 5 };
@@ -3542,7 +3951,7 @@ test("G2-a: a withdrawn value reaches the iPhone; a late old response or a failu
   assert.equal(notifier.pending.size, 0, "nor does a failure after it");
 });
 
-test("G2-b: a newer response with new boundaries, then a late older one: the newer boundaries stay", async () => {
+test("a newer response with new boundaries, then a late older one: the newer boundaries stay", async () => {
   const files = new Map<string, string>([[`/docs/headroom-events-${TAG}-3`, ""]]);
   const notifier = newNotifier();
   const newer = { ...demoBody("normal", NOTE_NOW), data_version: 8, boundaries: { claude: "2026-11-19T11:00:00.000Z#1", codex: "#0" } };
@@ -3554,7 +3963,7 @@ test("G2-b: a newer response with new boundaries, then a late older one: the new
   assert.ok([...files.keys()].some((k) => k.includes(`headroom-view-${TAG}-8`)), "the newer view is the saved one");
 });
 
-test("G2-c: an ordinary network failure keeps the previous value (shown as old) and its version", async () => {
+test("an ordinary network failure keeps the previous value (shown as old) and its version", async () => {
   const files = new Map<string, string>();
   const ok = await runWidget({ family: "medium", files, response: { status: 200, body: sampleView(5) } });
   assert.equal(ok.error, null);
@@ -3563,7 +3972,7 @@ test("G2-c: an ordinary network failure keeps the previous value (shown as old) 
   assert.ok([...files.keys()].some((k) => k.includes(`headroom-view-${TAG}-5`)), "and kept");
 });
 
-test("G2-d: values after a withdrawal show; a late empty response doesn't take them away", async () => {
+test("values after a withdrawal show; a late empty response doesn't take them away", async () => {
   const files = new Map<string, string>();
   await runWidget({ family: "medium", files, response: { status: 200, body: emptyView(6) } });
   await runWidget({ family: "medium", files, response: { status: 200, body: sampleView(7) } });
@@ -3572,11 +3981,11 @@ test("G2-d: values after a withdrawal show; a late empty response doesn't take t
   assert.ok(texts(late.widget.node).some((x) => /%/.test(x)), "the values are drawn");
 });
 
-// ---- Guarantees G4 and G5: each counterexample with its control
+// ---- Guarantees for the settings and the notifications: each counterexample with its control
 const CONFIG_A = JSON.stringify({ url: "https://headroom.example.com", token: "t", id: "1111111111111111" });
 const CONFIG_B = JSON.stringify({ url: "https://headroom.example.com", token: "t2", id: "2222222222222222" });
 
-test("G4-a: new settings saved at any moment of Remove all (right before each item is removed, also on a retry) keep their settings and switches", async () => {
+test("new settings saved at any moment of Remove all (right before each item is removed, also on a retry) keep their settings and switches", async () => {
   const keyed = (k: Map<string, string>) => saveAs(k, CONFIG_A, JSON.stringify({ times: false }));
   // another run of the script under test saves B its own way (an earlier version wrote the single items)
   const saveB = (k: Map<string, string>) => {
@@ -3591,7 +4000,7 @@ test("G4-a: new settings saved at any moment of Remove all (right before each it
       else { keychain.set(lib.KEYCHAIN_CONFIG, CONFIG_A); keychain.set(lib.KEYCHAIN_NOTIFY, JSON.stringify({ times: false })); }
       let calls = 0;
       let fails = 1;
-      const run = await runWidget({ family: "medium", app: { menu: [3, 2] }, keychain: Object.fromEntries(keychain),
+      const run = await runWidget({ family: "medium", app: { menu: [3, 2, 1] }, keychain: Object.fromEntries(keychain),
         keychainRemove: (k: string) => {
           if (++calls === n) saveB(runKeychain!);
           // the first removal fails once: a retry goes over the items again
@@ -3608,18 +4017,18 @@ test("G4-a: new settings saved at any moment of Remove all (right before each it
 });
 let runKeychain: Map<string, string> | null = null;
 
-test("G4-b: a switches item that can't be removed leaves Remove all unfinished and asks to retry; quitting there, a new setup starts with its own switches", async () => {
+test("a switches item that can't be removed leaves Remove all unfinished and asks to retry; quitting there, a new setup starts with its own switches", async () => {
   // can't be read: nothing needs reading to remove it (each generation's items are its own), so it goes
   const keychain = new Map<string, string>();
   saveAs(keychain, CONFIG_A, JSON.stringify({ times: false }));
-  const unreadable = await runWidget({ family: "medium", app: { menu: [3, 2] }, keychain: Object.fromEntries(keychain),
+  const unreadable = await runWidget({ family: "medium", app: { menu: [3, 2, 1] }, keychain: Object.fromEntries(keychain),
     keychainGetFailsWhen: (k: string) => k.startsWith("headroom.notify.") } as any);
   assert.ok(!unreadable.alertTitles.includes("Not fully removed"));
   assert.ok(![...unreadable.keychain.keys()].some((k) => k.startsWith("headroom.notify.") || k.startsWith("headroom.config.")), "removed");
   // can't be removed: unfinished, and the retry clears it once the fault is gone
   let failing = true;
   let questions = 0;
-  const run = await runWidget({ family: "medium", app: { menu: [3, 2] }, keychain: Object.fromEntries(keychain),
+  const run = await runWidget({ family: "medium", app: { menu: [3, 2, 1] }, keychain: Object.fromEntries(keychain),
     keychainRemove: (k: string) => { if (failing && k.startsWith("headroom.notify.")) throw new Error("keychain"); },
     // the fault goes away when the retry is offered (the second question)
     beforeConfirm: () => { if (++questions === 2) failing = false; } } as any);
@@ -3627,7 +4036,7 @@ test("G4-b: a switches item that can't be removed leaves Remove all unfinished a
   assert.equal(savedConfig(run.keychain), null);
   assert.ok(![...run.keychain.keys()].some((k) => k.startsWith("headroom.notify.")), "cleared on the retry");
   // quitting at the retry question: the old switches are left, but a new setup doesn't take them
-  const quit = await runWidget({ family: "medium", app: { menu: [3, 2] }, keychain: Object.fromEntries(keychain), answers: [0, -1],
+  const quit = await runWidget({ family: "medium", app: { menu: [3, 2, 1] }, keychain: Object.fromEntries(keychain), answers: [0, -1],
     keychainRemove: (k: string) => { if (k.startsWith("headroom.notify.")) throw new Error("keychain"); } } as any);
   assert.equal(savedConfig(quit.keychain), null);
   assert.ok(quit.keychain.has("headroom.notify.1111111111111111"), "left by the quit");
@@ -3643,7 +4052,7 @@ test("G4-b: a switches item that can't be removed leaves Remove all unfinished a
 });
 let run0 = 0;
 
-test("G4-c: a stored switch value of the wrong shape stops the run; a re-read failing just before cancelling keeps the reminders", async () => {
+test("a stored switch value of the wrong shape stops the run; a re-read failing just before cancelling keeps the reminders", async () => {
   for (const stored of ["", "[]", JSON.stringify({ times: "false" })]) {
     assert.equal(lib.notifyPrefs(stored), null, JSON.stringify(stored));
     const notifier = newNotifier();
@@ -3669,21 +4078,21 @@ test("G4-c: a stored switch value of the wrong shape stops the run; a re-read fa
   assert.equal(notifier.pending.size, 1, "not cancelled on a read that failed");
 });
 
-test("G4-d: with nothing in the way, Remove all removes the settings, switches, saved data and notifications", async () => {
+test("with nothing in the way, Remove all removes the settings, switches, saved data and notifications", async () => {
   const gen = "1111111111111111";
   const tag = lib.cacheTag({ id: gen }, "https://headroom.example.com");
   const notifier = newNotifier();
   notifier.pending.set(`headroom.${gen}.back.claude.all.1`, { id: `headroom.${gen}.back.claude.all.1` });
   notifier.delivered.set(`headroom.${gen}.events.5.claude`, { id: `headroom.${gen}.events.5.claude` });
   const files = new Map<string, string>([[`/docs/headroom-notify-${tag}.json`, "{}"], [`/docs/headroom-events-${tag}-5`, ""]]);
-  const run = await runWidget({ family: "medium", app: { menu: [3, 2] }, files, notifier,
+  const run = await runWidget({ family: "medium", app: { menu: [3, 2, 1] }, files, notifier,
     keychain: { [lib.KEYCHAIN_CONFIG]: CONFIG_A, [lib.KEYCHAIN_NOTIFY]: JSON.stringify({ times: false }) } });
   assert.equal(run.keychain.size, 0);
   assert.equal(notifier.pending.size + notifier.delivered.size, 0);
   assert.ok(![...files.keys()].some((k) => k.includes(tag)));
 });
 
-test("G4-e: turning time reminders off cancels at once; unconfirmed, it shows cancel pending until a notifying run confirms", async () => {
+test("turning time reminders off cancels at once; unconfirmed, it shows cancel pending until a notifying run confirms", async () => {
   const gen = lib.DEFAULT_CONFIG_ID;
   const id = `headroom.${gen}.back.claude.all.29918280`;
   // confirmed: nothing left on the device
@@ -3707,7 +4116,7 @@ test("G4-e: turning time reminders off cancels at once; unconfirmed, it shows ca
   assert.equal(lib.notifyPrefs(savedSwitches(after.keychain))!.cancel_pending, false);
 });
 
-test("G5-a: a stopped already on the device and a resumed not yet: the resumed is told, then the cursor passes it", async () => {
+test("a stopped already on the device and a resumed not yet: the resumed is told, then the cursor passes it", async () => {
   const gen = lib.DEFAULT_CONFIG_ID;
   const files = new Map<string, string>([[`/docs/headroom-events-${TAG}-4`, ""]]);
   const notifier = newNotifier();
@@ -3725,7 +4134,7 @@ test("G5-a: a stopped already on the device and a resumed not yet: the resumed i
   assert.ok(!files2.has(`/docs/headroom-events-${TAG}-6`));
 });
 
-test("G5-b: limits of two providers both on the device just before: none told again, both cycles remembered (also past their reset)", async () => {
+test("limits of two providers both on the device just before: none told again, both cycles remembered (also past their reset)", async () => {
   const gen = lib.DEFAULT_CONFIG_ID;
   const files = new Map<string, string>([[`/docs/headroom-events-${TAG}-3`, ""]]);
   const notifier = newNotifier();
@@ -3746,7 +4155,7 @@ test("G5-b: limits of two providers both on the device just before: none told ag
   assert.equal(lib.selectAlerts([passed], null, NOTE_NOW, { told: { limits: [], warned: [] }, times: true }).told.limits.length, 0);
 });
 
-test("G5-c: a reset whose reminder can't be checked is held; the next run tells it only if the reminder was cancelled before ringing", async () => {
+test("a reset whose reminder can't be checked is held; the next run tells it only if the reminder was cancelled before ringing", async () => {
   const gen = lib.DEFAULT_CONFIG_ID;
   const cycle = "2026-11-19T11:59:00.000Z";
   const id = `headroom.${gen}.back.claude.all.${Math.round(Date.parse(cycle) / 60000)}.0123abcd`;
@@ -3772,7 +4181,7 @@ test("G5-c: a reset whose reminder can't be checked is held; the next run tells 
   assert.equal(notifier2.log.length, 1);
 });
 
-test("G5-d: an old view without a stamp, or an earlier switch's mark, doesn't hold back the new account's warning", () => {
+test("an old view without a stamp, or an earlier switch's mark, doesn't hold back the new account's warning", () => {
   // 701: time reminders off; a view without stamps forecasts "lasts"; the new account's soon is told
   const view = plain(lib.demoResult("normal", NOTE_NOW).view);
   delete view.boundaries;
@@ -3789,7 +4198,7 @@ test("G5-d: an old view without a stamp, or an earlier switch's mark, doesn't ho
   assert.equal(titles(lib.selectAlerts([warn], null, NOTE_NOW, { told: { limits: [], warned: [same] }, times: false, since })).length, 0);
 });
 
-test("G5-f: an unshown stopped and resumed cancel out in either order; a single alert is told once over runs", async () => {
+test("an unshown stopped and resumed cancel out in either order; a single alert is told once over runs", async () => {
   const a = ev(5, "collection_stopped", { provider: null, window_id: null });
   const b = ev(6, "collection_resumed", { provider: null, window_id: null });
   assert.equal(titles(lib.selectAlerts([a, b], null, NOTE_NOW, {})).length, 0);
@@ -3802,7 +4211,7 @@ test("G5-f: an unshown stopped and resumed cancel out in either order; a single 
   assert.equal(notifier.log.length, 1);
 });
 
-test("G5-g: a reset reminder that couldn't be scheduled is made up by the event's reset; one that was delivered isn't", () => {
+test("a reset reminder that couldn't be scheduled is made up by the event's reset; one that was delivered isn't", () => {
   const cycle = "2026-11-19T11:59:00.000Z";
   const told = { limits: [{ key: `claude.five_hour.${cycle}`, at: 1, event_at: 1, until: NOTE_NOW.getTime() + 86_400_000 }], warned: [] };
   const reset = ev(9, "reset", { cycle, resets_at: cycle });
@@ -3813,7 +4222,7 @@ test("G5-g: a reset reminder that couldn't be scheduled is made up by the event'
   assert.equal(titles(lib.selectAlerts([reset], null, NOTE_NOW, { told, reminders: rang, times: true, pending: new Set() })).length, 0);
 });
 
-test("G4-c (the order): a run whose lock expired after it scheduled keeps its reminder whichever read of the switches fails", async () => {
+test("a run whose lock expired after it scheduled keeps its reminder whichever read of the switches fails (the order)", async () => {
   const LEGACY = { "headroom.url": "https://headroom.example.com", "headroom.token": "read-token-xyz", [lib.KEYCHAIN_NOTIFY]: JSON.stringify({ times: true }) };
   for (let k = 1; k <= 4; k++) {
     const files = new Map<string, string>([[`/docs/headroom-events-${TAG}-3`, ""]]);
@@ -3829,7 +4238,7 @@ test("G4-c (the order): a run whose lock expired after it scheduled keeps its re
   }
 });
 
-test("G4-e (stopping right after turning off): Off is saved together with cancel pending, and the menu shows it until confirmed", async () => {
+test("Off is saved together with cancel pending, and the menu shows it until confirmed (stopping right after turning off)", async () => {
   const id = `headroom.${lib.DEFAULT_CONFIG_ID}.back.claude.all.29918280`;
   const notifier = newNotifier();
   notifier.pending.set(id, { id });
@@ -3849,7 +4258,7 @@ test("G4-e (stopping right after turning off): Off is saved together with cancel
   assert.ok(done.actionLabels.includes("Time reminders: Off"), done.actionLabels.join(" | "));
 });
 
-test("G5-e (per number): an intent for 5 and 6 with only 5 on the device (told by another run) tells 6 again", async () => {
+test("an intent for 5 and 6 with only 5 on the device (told by another run) tells 6 again (per number)", async () => {
   const gen = lib.DEFAULT_CONFIG_ID;
   const weekly = { window_id: "seven_day", label: "Weekly", resets_at: "2026-11-21T00:00:00.000Z", cycle: "2026-11-21T00:00:00.000Z" };
   const events = feed(6, [ev(5, "limit"), ev(6, "threshold", { threshold: 80, ...weekly })]);
@@ -3872,7 +4281,7 @@ test("G5-e (per number): an intent for 5 and 6 with only 5 on the device (told b
   assert.equal(notifier2.log.length, 0);
 });
 
-test("G5-a (late evidence): a stopped another run tells while this one is about to tell a later limit: its resumed is told too", async () => {
+test("a stopped another run tells while this one is about to tell a later limit: its resumed is told too (late evidence)", async () => {
   const gen = lib.DEFAULT_CONFIG_ID;
   const files = new Map<string, string>([[`/docs/headroom-events-${TAG}-4`, ""]]);
   const notifier = newNotifier();
@@ -3893,7 +4302,7 @@ test("G5-a (late evidence): a stopped another run tells while this one is about 
   assert.ok(files2.has(`/docs/headroom-events-${TAG}-7`));
 });
 
-test("G5-b (late evidence): limits shown by another run only at the re-read, one already past its reset: both cycles remembered", async () => {
+test("limits shown by another run only at the re-read, one already past its reset: both cycles remembered (late evidence)", async () => {
   const gen = lib.DEFAULT_CONFIG_ID;
   const files = new Map<string, string>([[`/docs/headroom-events-${TAG}-3`, ""]]);
   const notifier = newNotifier();
@@ -3910,7 +4319,7 @@ test("G5-b (late evidence): limits shown by another run only at the re-read, one
   assert.ok(told.some((k: string) => k.startsWith("claude.seven_day")) && told.some((k: string) => k.startsWith("codex.seven_day")), told.join(", "));
 });
 
-test("G5-c (unconfirmed): a reset reminder saved but never known to be scheduled doesn't count as rung, unless the device shows it delivered", () => {
+test("a reset reminder saved but never known to be scheduled doesn't count as rung, unless the device shows it delivered (unconfirmed)", () => {
   const cycle = "2026-11-19T11:59:00.000Z";
   const told = { limits: [{ key: `claude.five_hour.${cycle}`, at: 1, event_at: 1, until: NOTE_NOW.getTime() + 86_400_000 }], warned: [] };
   const reset = ev(9, "reset", { cycle, resets_at: cycle });
@@ -3928,7 +4337,7 @@ test("G5-c (unconfirmed): a reset reminder saved but never known to be scheduled
   assert.equal(titles(lib.selectAlerts([reset], null, NOTE_NOW, { told, reminders: [{ ...reminder, confirmed: true }], times: true, pending: new Set([id]), deliveredIds: new Set([id]) })).length, 0);
 });
 
-test("G5-d (a later switch known): a switch between an old mark and a new warning makes them different accounts, whichever switch it is", () => {
+test("a switch between an old mark and a new warning makes them different accounts, whichever switch it is (a later switch known)", () => {
   // a mark without a stamp at 11:30, the event's own switch 11:40, the warning 11:45, a later switch the device knows at 11:50
   const since = { claude: Date.parse("2026-11-19T11:50:00Z") };
   const old = { key: "claude.five_hour.2026-11-19T15:00:00.000Z", at: 1, event_at: Date.parse("2026-11-19T11:30:00Z"), until: NOTE_NOW.getTime() + 86_400_000 };
@@ -3939,7 +4348,7 @@ test("G5-d (a later switch known): a switch between an old mark and a new warnin
   assert.equal(titles(lib.selectAlerts([warn], null, NOTE_NOW, { told: { limits: [], warned: [same] }, times: false, since })).length, 0);
 });
 
-test("G5-g (a real failure): the reset reminder's scheduling fails, and the event's reset tells it; one that rang isn't told again", async () => {
+test("the reset reminder's scheduling fails, and the event's reset tells it; one that rang isn't told again (a real failure)", async () => {
   const cycle = "2026-11-19T14:00:00.000Z";
   const at = new Date("2026-11-19T14:01:00Z");
   const state = JSON.stringify({ reminders: [], told: { limits: [{ key: `codex.five_hour.${cycle}`, at: 1, event_at: NOTE_NOW.getTime() - 120_000, boundary: "#0", until: at.getTime() + 86_400_000 }], warned: [] }, sent: [] });
@@ -3963,7 +4372,7 @@ test("G5-g (a real failure): the reset reminder's scheduling fails, and the even
   }
 });
 
-test("G4-f: a replacement publishes only what it replaces as read: a removal or a switch change meanwhile stops it; one after the check is carried over", async () => {
+test("a replacement publishes only what it replaces as read: a removal or a switch change meanwhile stops it; one after the check is carried over", async () => {
   const A = "1111111111111111";
   const start = () => {
     const k = new Map<string, string>();
@@ -3972,7 +4381,7 @@ test("G4-f: a replacement publishes only what it replaces as read: a removal or 
   };
   // Remove all (another run) takes A away while Reset saved data reads it
   let removed = false;
-  const gone = await runWidget({ family: "medium", app: { menu: [3, 1] }, keychain: start(),
+  const gone = await runWidget({ family: "medium", app: { menu: [3, 2, 0] }, keychain: start(),
     onKeychainContains: (k: Map<string, string>, key: string) => {
       if (!removed && key === `headroom.notify.${A}`) {
         removed = true;
@@ -3984,7 +4393,7 @@ test("G4-f: a replacement publishes only what it replaces as read: a removal or 
   assert.ok(gone.alertTitles.includes("Not reset"));
   // time reminders turned off on A (another menu) after the switches were copied: not published
   let keychainRef: Map<string, string> | null = null;
-  const changed = await runWidget({ family: "medium", app: { menu: [3, 1] }, keychain: start(),
+  const changed = await runWidget({ family: "medium", app: { menu: [3, 2, 0] }, keychain: start(),
     onKeychainContains: (k: Map<string, string>) => { keychainRef = k; },
     onKeychainSet: (key: string) => {
       if (key.startsWith("headroom.notify.") && key !== `headroom.notify.${A}`) keychainRef!.set(`headroom.notify.${A}`, JSON.stringify({ events: true, times: false, rev: 2 }));
@@ -3992,7 +4401,7 @@ test("G4-f: a replacement publishes only what it replaces as read: a removal or 
   assert.equal(JSON.stringify(savedConfig(changed.keychain)), CONFIG_A, "A stays current");
   assert.equal(lib.notifyPrefs(savedSwitches(changed.keychain))!.times, false, "with the change");
   // turned off right after the check, before the new generation is named: carried over to it
-  const late = await runWidget({ family: "medium", app: { menu: [3, 1] }, keychain: start(),
+  const late = await runWidget({ family: "medium", app: { menu: [3, 2, 0] }, keychain: start(),
     onKeychainContains: (k: Map<string, string>) => { keychainRef = k; },
     onKeychainSet: (key: string) => {
       if (key === lib.KEYCHAIN_CURRENT) keychainRef!.set(`headroom.notify.${A}`, JSON.stringify({ events: true, times: false, rev: 2 }));
@@ -4000,12 +4409,12 @@ test("G4-f: a replacement publishes only what it replaces as read: a removal or 
   assert.notEqual(currentId(late.keychain), A);
   assert.equal(lib.notifyPrefs(savedSwitches(late.keychain))!.times, false, "the change carried over");
   // the control: a plain reset keeps the switches
-  const plainReset = await runWidget({ family: "medium", app: { menu: [3, 1] }, keychain: start() });
+  const plainReset = await runWidget({ family: "medium", app: { menu: [3, 2, 0] }, keychain: start() });
   assert.notEqual(currentId(plainReset.keychain), A);
   assert.equal(lib.notifyPrefs(savedSwitches(plainReset.keychain))!.times, true);
 });
 
-test("G4-g: a cancel owed when time reminders were turned off follows each replacement, and goes only once nothing of it waits", async () => {
+test("a cancel owed when time reminders were turned off follows each replacement, and goes only once nothing of it waits", async () => {
   const A = "1111111111111111";
   const id = `headroom.${A}.back.claude.all.29918280.0123abcd`;
   const k = new Map<string, string>();
@@ -4015,7 +4424,7 @@ test("G4-g: a cancel owed when time reminders were turned off follows each repla
   // replaced twice while the list of pending reminders can't be read (A to B, B to C)
   let keychain = Object.fromEntries(k);
   for (let i = 0; i < 2; i++) {
-    const reset = await runWidget({ family: "medium", app: { menu: [3, 1] }, keychain, notifier, pendingFails: true } as any);
+    const reset = await runWidget({ family: "medium", app: { menu: [3, 2, 0] }, keychain, notifier, pendingFails: true } as any);
     keychain = Object.fromEntries(reset.keychain);
   }
   const menu = await runWidget({ family: "medium", app: { menu: [2] }, keychain, notifier });
@@ -4037,7 +4446,7 @@ test("G4-g: a cancel owed when time reminders were turned off follows each repla
 const stoppedEv = (n: number) => ev(n, "collection_stopped", { provider: null, window_id: null });
 const resumedEv = (n: number) => ev(n, "collection_resumed", { provider: null, window_id: null });
 
-test("G5-h: a stopped another run is handing to iOS is neither cancelled out nor passed; once it is delivered, its resumed is told", async () => {
+test("a stopped another run is handing to iOS is neither cancelled out nor passed; once it is delivered, its resumed is told", async () => {
   const gen = lib.DEFAULT_CONFIG_ID;
   const files = new Map<string, string>([[`/docs/headroom-events-${TAG}-4`, ""],
     [`/docs/${lib.recordName("intent", TAG, 5, "aaaaaaaa")}`, JSON.stringify({ seqs: [5], at: NOTE_NOW.getTime() - 30_000 })]]);
@@ -4066,7 +4475,7 @@ test("G5-h: a stopped another run is handing to iOS is neither cancelled out nor
   assert.ok(files3.has(`/docs/headroom-events-${TAG}-6`));
 });
 
-test("G5-i: the told records outlive a cursor that couldn't be written and a slower run's older state: nothing told twice, both cycles kept", async () => {
+test("the told records outlive a cursor that couldn't be written and a slower run's older state: nothing told twice, both cycles kept", async () => {
   const files = new Map<string, string>([[`/docs/headroom-events-${TAG}-3`, ""]]);
   const notifier = newNotifier();
   const limits = feed(5, [ev(4, "limit", { provider: "codex", window_id: "five_hour", cycle: "2026-11-19T14:00:00.000Z", resets_at: "2026-11-19T14:00:00.000Z" }),
@@ -4085,7 +4494,7 @@ test("G5-i: the told records outlive a cursor that couldn't be written and a slo
   assert.equal(notifier.log.filter((n: any) => String(n.body).includes("usable again")).length, 2);
 });
 
-test("G5-j: version 64's notification about to be told (5 and 6), with only 5 on the device: 5's cycle is kept, 6 and the reset 7 are told", async () => {
+test("version 64's notification about to be told (5 and 6), with only 5 on the device: 5's cycle is kept, 6 and the reset 7 are told", async () => {
   const gen = lib.DEFAULT_CONFIG_ID;
   const weekly = { window_id: "seven_day", label: "Weekly", resets_at: "2026-11-21T00:00:00.000Z", cycle: "2026-11-21T00:00:00.000Z" };
   const state = { reminders: [], told: { limits: [], warned: [] }, sent: [],
@@ -4106,7 +4515,7 @@ const saveViewFile = (files: Map<string, string>, body: unknown) => {
   files.set(`/docs/headroom-seen-${TAG}-${v}`, "");
 };
 
-test("G2-b (the iPhone): a widget saved a newer view with new boundaries; the notifying run that read an older one takes the newer", async () => {
+test("a widget saved a newer view with new boundaries; the notifying run that read an older one takes the newer (the iPhone)", async () => {
   const files = new Map<string, string>([[`/docs/headroom-events-${TAG}-3`, ""]]);
   const notifier = newNotifier();
   const older = { ...demoBody("reset", NOTE_NOW), data_version: 7, boundaries: { claude: "#0", codex: "#0" } };
@@ -4141,7 +4550,7 @@ test("when the saved files can't be listed, a late older response is neither sho
 // ---- The device's floor and its withdrawals (the newest version seen here)
 const withdrawnMarker = (files: Map<string, string>, v: number) => files.set(`/docs/headroom-seen-${TAG}-${v}`, "withdrawn");
 
-test("G2-g: a withdrawal recorded in its seen marker holds without its body: no older value shown, saved or planned from", async () => {
+test("a withdrawal recorded in its seen marker holds without its body: no older value shown, saved or planned from", async () => {
   const files = new Map<string, string>([[`/docs/headroom-events-${TAG}-3`, ""]]);
   saveViewFile(files, { ...demoBody("reset", NOTE_NOW), data_version: 5 });
   // the empty 6 was received (its marker says so) but its body couldn't be kept
@@ -4167,7 +4576,7 @@ test("G2-g: a withdrawal recorded in its seen marker holds without its body: no 
   assert.equal(notifier2.log.length, 0, "held");
 });
 
-test("G2-h: a withdrawal seen before a reminder is handed to iOS stops it; one landing after it is cancelled by the next run", async () => {
+test("a withdrawal seen before a reminder is handed to iOS stops it; one landing after it is cancelled by the next run", async () => {
   const body = { ...demoBody("reset", NOTE_NOW), data_version: 5 };
   // seen before: no schedule call at all
   const files = new Map<string, string>([[`/docs/headroom-events-${TAG}-3`, ""]]);
@@ -4204,7 +4613,7 @@ test("a run with an older view never cancels a reminder planned from a newer one
   assert.deepEqual(current.cancel, [newer.id], "the control: a newer view cancels what it doesn't plan");
 });
 
-test("G5-k: two accounts' reset reminders of the same minute have their own identifiers; one's delivery never stands for the other's", () => {
+test("two accounts' reset reminders of the same minute have their own identifiers; one's delivery never stands for the other's", () => {
   const gen = lib.DEFAULT_CONFIG_ID;
   const cycle = "2026-11-19T11:59:00.000Z";
   const item = (boundary: string | null) => ({ kind: "back", provider: "claude", window_id: "five_hour", cycle: Date.parse(cycle), fire_at: Date.parse(cycle), boundary });
@@ -4245,25 +4654,25 @@ test("the settings form changes nothing when the saved settings can't be read, w
   assert.equal(savedConfig(ok.keychain).token, "t2", ok.alertTitles.join(" | "));
 });
 
-test("G4-b (shared items): Remove all reads an item shared with earlier versions before removing it; one it can't read stays and it asks to retry", async () => {
+test("Remove all reads an item shared with earlier versions before removing it; one it can't read stays and it asks to retry (shared items)", async () => {
   const keychain = { [lib.KEYCHAIN_CONFIG]: CONFIG_A, [lib.KEYCHAIN_NOTIFY]: JSON.stringify({ events: true, times: false }) };
   // the shared switches can't be read once Remove all is confirmed; the fault goes when the retry is offered
   let questions = 0;
   let failing = false;
-  const run = await runWidget({ family: "medium", app: { menu: [3, 2] }, keychain,
+  const run = await runWidget({ family: "medium", app: { menu: [3, 2, 1] }, keychain,
     beforeConfirm: () => { questions++; failing = questions === 1; },
     keychainGetFailsWhen: (k: string) => failing && k === lib.KEYCHAIN_NOTIFY } as any);
   assert.ok(run.alertTitles.includes("Not fully removed"), run.alertTitles.join(" | "));
   assert.ok(!run.keychain.has(lib.KEYCHAIN_NOTIFY), "removed on the retry, once read");
   // quitting at the retry: the item it couldn't read stays
-  const quit = await runWidget({ family: "medium", app: { menu: [3, 2] }, keychain, answers: [0, -1],
+  const quit = await runWidget({ family: "medium", app: { menu: [3, 2, 1] }, keychain, answers: [0, -1],
     beforeConfirm: () => { failing = true; },
     keychainGetFailsWhen: (k: string) => failing && k === lib.KEYCHAIN_NOTIFY } as any);
   assert.ok(quit.keychain.has(lib.KEYCHAIN_NOTIFY), "not removed unread");
 });
 
 // ---- Turning time reminders off and on again
-test("G4-e (on again): turning time reminders on again keeps the cancel still owed; the next notifying run cancels the old reminder", async () => {
+test("turning time reminders on again keeps the cancel still owed; the next notifying run cancels the old reminder (on again)", async () => {
   const gen = lib.DEFAULT_CONFIG_ID;
   const old = `headroom.${gen}.back.claude.five_hour.29918280.0123456789abcdef.0a0a0a0a`;
   const notifier = newNotifier();
@@ -4283,7 +4692,7 @@ test("G4-e (on again): turning time reminders on again keeps the cancel still ow
   assert.equal(lib.notifyPrefs(savedSwitches(run.keychain))!.cancels.length, 0, "settled");
 });
 
-test("G4-e (on its way): turning off isn't confirmed while a reminder saved as about to be scheduled may still reach iOS", async () => {
+test("turning off isn't confirmed while a reminder saved as about to be scheduled may still reach iOS (on its way)", async () => {
   const gen = lib.DEFAULT_CONFIG_ID;
   const t = NOTE_NOW.getTime() + 3_600_000;
   const id = `headroom.${gen}.back.claude.five_hour.${Math.round(t / 60_000)}.0123456789abcdef.0a0a0a0a`;
@@ -4299,7 +4708,7 @@ test("G4-e (on its way): turning off isn't confirmed while a reminder saved as a
 });
 
 // ---- Reminders being cancelled, and deliveries of the same identifier under another stamp
-test("G5-l: a reminder saved as being cancelled doesn't count as rung unless the device shows it delivered; a delivery counts only with its own stamp", () => {
+test("a reminder saved as being cancelled doesn't count as rung unless the device shows it delivered; a delivery counts only with its own stamp", () => {
   const gen = lib.DEFAULT_CONFIG_ID;
   const cycle = "2026-11-19T11:59:00.000Z";
   const stamp = "2026-11-19T10:00:00.000Z#1";
@@ -4321,7 +4730,7 @@ test("G5-l: a reminder saved as being cancelled doesn't count as rung unless the
 });
 
 // ---- The seen marker and the list of files on the iPhone
-test("G2-g (the marker): a view whose seen marker can't be saved is shown, but neither saved nor planned from", async () => {
+test("a view whose seen marker can't be saved is shown, but neither saved nor planned from (the marker)", async () => {
   const files = new Map<string, string>([[`/docs/headroom-events-${TAG}-3`, ""]]);
   const notifier = newNotifier();
   const run = await runWidget({ family: "medium", parameter: "notify", files, notifier, now: NOTE_NOW,
@@ -4338,7 +4747,7 @@ test("G2-g (the marker): a view whose seen marker can't be saved is shown, but n
   assert.equal(notifier2.pending.size, 1);
 });
 
-test("G2-g (the list): when the files can't be listed after the response is saved, a withdrawal saved meanwhile isn't hidden by older values", async () => {
+test("when the files can't be listed after the response is saved, a withdrawal saved meanwhile isn't hidden by older values (the list)", async () => {
   const files = new Map<string, string>();
   // another run saves the empty 6 while this one saves 5; then the list fails
   let failing = false;
@@ -4351,7 +4760,7 @@ test("G2-g (the list): when the files can't be listed after the response is save
   assert.ok(!texts(run2.widget.node).some((x) => /%/.test(x)));
 });
 
-test("G2-g (no response): a withdrawal whose marker lands while the notifying run waits for the lock cancels what was planned", async () => {
+test("a withdrawal whose marker lands while the notifying run waits for the lock cancels what was planned (no response)", async () => {
   const files = new Map<string, string>([[`/docs/headroom-events-${TAG}-3`, ""]]);
   const notifier = newNotifier();
   await notifyWith(files, notifier, { status: 200, body: { ...demoBody("reset", NOTE_NOW), data_version: 5 } });
@@ -4366,7 +4775,7 @@ test("G2-g (no response): a withdrawal whose marker lands while the notifying ru
 });
 
 // ---- Records of the notifying runs: pairs, intents and told records
-test("G5-f (one record): a stopped and resumed that cancel out are settled by one record, or neither when it can't be written", async () => {
+test("a stopped and resumed that cancel out are settled by one record, or neither when it can't be written (one record)", async () => {
   const events = feed(6, [stoppedEv(5), resumedEv(6)]);
   const files = new Map<string, string>([[`/docs/headroom-events-${TAG}-4`, ""]]);
   const notifier = newNotifier();
@@ -4390,7 +4799,7 @@ test("G5-f (one record): a stopped and resumed that cancel out are settled by on
   assert.ok(files.has(`/docs/headroom-events-${TAG}-6`));
 });
 
-test("G5-h (a gone run's pair): a pair left by a run long gone doesn't stop a sender; a fresh one does", async () => {
+test("a pair left by a run long gone doesn't stop a sender; a fresh one does (a gone run's pair)", async () => {
   const pairAt = (at: number) => new Map<string, string>([[`/docs/headroom-events-${TAG}-4`, ""],
     [`/docs/${lib.recordName("pair", TAG, 5, 6, "bbbbbbbb")}`, JSON.stringify({ at })]]);
   const stale = pairAt(NOTE_NOW.getTime() - 10 * 60_000);
@@ -4403,7 +4812,7 @@ test("G5-h (a gone run's pair): a pair left by a run long gone doesn't stop a se
   assert.equal(notifier2.log.length, 0, "held while that run may be cancelling them out");
 });
 
-test("G5-h (an intent after the pair): a stopped another run starts handing over is neither taken as told nor cancelled out; both wait", async () => {
+test("a stopped another run starts handing over is neither taken as told nor cancelled out; both wait (an intent after the pair)", async () => {
   const gen = lib.DEFAULT_CONFIG_ID;
   const events = feed(6, [stoppedEv(5), resumedEv(6)]);
   const files = new Map<string, string>([[`/docs/headroom-events-${TAG}-4`, ""]]);
@@ -4421,7 +4830,7 @@ test("G5-h (an intent after the pair): a stopped another run starts handing over
   assert.deepEqual(notifier.log.flatMap((n: any) => plain(n.userInfo.seqs)), [6]);
 });
 
-test("G5-e (settled meanwhile): a notification another run settles after this one chose it isn't handed to iOS", async () => {
+test("a notification another run settles after this one chose it isn't handed to iOS (settled meanwhile)", async () => {
   const events = feed(5, [ev(5, "limit", { window_id: "seven_day", label: "Weekly", resets_at: "2026-11-20T00:00:00Z" })]);
   for (const [what, settle] of [
     ["the cursor passed it", (f: Map<string, string>) => f.set(`/docs/headroom-events-${TAG}-5`, "")],
@@ -4437,7 +4846,7 @@ test("G5-e (settled meanwhile): a notification another run settles after this on
   }
 });
 
-test("G5-e (in one run): a notification iOS took whose told record can't be written isn't sent again in the same run", async () => {
+test("a notification iOS took whose told record can't be written isn't sent again in the same run (in one run)", async () => {
   const files = new Map<string, string>([[`/docs/headroom-events-${TAG}-4`, ""]]);
   const notifier = newNotifier();
   const events = feed(5, [ev(5, "limit", { window_id: "seven_day", label: "Weekly", resets_at: "2026-11-20T00:00:00Z" })]);
@@ -4448,7 +4857,7 @@ test("G5-e (in one run): a notification iOS took whose told record can't be writ
   assert.ok(!files.has(`/docs/headroom-events-${TAG}-5`), "the cursor stays before it");
 });
 
-test("G5-j (kept by the intent): a notification found delivered after its event left the feed still remembers its cycle", async () => {
+test("a notification found delivered after its event left the feed still remembers its cycle (kept by the intent)", async () => {
   const gen = lib.DEFAULT_CONFIG_ID;
   const limit = ev(5, "limit");
   const mark = lib.eventMark(limit);
@@ -4471,7 +4880,7 @@ test("G5-j (kept by the intent): a notification found delivered after its event 
   assert.ok(!plainIntent.notifier.log.some((n: any) => plain(n.userInfo?.seqs ?? []).includes(7)));
 });
 
-test("G5-i (cleanup): an intent stays until all its numbers are passed; a told record that can't be read stays; a corrupt one goes", async () => {
+test("an intent stays until all its numbers are passed; a told record that can't be read stays; a corrupt one goes (cleanup)", async () => {
   const gen = lib.DEFAULT_CONFIG_ID;
   // an intent for 5 and 7 whose run may still be going; 5 is on the device
   const intent = `/docs/${lib.recordName("intent", TAG, 5, "aaaaaaaa")}`;
@@ -4498,12 +4907,12 @@ test("G5-i (cleanup): an intent stays until all its numbers are passed; a told r
 });
 
 // ---- Fixes after the second check (realistic ones)
-test("G4-b (a shared item read last): Remove all removes none of the shared items unless it read them all; settings keep their switches", async () => {
+test("Remove all removes none of the shared items unless it read them all; settings keep their switches (a shared item read last)", async () => {
   const keychain = { [lib.KEYCHAIN_CONFIG]: CONFIG_A, [lib.KEYCHAIN_NOTIFY]: JSON.stringify({ events: false, times: false }) };
   // after the confirmation, the second read of the shared settings (the one Remove all makes before removing) fails once
   let armed = false;
   let gets = 0;
-  const quit = await runWidget({ family: "medium", app: { menu: [3, 2] }, keychain, answers: [0, -1],
+  const quit = await runWidget({ family: "medium", app: { menu: [3, 2, 1] }, keychain, answers: [0, -1],
     beforeConfirm: () => { armed = true; },
     keychainGetFailsWhen: (k: string) => armed && k === lib.KEYCHAIN_CONFIG && ++gets === 2 } as any);
   assert.ok(quit.alertTitles.includes("Not fully removed"), quit.alertTitles.join(" | "));
@@ -4511,11 +4920,11 @@ test("G4-b (a shared item read last): Remove all removes none of the shared item
   const prefs = lib.notifyPrefs(quit.keychain.get(lib.KEYCHAIN_NOTIFY))!;
   assert.deepEqual([prefs.events, prefs.times], [false, false], "still both off");
   // the control: read, all go
-  const done = await runWidget({ family: "medium", app: { menu: [3, 2] }, keychain });
+  const done = await runWidget({ family: "medium", app: { menu: [3, 2, 1] }, keychain });
   assert.ok(!done.keychain.has(lib.KEYCHAIN_CONFIG) && !done.keychain.has(lib.KEYCHAIN_NOTIFY));
 });
 
-test("G5-f (a record cut short): a told record whose content is corrupt settles nothing; the pair is decided again", async () => {
+test("a told record whose content is corrupt settles nothing; the pair is decided again (a record cut short)", async () => {
   const files = new Map<string, string>([[`/docs/headroom-events-${TAG}-4`, ""], [`/docs/${lib.recordName("told", TAG, 5)}`, "{"]]);
   const notifier = newNotifier();
   await runWidget({ family: "medium", inApp: true, shortcut: "notify", files, notifier, now: NOTE_NOW, responder: eventsAt(feed(6, [stoppedEv(5), resumedEv(6)])) });
@@ -4523,7 +4932,7 @@ test("G5-f (a record cut short): a told record whose content is corrupt settles 
   assert.ok(files.has(`/docs/headroom-events-${TAG}-6`), "both settled");
 });
 
-test("G5-i (a record cut short): a corrupt told record doesn't take the cycle an intent kept; the reset is told", async () => {
+test("a corrupt told record doesn't take the cycle an intent kept; the reset is told (a record cut short)", async () => {
   const gen = lib.DEFAULT_CONFIG_ID;
   const mark = lib.eventMark(ev(5, "limit"));
   const files = new Map<string, string>([[`/docs/headroom-events-${TAG}-4`, ""], [`/docs/${lib.recordName("told", TAG, 5)}`, "{"],
@@ -4535,7 +4944,7 @@ test("G5-i (a record cut short): a corrupt told record doesn't take the cycle an
   assert.ok(notifier.log.some((n: any) => plain(n.userInfo.seqs).includes(7)));
 });
 
-test("G5-e (seen at the re-read): an intent's number that shows on the device only at the last check still gives its cycle", async () => {
+test("an intent's number that shows on the device only at the last check still gives its cycle (seen at the re-read)", async () => {
   const gen = lib.DEFAULT_CONFIG_ID;
   const mark = lib.eventMark(ev(5, "limit"));
   const files = new Map<string, string>([[`/docs/headroom-events-${TAG}-4`, ""],
@@ -4550,7 +4959,7 @@ test("G5-e (seen at the re-read): an intent's number that shows on the device on
   assert.equal(JSON.parse(files.get(`/docs/${lib.recordName("told", TAG, 5)}`) ?? "null")?.mark?.key, mark.key);
 });
 
-test("G5-g (still waiting): a reset whose reminder is due but still waiting on the device is held; long past its time, it is told", () => {
+test("a reset whose reminder is due but still waiting on the device is held; long past its time, it is told (still waiting)", () => {
   const gen = lib.DEFAULT_CONFIG_ID;
   const cycle = "2026-11-19T11:59:00.000Z";
   const stamp = "2026-11-19T10:00:00.000Z#1";
@@ -4567,7 +4976,7 @@ test("G5-g (still waiting): a reset whose reminder is due but still waiting on t
   assert.equal(pick(row(NOTE_NOW.getTime() - 30_000), false).alerts.length, 1, "with time reminders off it is being cancelled");
 });
 
-test("G4-e (a stop before iOS): a reminder saved as about to be scheduled no longer holds a cancel once its run is gone", async () => {
+test("a reminder saved as about to be scheduled no longer holds a cancel once its run is gone (a stop before iOS)", async () => {
   const gen = lib.DEFAULT_CONFIG_ID;
   const t = NOTE_NOW.getTime() + 3_600_000;
   const id = `headroom.${gen}.back.claude.five_hour.${Math.round(t / 60_000)}.0123456789abcdef.0a0a0a0a`;
@@ -4585,7 +4994,7 @@ test("G4-e (a stop before iOS): a reminder saved as about to be scheduled no lon
   assert.equal((await run(NOTE_NOW.getTime() - 30_000)).cancel_pending, true, "its run may still be handing it over");
 });
 
-test("G5-l (the menu): turning time reminders off marks a reminder as being cancelled before removing it; a stop there leaves the reset to be told", async () => {
+test("turning time reminders off marks a reminder as being cancelled before removing it; a stop there leaves the reset to be told (the menu)", async () => {
   const gen = lib.DEFAULT_CONFIG_ID;
   const cycle = "2026-11-19T11:59:00.000Z";
   const item = { kind: "back", provider: "claude", window_id: "five_hour", cycle: Date.parse(cycle), fire_at: NOTE_NOW.getTime() - 60_000, boundary: null };
@@ -4605,7 +5014,7 @@ test("G5-l (the menu): turning time reminders off marks a reminder as being canc
   assert.ok(notifier.log.some((n: any) => String(n.body).includes("usable again")), "told");
 });
 
-test("G5-g (taking over): a reminder being cancelled, or one of another account's stamp, is planned again under a new identifier", () => {
+test("a reminder being cancelled, or one of another account's stamp, is planned again under a new identifier (taking over)", () => {
   const gen = lib.DEFAULT_CONFIG_ID;
   const c = NOTE_NOW.getTime() + 3_600_000;
   const item = { kind: "back", provider: "claude", window_id: "five_hour", cycle: c, fire_at: c, boundary: "2026-11-19T12:00:00.000Z#2", title: "t", body: "b" };
@@ -4626,7 +5035,7 @@ test("G5-g (taking over): a reminder being cancelled, or one of another account'
   assert.deepEqual([same.schedule.length, same.cancel.length, same.reminders[0].id], [0, 0, prev({}).id]);
 });
 
-test("G2-g (what the marker says): a received withdrawal's seen marker says so; a view with values says nothing", async () => {
+test("a received withdrawal's seen marker says so; a view with values says nothing (what the marker says)", async () => {
   const files = new Map<string, string>();
   await runWidget({ family: "medium", files, response: { status: 200, body: sampleView(5) } });
   assert.equal(files.get(`/docs/headroom-seen-${TAG}-5`), "");
@@ -4634,7 +5043,7 @@ test("G2-g (what the marker says): a received withdrawal's seen marker says so; 
   assert.equal(files.get(`/docs/headroom-seen-${TAG}-6`), "withdrawn");
 });
 
-test("G5-f (told meanwhile): a stopped another run told while this one cancels the pair out is taken; its resumed is told", async () => {
+test("a stopped another run told while this one cancels the pair out is taken; its resumed is told (told meanwhile)", async () => {
   const files = new Map<string, string>([[`/docs/headroom-events-${TAG}-4`, ""]]);
   const notifier = newNotifier();
   const told5 = `/docs/${lib.recordName("told", TAG, 5)}`;
@@ -4645,7 +5054,7 @@ test("G5-f (told meanwhile): a stopped another run told while this one cancels t
   assert.ok(![...files.keys()].some((k) => k.includes("headroom-pair-")), "its pair is taken back");
 });
 
-test("G5-j (what the intent holds): a notification's intent keeps each number's cycle, read from its event", async () => {
+test("a notification's intent keeps each number's cycle, read from its event (what the intent holds)", async () => {
   const files = new Map<string, string>([[`/docs/headroom-events-${TAG}-4`, ""]]);
   let written: any = null;
   await runWidget({ family: "medium", inApp: true, shortcut: "notify", files, notifier: newNotifier(), now: NOTE_NOW, responder: eventsAt(feed(5, [ev(5, "limit")])),
@@ -4654,7 +5063,7 @@ test("G5-j (what the intent holds): a notification's intent keeps each number's 
   assert.equal(written?.marks?.[5]?.key, lib.eventMark(ev(5, "limit")).key);
 });
 
-test("G5-l (the notifying run): a reminder is saved as being cancelled before it is removed, when cancelling what is owed and when withdrawn", async () => {
+test("a reminder is saved as being cancelled before it is removed, when cancelling what is owed and when withdrawn (the notifying run)", async () => {
   const gen = lib.DEFAULT_CONFIG_ID;
   const t = NOTE_NOW.getTime() + 3_600_000;
   const id = `headroom.${gen}.back.claude.five_hour.${Math.round(t / 60_000)}.0123456789abcdef.0a0a0a0a`;
@@ -4680,7 +5089,7 @@ test("G5-l (the notifying run): a reminder is saved as being cancelled before it
 });
 
 // ---- Fixes after the limitations check
-test("G5-h (shown at the re-read): a stopped in flight that shows on the device only at the last check lets its resumed be told in that run", async () => {
+test("a stopped in flight that shows on the device only at the last check lets its resumed be told in that run (shown at the re-read)", async () => {
   const gen = lib.DEFAULT_CONFIG_ID;
   const files = new Map<string, string>([[`/docs/headroom-events-${TAG}-4`, ""],
     [`/docs/${lib.recordName("intent", TAG, 5, "aaaaaaaa")}`, JSON.stringify({ seqs: [5], at: NOTE_NOW.getTime() - 30_000 })]]);
@@ -4696,7 +5105,7 @@ test("G5-h (shown at the re-read): a stopped in flight that shows on the device 
   assert.equal(notifier.log.length, 1, "not again");
 });
 
-test("G5-g (taking over, due): a reminder being cancelled or of another account is planned again also within its last minute", () => {
+test("a reminder being cancelled or of another account is planned again also within its last minute (taking over, due)", () => {
   const gen = lib.DEFAULT_CONFIG_ID;
   const c = NOTE_NOW.getTime() + 30_000;
   const item = { kind: "runout", provider: "claude", window_id: "five_hour", cycle: c, fire_at: c, boundary: "2026-11-19T12:00:00.000Z#2", title: "t", body: "b" };
@@ -4714,7 +5123,7 @@ test("G5-g (taking over, due): a reminder being cancelled or of another account 
   assert.equal(plain(lib.reconcileReminders([prev({})], [item], NOTE_NOW, gen, new Set())).schedule.length, 0);
 });
 
-test("G5-l (settled by the device): a reminder left as being cancelled is forgotten once gone, and taken as rung once delivered", async () => {
+test("a reminder left as being cancelled is forgotten once gone, and taken as rung once delivered (settled by the device)", async () => {
   const gen = lib.DEFAULT_CONFIG_ID;
   // its time has passed (a reminder delivered has rung)
   const t = NOTE_NOW.getTime() - 60_000;
@@ -4735,7 +5144,7 @@ test("G5-l (settled by the device): a reminder left as being cancelled is forgot
   assert.equal((await run(null, { deliveredFailsOnCall: 1 }))?.cancelling, true, "the list can't be read: left as it is");
 });
 
-test("G5-i (two intents): the cycle an intent kept is used whichever of two intents for the number is read first", async () => {
+test("the cycle an intent kept is used whichever of two intents for the number is read first (two intents)", async () => {
   const gen = lib.DEFAULT_CONFIG_ID;
   const mark = lib.eventMark(ev(5, "limit"));
   const good = [`/docs/${lib.recordName("intent", TAG, 5, "bbbbbbbb")}`, JSON.stringify({ seqs: [5], marks: { 5: mark }, at: NOTE_NOW.getTime() - 10 * 60_000 })] as const;
@@ -4750,7 +5159,7 @@ test("G5-i (two intents): the cycle an intent kept is used whichever of two inte
   }
 });
 
-test("G2-g (a marker not saved, the older body kept): nothing is planned from the older body in the run that read the newer view", async () => {
+test("nothing is planned from the older body in the run that read the newer view (a marker not saved, the older body kept)", async () => {
   const files = new Map<string, string>([[`/docs/headroom-events-${TAG}-3`, ""]]);
   saveViewFile(files, { ...demoBody("reset", NOTE_NOW), data_version: 5 });
   const notifier = newNotifier();
@@ -4766,7 +5175,7 @@ test("G2-g (a marker not saved, the older body kept): nothing is planned from th
   assert.equal(notifier2.pending.size, 1);
 });
 
-test("G2-h (one provider withdrawn): its reminder due within a minute is cancelled; the other provider's is kept", () => {
+test("its reminder due within a minute is cancelled; the other provider's is kept (one provider withdrawn)", () => {
   const gen = lib.DEFAULT_CONFIG_ID;
   const c = NOTE_NOW.getTime() + 30_000;
   const row = (provider: string) => ({ id: `headroom.${gen}.back.${provider}.all.${Math.round(c / 60_000)}.0123456789abcdef.0a0a0a0a`,
@@ -4778,7 +5187,7 @@ test("G2-h (one provider withdrawn): its reminder due within a minute is cancell
   assert.ok(r.reminders.some((x: any) => x.id === claude.id), "claude's kept (it rings in a moment)");
 });
 
-test("G5-l (the list unreadable): a reminder being cancelled whose fate can't be told isn't planned again in that run", async () => {
+test("a reminder being cancelled whose fate can't be told isn't planned again in that run (the list unreadable)", async () => {
   const files = new Map<string, string>([[`/docs/headroom-events-${TAG}-3`, ""]]);
   const notifier = newNotifier();
   const body = { ...demoBody("reset", NOTE_NOW), data_version: 5 };
@@ -4817,7 +5226,7 @@ function threeView(): any {
   return lib.sanitizeView({ ...view, data_version: 3, boundaries: { claude: "#0", codex: "#0", gemini: "" } });
 }
 
-test("G3: a view of three providers is read whole; an earlier Worker's reads Gemini as none; a limit for the details only is kept so", () => {
+test("a view of three providers is read whole; an earlier Worker's reads Gemini as none; a limit for the details only is kept so", () => {
   const view = threeView();
   assert.ok(view, "the server's view of three providers");
   assert.deepEqual(Object.keys(view.gemini.windows).sort(), ["five_hour", "partner_five_hour", "seven_day", "seven_day_argon"]);
@@ -4830,11 +5239,13 @@ test("G3: a view of three providers is read whole; an earlier Worker's reads Gem
   assert.equal(lib.sanitizeBoundaries({ claude: "", gemini: "" }), null, "the first providers must be there");
 });
 
-test("G3: the parameter names one to three providers in its order; empty shows Codex and Claude, then any other with values", () => {
+test("the parameter names one to three providers in its order; empty shows Codex and Claude, then any other with values", () => {
   assert.deepEqual(plain(lib.providerList("gemini")), ["gemini"]);
   assert.deepEqual(plain(lib.providerList(" Claude, Gemini ")), ["claude", "gemini"]);
   assert.deepEqual(plain(lib.providerList("codex claude gemini claude")), ["codex", "claude", "gemini"]);
-  for (const p of ["", "top", "claude 5h", "claude.five_hour", "claude, demo"]) assert.equal(lib.providerList(p), null, p);
+  for (const p of ["", "claude 5h", "most", "5h, others"]) assert.equal(lib.providerList(p), null, `${p}: names more than providers`);
+  // words not understood are left out of what is shown (and said on the widget)
+  assert.deepEqual(plain(lib.parseParameter("claude, top, claude.five_hour").unknown), ["top", "claude.five_hour"]);
   const three = threeView();
   const two = lib.demoResult("normal", NOW).view;
   const shown = (view: any, p: string) => plain(lib.groupsOf(view, p, NOW).map((g: any) => [g.provider, g.message]));
@@ -4845,7 +5256,7 @@ test("G3: the parameter names one to three providers in its order; empty shows C
   assert.deepEqual(plain(lib.groupsOf(two, "codex, claude", NOW).map((g: any) => g.provider)), ["codex", "claude"]);
 });
 
-test("G3: a limit shown in the details only never appears on the widget, the lock screen or in reminders unless named", () => {
+test("a limit shown in the details only never appears on the widget, the lock screen or in reminders", () => {
   const view = threeView();
   for (const allScoped of [false, true]) {
     const [gemini] = lib.groupsOf(view, "gemini", NOW, { allScoped });
@@ -4853,13 +5264,12 @@ test("G3: a limit shown in the details only never appears on the widget, the loc
     assert.ok(!ids.includes("partner_five_hour"), `${allScoped}: ${ids}`);
     assert.ok(ids.includes("seven_day_argon"), "Gemini's own model limit at 100%, as Fable");
   }
-  assert.ok(!lib.selectWindows(view, "top", NOW).some((x: any) => x.window.id === "partner_five_hour"));
-  assert.deepEqual(plain(lib.selectWindows(view, "gemini.partner_five_hour", NOW).map((x: any) => x.window.id)), ["partner_five_hour"], "named");
+  for (const p of ["", "5h", "gemini, wk"]) assert.ok(!lib.selectWindows(view, p, NOW).some((x: any) => x.window.id.startsWith("partner_")), p);
   assert.ok(!lib.lockPicks(view, "gemini", NOW).some((x: any) => x.window?.id === "partner_five_hour"));
   assert.ok(!lib.reminderPlan(view, NOW).some((r: any) => r.window_id === "partner_five_hour"));
 });
 
-test("G3: medium and large draw three columns of one width; a demo says Demo once at the bottom; Not supported where the limits go", async () => {
+test("medium and large draw three columns of one width; a demo says Demo once at the bottom; Not supported where the limits go", async () => {
   const view = lib.demoResult("three", NOW).view;
   for (const family of ["medium", "large"]) {
     const layout = lib.layoutGroups(view, family, "", NOW, { demo: true });
@@ -4869,32 +5279,180 @@ test("G3: medium and large draw three columns of one width; a demo says Demo onc
     assert.equal(layout.demoNote, true);
   }
   assert.equal(lib.layoutGroups(lib.demoResult("normal", NOW).view, "medium", "", NOW, { demo: true }).demoNote, false, "two columns: Demo in the headers");
-  const medium = texts((await runWidget({ family: "medium", parameter: "demo:three", now: NOW })).widget.node);
+  const medium = texts((await runWidget({ family: "medium", demo: "three", now: NOW })).widget.node);
   for (const name of ["Codex", "Claude", "Gemini"]) assert.ok(medium.includes(name), medium.join(" | "));
   assert.equal(medium.filter((t) => /\bDemo\b/.test(t)).length, 1, medium.join(" | "));
   assert.ok(!medium.some((t) => t.includes("Claude/GPT")), "the details-only limit isn't drawn");
-  const large = texts((await runWidget({ family: "large", parameter: "demo:three", now: NOW })).widget.node);
-  assert.ok(large.includes("Argon weekly") && large.includes("Weekly usage"), large.join(" | "));
+  const large = texts((await runWidget({ family: "large", demo: "three", now: NOW })).widget.node);
+  assert.ok(large.includes("Argon wk") && large.includes("Weekly usage"), large.join(" | "));
   assert.equal(large.filter((t) => t === "Gemini").length, 2, "its column and the chart's legend");
-  const off = texts((await runWidget({ family: "medium", parameter: "demo:unsupported", now: NOW })).widget.node);
+  const off = texts((await runWidget({ family: "medium", demo: "unsupported", now: NOW })).widget.node);
   assert.ok(off.includes("Gemini") && off.includes("Not supported"), off.join(" | "));
-  const small = texts((await runWidget({ family: "small", parameter: "demo:three", now: NOW })).widget.node);
+  const small = texts((await runWidget({ family: "small", demo: "three", now: NOW })).widget.node);
   for (const name of ["Codex", "Claude", "Gemini"]) assert.ok(small.includes(name), small.join(" | "));
 });
 
-test("G3: the lock screen takes Gemini as any provider, and one not supported says so", async () => {
+test("the lock screen takes Gemini as any provider, and one not supported says so", async () => {
   const pick = (view: any, p: string) => plain(lib.lockPicks(view, p, NOW).map((x: any) => (x.missing ? `${x.provider}:${x.label}` : `${x.provider}.${x.window.id}`)));
   const three = threeView();
   assert.deepEqual(pick(three, "gemini 5h"), ["gemini.five_hour"]);
+  // both limits named: each provider's tightest, the least left at its reset at the current pace (no pace in this view: Gemini's
+  // weekly, 60% left, before its 5h, 70% left)
   assert.deepEqual(pick(three, "gemini weekly, claude 5h"), ["gemini.seven_day", "claude.five_hour"]);
   assert.deepEqual(pick(lib.demoResult("normal", NOW).view, "gemini"), ["gemini:Not supported"]);
-  const rect = texts((await runWidget({ family: "accessoryRectangular", parameter: "gemini, demo:unsupported", now: NOW })).widget.node);
+  const rect = texts((await runWidget({ family: "accessoryRectangular", demo: "unsupported", parameter: "gemini", now: NOW })).widget.node);
   assert.ok(rect.some((t) => t.includes("Gemini: Not supported")), rect.join(" | "));
-  const circle = texts((await runWidget({ family: "accessoryCircular", parameter: "gemini, demo:unsupported", now: NOW })).widget.node);
+  const circle = texts((await runWidget({ family: "accessoryCircular", demo: "unsupported", parameter: "gemini", now: NOW })).widget.node);
   assert.ok(circle.some((t) => t.includes("Not supported")), circle.join(" | "));
 });
 
-test("G3: events, notification titles and account switches take Gemini as the others", () => {
+test("Lock screen ②'s time line fits its column: a countdown keeps counting over the whole width, right-aligned; texts fitted", async () => {
+  const now = new Date("2026-11-16T13:05:00.000Z");
+  const stacks = (node: any): any[] => [...(node.kind === "stack" ? [node] : []), ...node.children.flatMap(stacks)];
+  const kinds = (node: any) => node.children.map((c: any) => (c.kind === "spacer" ? (c.props.length == null ? "flex" : "gap") : c.kind));
+  const hours = (h: number) => new Date(now.getTime() + h * 3600000).toISOString();
+  const cases: [string, any][] = [];
+  for (const demo of ["runout", "three", "reached", "firstuse", "reset", "stale"]) {
+    cases.push([demo, { status: 200, body: { ...lib.demoResult(demo, now).view, data_version: 1, view_version: 1 } }]);
+  }
+  // a weekly reset more than a day away (weekday and time), one within a day (two hour digits), and one in use without a reset time
+  for (const [name, h] of [["weekday", 60], ["day", 23.5]] as const) {
+    const v = structuredClone(lib.demoResult("three", now).view);
+    for (const p of ["codex", "claude", "gemini"]) Object.assign(v[p].windows.seven_day, { used_percent: 97, used_percent_int: 97, remaining_percent: 3, resets_at: hours(h), rate_pace: 0 });
+    cases.push([name, { status: 200, body: { ...v, data_version: 1, view_version: 1 } }]);
+  }
+  const u = structuredClone(lib.demoResult("three", now).view);
+  for (const p of ["codex", "claude", "gemini"]) Object.assign(u[p].windows.five_hour, { used_percent: 90, used_percent_int: 90, remaining_percent: 10, resets_at: null, rate_pace: 0 });
+  cases.push(["unknown", { status: 200, body: { ...u, data_version: 1, view_version: 1 } }]);
+  const seen: string[] = [];
+  let countdowns = 0;
+  for (const [name, response] of cases) {
+    for (const parameter of ["5h", "wk", "gemini, 5h"]) {
+      const run = await runWidget({ family: "accessoryRectangular", parameter, response, now });
+      const row = stacks(run.widget.node).find((x) => x.children.some((c: any) => c.kind === "image" && c.props.ring));
+      const column = row?.children[3];
+      if (!column || column.kind !== "stack") continue;
+      const line = column.children.at(-1);
+      const holder = line.children.find((c: any) => c.kind === "stack" && c.children.some((d: any) => d.kind === "date"));
+      if (holder) {
+        // the countdown: a fixed space (or none), the mark, its box; together the column's whole width, the countdown right-aligned
+        countdowns++;
+        const date = holder.children[0];
+        const size = date.props.font.size;
+        assert.ok(date.props.timer && date.props.align === "right", `${name} ${parameter}: a countdown, right-aligned`);
+        assert.ok(!kinds(line).includes("flex"), "no flexible space: the whole width");
+        const lead = line.children[0].kind === "spacer" ? line.children[0].props.length : 0;
+        assert.ok(Math.abs(lead + size + 3 + (holder.props.size as any).w - lib.LOCK_TITLE_WIDTH) < 1e-9, `${name} ${parameter}: the whole column`);
+        assert.ok(lead >= 0 && size >= 8, `${name} ${parameter}: ${size}`);
+        continue;
+      }
+      const text = line.children.find((c: any) => c.kind === "text");
+      if (!text) continue;
+      const size = (text.props.font as any).size;
+      seen.push(text.props.text);
+      assert.equal(kinds(line)[0], "flex", "a text pushed right");
+      assert.ok(size + 3 + lib.textWidth(text.props.text, size) * 0.8 <= lib.LOCK_LINE_WIDTH + 1e-9, `${name} ${parameter}: ${text.props.text} at ${size}`);
+      assert.ok(size >= 8, "still readable");
+    }
+  }
+  assert.ok(countdowns > 0, "countdowns were checked");
+  assert.ok(seen.includes("First use") && !seen.includes("On first use"), `the short word: ${seen.join(" | ")}`);
+  assert.ok(seen.some((t) => /^\w{3} \d{2}:\d{2}$/.test(t)), `a weekday: ${seen.join(" | ")}`);
+  assert.ok(seen.includes("Unknown"), seen.join(" | "));
+  // within the hour "mm:ss", else "h:mm:ss" (a wider estimate for two hour digits)
+  assert.ok(lib.countdownWidth(new Date(now.getTime() + 30 * 60000), now, 12) < lib.countdownWidth(new Date(now.getTime() + 2 * 3600000), now, 12));
+  assert.ok(lib.countdownWidth(new Date(now.getTime() + 2 * 3600000), now, 12) < lib.countdownWidth(new Date(now.getTime() + 20 * 3600000), now, 12));
+  // the pair's columns keep their countdown as before
+  const pair = await runWidget({ family: "accessoryRectangular", demo: "runout", parameter: "claude, codex, 5h", now });
+  assert.ok(JSON.stringify(pair.widget.node).includes('"timer":true'), "the pair still counts down");
+});
+
+test("Lock screen ② picks the tightest limit (the least left at its reset at the current pace), never one used up; ③ follows the same order", () => {
+  const now = new Date("2026-11-16T13:05:00.000Z");
+  const hours = (h: number) => new Date(now.getTime() + h * 3600000).toISOString();
+  const near = (a: number, b: number) => Math.abs(a - b) < 1e-9;
+  // slack: what is left, less the reliable pace times the hours to the reset
+  assert.ok(near(lib.lockSlack({ used_percent: 80, resets_at: hours(4), rate_pace: 3, confidence: "high" }, now), 20 - 12));
+  assert.equal(lib.lockSlack({ used_percent: 80, resets_at: hours(4), rate_pace: 3, confidence: "low" }, now), 20, "a rough pace isn't used");
+  assert.equal(lib.lockSlack({ used_percent: 0, resets_at: null, rate_pace: 0, confidence: "high" }, now), 100, "not used yet: all of it");
+  assert.equal(lib.lockSlack({ used_percent: 30, resets_at: hours(-1), rate_pace: 30, confidence: "high" }, now), 70, "past its reset: nothing known used");
+  const view = (limits: Record<string, [number, number | null]>) => {
+    const v = structuredClone(lib.demoResult("three", now).view);
+    for (const [p, [used, h]] of Object.entries(limits)) {
+      Object.assign(v[p].windows.five_hour, { used_percent: used, used_percent_int: Math.round(used), remaining_percent: 100 - used,
+        resets_at: h === null ? null : hours(h), fetched_at: now.toISOString(), ...(h === null ? { rate_pace: 0 } : {}) });
+    }
+    return v;
+  };
+  const pick = (v: any, p: string) => plain(lib.lockPicks(v, p, now).map((x: any) => x.provider));
+  // the sample's paces: Codex 3, Claude 4, Gemini 3 %/hour. Claude has the least left (15%) but resets in 10 minutes (about 14 left
+  // then); Codex has 20% for 4 hours (8 left then): Codex is the tighter; Gemini, 50% for an hour (47 left), the roomiest
+  const timed = view({ codex: [80, 4], claude: [85, 1 / 6], gemini: [50, 1] });
+  assert.deepEqual(pick(timed, "5h"), ["codex"]);
+  assert.deepEqual(pick(timed, "5h, others"), ["claude", "gemini"]);
+  // not used yet (100% left, no reset time): the last
+  const unused = view({ codex: [30, 2], claude: [40, 3], gemini: [0, null] });
+  assert.deepEqual(pick(unused, "5h"), ["claude"], "Claude: 60 less 4 x 3 = 48 left at its reset; Codex: 70 less 3 x 2 = 64");
+  assert.deepEqual(pick(unused, "5h, others"), ["codex", "gemini"]);
+  // used up (0% left): never ②'s while another has something left, and on ③'s right
+  const used = view({ codex: [100, 2], claude: [60, 3], gemini: [20, 4] });
+  assert.deepEqual(pick(used, "5h"), ["claude"]);
+  assert.deepEqual(pick(used, "5h, others"), ["gemini", "codex"]);
+  // all used up: the one back soonest
+  const all = view({ codex: [100, 2], claude: [100, 0.5], gemini: [100, 4] });
+  assert.deepEqual(pick(all, "5h"), ["claude"]);
+  assert.deepEqual(pick(all, "5h, others"), ["codex", "gemini"]);
+  // the circle without a provider named takes the same pick
+  assert.equal(lib.lockPicks(timed, "5h", now)[0].provider, "codex");
+});
+
+test("Appearance: Auto follows the iPhone (dynamic colors), Light and Dark are fixed; one switch in Settings for every widget and the pages", async () => {
+  const signedIn = { "headroom.url": "https://headroom.example.com", "headroom.token": "read-token-xyz" };
+  const colors = (node: any): string[] => [...(node.kind === "text" && node.props.color ? [node.props.color] : []), ...node.children.flatMap(colors)];
+  // Auto (nothing chosen): the home widget's background and texts follow the iPhone
+  const auto = await runWidget({ family: "medium" });
+  const bg = auto.widget.node.props.background as any;
+  assert.deepEqual([bg.hex, bg.dark, bg.dynamic], [lib.WIDGET_BG.light, lib.WIDGET_BG.dark, true]);
+  // Light and Dark: fixed colors
+  const light = await runWidget({ family: "medium", keychain: { ...signedIn, [lib.KEYCHAIN_APPEARANCE]: "light" } });
+  assert.deepEqual([(light.widget.node.props.background as any).hex, (light.widget.node.props.background as any).dynamic], [lib.WIDGET_BG.light, undefined]);
+  assert.ok(colors(light.widget.node).includes("#1c1c1e") && !colors(light.widget.node).includes("#f2f2f7"), colors(light.widget.node).join(" "));
+  const dark = await runWidget({ family: "medium", keychain: { ...signedIn, [lib.KEYCHAIN_APPEARANCE]: "dark" } });
+  assert.equal((dark.widget.node.props.background as any).hex, lib.WIDGET_BG.dark);
+  assert.ok(colors(dark.widget.node).includes("#f2f2f7") && !colors(dark.widget.node).includes("#1c1c1e"), colors(dark.widget.node).join(" "));
+  // the lock screen keeps its transparent background
+  const lock = await runWidget({ family: "accessoryRectangular", keychain: { ...signedIn, [lib.KEYCHAIN_APPEARANCE]: "light" } });
+  assert.equal(lock.widget.node.props.background, undefined);
+  // the pages: both by the iPhone for Auto, one alone otherwise
+  const css = ":root{color-scheme:light dark;--text:#1c1c1e}\n@media (prefers-color-scheme:dark){:root{--text:#f2f2f7}}\nbody{}";
+  assert.equal(lib.pageAppearance(css), css);
+  // Settings › Appearance: Auto → Light (saved for the whole iPhone), then back to Auto (the item removed)
+  const toLight = await runWidget({ family: "medium", app: { menu: [3, 1, 0, 1] } });
+  assert.ok(toLight.actionLabels.includes("Appearance: Auto") && toLight.actionLabels.includes("Auto (iPhone setting) ✓"), toLight.actionLabels.join(" | "));
+  assert.equal(toLight.keychain.get(lib.KEYCHAIN_APPEARANCE), "light");
+  assert.ok(toLight.actionLabels.includes("Appearance: Light"), "the menu shows the new choice");
+  const toAuto = await runWidget({ family: "medium", keychain: { ...signedIn, [lib.KEYCHAIN_APPEARANCE]: "dark" }, app: { menu: [3, 1, 0, 0] } });
+  assert.equal(toAuto.keychain.has(lib.KEYCHAIN_APPEARANCE), false);
+  // Remove all settings also removes the choice
+  const removed = await runWidget({ family: "medium", keychain: { ...signedIn, [lib.KEYCHAIN_APPEARANCE]: "dark" }, app: { menu: [3, 2, 1] } });
+  assert.ok(!removed.keychain.has(lib.KEYCHAIN_APPEARANCE) && !removed.keychain.has("headroom.url"), [...removed.keychain.keys()].join(" | "));
+});
+
+test("Appearance on the pages: Light drops the dark colors, Dark keeps only them", async () => {
+  const css = ":root{color-scheme:light dark;--text:#1c1c1e}\n@media (prefers-color-scheme:dark){:root{--text:#f2f2f7}}\nbody{}";
+  const signedIn = { "headroom.url": "https://headroom.example.com", "headroom.token": "read-token-xyz" };
+  const pageOf = async (mode: string) => {
+    const run = await runWidget({ family: "medium", keychain: { ...signedIn, [lib.KEYCHAIN_APPEARANCE]: mode }, app: { menu: [0] } });
+    return String(run.webPages.at(-1) ?? "");
+  };
+  const lightPage = await pageOf("light");
+  assert.ok(lightPage.includes("color-scheme:light;") && !lightPage.includes("prefers-color-scheme:dark"), "light alone");
+  const darkPage = await pageOf("dark");
+  assert.ok(darkPage.includes("color-scheme:dark;") && !darkPage.includes("prefers-color-scheme") && darkPage.includes("--text:#f2f2f7"), "dark alone");
+  void css;
+});
+
+test("events, notification titles and account switches take Gemini as the others", () => {
   const events = lib.sanitizeEvents({ last_seq: 1, events: [{ seq: 1, kind: "limit", provider: "gemini", window_id: "five_hour", created_at: NOW.toISOString() }] });
   assert.equal(events.events[0].provider, "gemini");
   assert.equal(lib.notifyTitle("gemini", "5h"), "Gemini · 5h");
@@ -4908,7 +5466,7 @@ test("G3: events, notification titles and account switches take Gemini as the ot
   assert.equal(kept.state.boundaries.gemini, "a#1");
 });
 
-test("G3: the details list the providers the widget shows by default, Gemini's details-only limit among Gemini's, and a tapped one without values says why", () => {
+test("the details list the providers the widget shows by default, Gemini's details-only limit among Gemini's, and a tapped one without values says why", () => {
   const html: string = lib.detailHtml({ view: threeView(), events: [], trends: {}, now: NOW });
   for (const name of ["Codex", "Claude", "Gemini"]) assert.ok(html.includes(`>${name}</h2>`), name);
   assert.ok(html.includes("Claude/GPT"), "the details-only limit is in the details");
@@ -4918,7 +5476,7 @@ test("G3: the details list the providers the widget shows by default, Gemini's d
   assert.ok(tapped.includes("Not supported"));
 });
 
-test("G3: past 50 time reminders, the earliest are planned and every one planned is read back (none rings twice)", () => {
+test("past 50 time reminders, the earliest are planned and every one planned is read back (none rings twice)", () => {
   // 17 overall windows per provider, each running out at its own time
   const now = NOW;
   const at = (m: number) => new Date(now.getTime() + m * 60_000).toISOString();
@@ -4966,20 +5524,20 @@ test("G3: past 50 time reminders, the earliest are planned and every one planned
   assert.ok(next.schedule.every((s: any) => kept.some((r: any) => r.id === s.id)), "the one waiting is read back");
 });
 
-test("G3: windows named, or top, still show a provider named without values and why one has none", () => {
+test("a limit named still shows a provider named without values and why one has none", () => {
   const view = lib.demoResult("unsupported", NOW).view;
   const shown = (v: any, p: string) => plain(lib.groupsOf(v, p, NOW).map((g: any) => [g.provider, g.message, g.rows.length]));
-  assert.deepEqual(shown(view, "gemini.five_hour"), [["gemini", "Not supported", 0]]);
-  assert.deepEqual(shown(view, "claude.five_hour, gemini.seven_day"), [["claude", null, 1], ["gemini", "Not supported", 0]]);
-  // top: a provider whose fetch failed says so, as the empty parameter does
+  assert.deepEqual(shown(view, "gemini, 5h"), [["gemini", "Not supported", 0]]);
+  assert.deepEqual(shown(view, "claude, gemini, 5h"), [["claude", null, 1], ["gemini", "Not supported", 0]]);
+  // a provider whose fetch failed says so
   const failed = lib.demoResult("error", NOW).view;
-  assert.deepEqual(shown(failed, "top"), [["codex", "No data", 0], ["claude", "Sign in required", 0]]);
-  // the "no 5h" row stays for the empty parameter and a provider list only
+  assert.deepEqual(shown(failed, "codex, claude, 5h"), [["codex", "No data", 0], ["claude", "Sign in required", 0]]);
+  // a limit the provider has: no "Not available" row
   const no5h = lib.demoResult("no5h", NOW).view;
-  assert.ok(!lib.groupsOf(no5h, "codex.seven_day", NOW)[0].rows.some((r: any) => r.kind === "missing"));
+  assert.ok(!lib.groupsOf(no5h, "codex, wk", NOW)[0].rows.some((r: any) => r.kind === "missing"));
 });
 
-test("G3: three stacked in small fit the smallest phones with a row each", () => {
+test("three stacked in small fit the smallest phones with a row each", () => {
   const view = lib.demoResult("three", NOW).view;
   for (const screen of [{ width: 320, height: 568 }, { width: 375, height: 667 }, { width: 390, height: 844 }]) {
     const l = lib.layoutGroups(view, "small", "", NOW, { screen });
@@ -4991,34 +5549,33 @@ test("G3: three stacked in small fit the smallest phones with a row each", () =>
   }
 });
 
-test("G3: in a column of three, the header keeps the name and dot (the staleness text is shortened, then left out), and a long label is cut so the remaining value shows", async () => {
+test("in a column of three, the header keeps the name and dot (the staleness text is shortened, then left out), and the labels fit", async () => {
   const now = new Date("2026-11-16T13:05:00.000Z");
-  const run = await runWidget({ family: "medium", parameter: "codex.five_hour, claude.five_hour, gemini.partner_seven_day, demo:three", now });
+  const run = await runWidget({ family: "medium", demo: "three", parameter: "codex, claude, gemini, 5h", now });
   const all = texts(run.widget.node);
-  assert.ok(all.includes("Claude/GPT weekly") && all.includes("95%"), all.join(" | "));
-  const stacks = (node: any): any[] => [...(node.kind === "stack" ? [node] : []), ...node.children.flatMap(stacks)];
-  const box = stacks(run.widget.node).find((st) => st.children.some((c: any) => c.kind === "text" && c.props.text === "Claude/GPT weekly"));
-  const colWidth = lib.layoutGroups(lib.demoResult("three", now).view, "medium", "codex.five_hour, claude.five_hour, gemini.partner_seven_day", now).colWidth;
-  assert.ok(box.props.size && box.props.size.w < colWidth - 20, JSON.stringify(box.props.size));
+  assert.equal(all.filter((x) => x === "5h limit").length, 3, all.join(" | "));
+  assert.ok(!all.includes("Argon wk"), "only the limit named");
+  const layout = lib.layoutGroups(lib.demoResult("three", now).view, "medium", "codex, claude, gemini, 5h", now);
+  for (const x of all.filter((t) => / limit$| wk$/.test(t))) assert.ok(lib.textWidth(x, layout.scale.label) < layout.colWidth, x);
   // an old value's staleness in a column of 96pt: the name and the dot stay
-  const stale = await runWidget({ family: "medium", parameter: "codex, claude, gemini, demo:stale", now });
+  const stale = await runWidget({ family: "medium", demo: "stale", parameter: "codex, claude, gemini", now });
   const texts3 = texts(stale.widget.node);
   for (const name of ["Codex", "Claude"]) assert.ok(texts3.includes(name), texts3.join(" | "));
   assert.ok(!texts3.some((t) => /^\d+h \d+m$/.test(t)), "no two-part staleness text in a column of three");
 });
 
-test("G3: the lock screen's line takes three providers named, and fits with their short names when it must", () => {
+test("the lock screen's line takes three providers named, and fits with their short names when it must", () => {
   const view = lib.demoResult("three", NOW).view;
   assert.equal(lib.lockPicks(view, "codex, claude, gemini", NOW, lib.MAX_PROVIDERS).length, 3);
   assert.equal(lib.lockPicks(view, "codex, claude, gemini", NOW).length, 2, "the rectangle: two");
-  const items = lib.selectWindows(view, "top", NOW).map((x: any) => ({ ...x, window: { ...x.window, used_percent: 100, value_status: "reset_estimated" } }));
-  const line = lib.inlineText(items, true, "Demo · ");
+  const items = lib.lockPicks(view, "codex, claude, gemini", NOW, lib.MAX_PROVIDERS).map((x: any) => ({ ...x, window: { ...x.window, used_percent: 100, value_status: "reset_estimated" } }));
+  const line = lib.inlineText(items, true, "Demo · ", NOW);
   assert.ok(lib.textWidth(line, 11) <= lib.INLINE_WIDTH, `${line}: ${lib.textWidth(line, 11)}`);
   assert.ok(line.includes("Cx") && line.includes("Gm"), line);
 });
 
-test("G3: a provider named by its window is drawn with its reason, and the lock screen's line fits the reasons of three", async () => {
-  const named = texts((await runWidget({ family: "medium", parameter: "codex.seven_day, demo:error", now: NOW })).widget.node);
+test("a provider named by its window is drawn with its reason, and the lock screen's line fits the reasons of three", async () => {
+  const named = texts((await runWidget({ family: "medium", demo: "error", parameter: "codex, wk", now: NOW })).widget.node);
   assert.ok(named.includes("Codex") && named.includes("No data") && !named.includes("No data yet"), named.join(" | "));
   const empty = texts((await runWidget({ family: "medium", response: { status: 200, body: { view_version: 1, data_version: 11, claude: null, codex: null } } })).widget.node);
   assert.deepEqual(empty, ["No data yet"], "nothing named, nothing there");
@@ -5030,6 +5587,6 @@ test("G3: a provider named by its window is drawn with its reason, and the lock 
   const line = lib.inlineText(items, false, "Demo · ");
   assert.ok(lib.textWidth(line, 11) <= lib.INLINE_WIDTH, `${line}: ${lib.textWidth(line, 11)}`);
   assert.ok(line.includes("Gm N/A") && line.includes("Cl Sign in"), line);
-  const off = texts((await runWidget({ family: "accessoryInline", parameter: "demo:unsupported", now: NOW })).widget.node);
+  const off = texts((await runWidget({ family: "accessoryInline", demo: "unsupported", now: NOW })).widget.node);
   assert.ok(lib.textWidth(off[0], 11) <= lib.INLINE_WIDTH, off.join(" | "));
 });

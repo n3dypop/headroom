@@ -152,12 +152,18 @@ impl Default for CodexConfig {
     }
 }
 
-/// The Gemini provider (the Antigravity CLI, agy). Off by default: turn it on only once the destination accepts Gemini values (an
-/// earlier destination refuses an upload holding them, with the other providers' values in it)
+/// The Gemini provider (the Antigravity CLI, agy). On only once the destination accepts Gemini values (an earlier destination refuses
+/// an upload holding them, with the other providers' values in it)
 #[derive(Deserialize, Debug, Clone)]
 #[serde(default)]
 pub struct GeminiConfig {
-    pub enabled: bool,
+    /// On or off as config.toml says. Left out: on only where the whole fetch was verified by hand (providers::gemini::default_on,
+    /// decided by the agent when it starts)
+    pub enabled: Option<bool>,
+    /// On because config.toml left it out (the agent's run sets it, never config.toml): every version check then takes only a version
+    /// verified for that (providers::gemini::DEFAULT_ON_VERSIONS), also after agy is updated while the agent runs
+    #[serde(skip)]
+    pub by_default: bool,
     /// If empty, HEADROOM_GEMINI_BIN; failing that, `agy` on PATH, then the install folders it is known to use
     pub gemini_bin: String,
     /// Interval (minutes) for running `/usage`. Uses no quota
@@ -167,7 +173,8 @@ pub struct GeminiConfig {
 impl Default for GeminiConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: None,
+            by_default: false,
             gemini_bin: String::new(),
             interval_min: 5,
         }

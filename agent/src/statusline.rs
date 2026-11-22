@@ -337,7 +337,7 @@ mod tests {
     }
 
     #[test]
-    fn g3_e_a_value_read_before_a_refusal_and_its_lifting_but_saved_after_is_never_used() {
+    fn value_read_before_a_refusal_and_its_lifting_but_saved_after_is_never_used() {
         let home = temp_home("capture-epoch");
         let rl = json!({"five_hour": {"used_percentage": 5, "resets_at": 1}});
         // the epoch is read before the input; the save comes after the agent refused and lifted the clock

@@ -364,7 +364,29 @@ pub fn install(home: &Path, cfg: &Config) -> Result<Vec<String>, String> {
         ),
     ];
     lines.extend(missing_cli_notes(cfg));
+    lines.extend(gemini_default_note(cfg, &cli));
     Ok(lines)
+}
+
+/// Where Gemini may be on by default (left out of config.toml, a verified OS, agy found): how to let it fetch, and how to keep it off.
+/// Whether agy is a verified version is told by the agent when it starts (nothing of agy runs here)
+fn gemini_default_note(cfg: &Config, cli: &Path) -> Option<String> {
+    (cfg.gemini.enabled.is_none()
+        && crate::providers::gemini::default_on_os()
+        && crate::providers::gemini::gemini_bin(&cfg.gemini).is_some())
+    .then(|| {
+        format!(
+            "Gemini: {} (headroom status says which). For it to fetch, set Antigravity's statusLine command to {} (docs/install.md 2.8); to keep it off, set enabled = false under [gemini] in config.toml",
+            crate::agent::default_on_note("gemini").unwrap_or_default(),
+            serde_json::json!(gemini_statusline_command(cli))
+        )
+    })
+}
+
+/// Antigravity's statusLine command for Headroom: the path quoted, as Antigravity runs the command with `cmd /c` (Windows) or `sh -c`
+/// (macOS), and a folder may contain spaces
+fn gemini_statusline_command(cli: &Path) -> String {
+    format!("\"{}\" statusline --gemini", cli.display())
 }
 
 /// Warns if an enabled provider's CLI is not on the current PATH (the agent inherits the PATH of the environment that starts it)
@@ -386,7 +408,7 @@ fn missing_cli_notes(cfg: &Config) -> Vec<String> {
         )
     })
     .chain(
-        (cfg.gemini.enabled && crate::providers::gemini::gemini_bin(&cfg.gemini).is_none()).then(|| {
+        (cfg.gemini.enabled == Some(true) && crate::providers::gemini::gemini_bin(&cfg.gemini).is_none()).then(|| {
             "Note: agy (the Antigravity CLI) was not found on PATH or in its install folders. Install it, or set an absolute path in [gemini] gemini_bin in config.toml".to_string()
         }),
     )
@@ -620,7 +642,48 @@ pub fn registered() -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_gemini_statusline_command_quotes_its_path_for_a_folder_with_spaces() {
+        let cli = std::path::Path::new(r"C:\My Tools\Headroom\bin\headroom.exe");
+        assert_eq!(
+            gemini_statusline_command(cli),
+            r#""C:\My Tools\Headroom\bin\headroom.exe" statusline --gemini"#
+        );
+        // as printed in the note (JSON): the quotes kept, escaped
+        assert_eq!(
+            serde_json::json!(gemini_statusline_command(cli)).to_string(),
+            r#""\"C:\\My Tools\\Headroom\\bin\\headroom.exe\" statusline --gemini""#
+        );
+    }
+
     use super::*;
+
+    #[test]
+    fn install_tells_how_gemini_fetches_where_it_may_be_on_by_default() {
+        let h = crate::test_util::TempHome::new("headroom-install-gemini-note");
+        let agy = h.join("agy.exe");
+        std::fs::write(&agy, "").unwrap();
+        let mut cfg = Config::default();
+        cfg.gemini.gemini_bin = agy.display().to_string();
+        let cli = h.join("bin").join("headroom.exe");
+        let note = gemini_default_note(&cfg, &cli);
+        if crate::providers::gemini::default_on_os() {
+            let note = note.unwrap();
+            assert!(note.contains("statusline --gemini"), "{note}");
+            assert!(note.contains("enabled = false under [gemini]"), "{note}");
+            assert!(note.contains("1.5.14"), "{note}");
+        } else {
+            assert_eq!(note, None, "not on by default here");
+        }
+        // chosen in config.toml, or no agy: nothing to tell
+        for chosen in [Some(true), Some(false)] {
+            cfg.gemini.enabled = chosen;
+            assert_eq!(gemini_default_note(&cfg, &cli), None);
+        }
+        cfg.gemini.enabled = None;
+        cfg.gemini.gemini_bin = h.join("missing.exe").display().to_string();
+        assert_eq!(gemini_default_note(&cfg, &cli), None);
+    }
 
     #[test]
     fn the_queue_discard_holds_the_agent_lock_and_refuses_while_it_is_held() {

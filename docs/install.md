@@ -3,7 +3,7 @@
 Headroom has three parts. Set them up in this order:
 
 1. **Server**: a Cloudflare Worker with a D1 database. You do this once.
-2. **Agent**: runs on each PC that uses Claude Code or Codex (Windows x64, or macOS on Apple silicon).
+2. **Agent**: runs on each PC that uses Claude Code, Codex or Gemini (the Antigravity CLI) (Windows x64, or macOS on Apple silicon).
 3. **Widget**: Scriptable on the iPhone.
 
 Each device gets its own token:
@@ -343,7 +343,31 @@ On macOS, the path is `/Users/<you>/.headroom/bin/headroom`. These examples assu
 | `outbox.json` | Values not sent yet and the send state (no credentials) |
 | `schedule.json`, `agent.session`, `agent.session.lock` | When the running agent next checks each provider, for `headroom status` |
 | `logs/agent.log` | Agent log, rotated at 1 MB × 3 (no tokens, IDs or emails) |
+| `schedule-seed.txt` | A random value made once on this PC that spreads its fetch times (never sent) |
 | `bin/` | The installed binaries |
+
+### 2.8 Gemini (Antigravity CLI)
+
+Headroom can also show Gemini's limits, read with Google's Antigravity CLI (`agy`). Install `agy` and sign in to it once yourself.
+
+- **On or off.** Set `enabled` under `[gemini]` in `config.toml`:
+
+  ```toml
+  [gemini]
+  enabled = true    # or false
+  ```
+
+  Left out, the agent turns Gemini on only on Windows 11 (not Windows Server) with `agy` 1.5.14, the combination the whole fetch was checked on. To decide, it asks `agy --version` once when it starts; once Gemini is on, it checks the version again on its own schedule and whenever `agy` changes, and stops fetching if `agy` is updated to a version not checked yet (`headroom status` then shows `last error unverified_default`, and setting `enabled = true` keeps using that version; a version older than the oldest one Headroom checked shows `unsupported_cli` instead: update `agy`). Anywhere else, Gemini stays off until you set `enabled = true`. While it is off, nothing of `agy` runs. After a change, restart the agent (`headroom stop`, then `headroom start`). `headroom status` shows which applies. If `agy` isn't found, set its absolute path in `gemini_bin` under `[gemini]`.
+- **What runs.** On the same schedule as the other providers (about every 15 minutes, taking turns between PCs), the agent runs `agy -p "/usage" --output-format json`. It reads the limits without using quota. Each run is checked for zero turns and zero tokens; if that can't be confirmed, Gemini stops with a safety stop.
+- **statusLine (needed).** Gemini fetches only after Antigravity's statusLine has shown the agent the signed-in account once. Headroom keeps only a hash of the email, on this PC. In `~/.gemini/antigravity-cli/settings.json`, change only the `statusLine` key:
+
+  ```json
+  "statusLine": { "type": "command", "command": "\"C:\\Users\\<you>\\.headroom\\bin\\headroom.exe\" statusline --gemini", "enabled": true, "stack_with_default": true }
+  ```
+
+  Quote the path, because a folder may contain spaces. On macOS, the command is `"/Users/<you>/.headroom/bin/headroom" statusline --gemini`. With `HEADROOM_HOME`, use the `Executables:` folder (`install` prints the command). Headroom's command prints nothing, and `stack_with_default: true` keeps Antigravity's own line. If you already have a statusLine command, use `headroom statusline --gemini --then "<your command>"`.
+
+  Then start `agy` once and wait for its status line to appear. You don't need to send a prompt (one would use quota). While you use `agy`, its status line also brings fresh values, and the agent's own run waits for them.
 
 ## 3. iPhone widget (Scriptable)
 
@@ -351,9 +375,10 @@ On macOS, the path is `/Users/<you>/.headroom/bin/headroom`. These examples assu
 2. **Get the script.**
    - Use `packages/scriptable/Headroom.js` as it is.
    - Or build a copy with provider icons:
-     1. Put `claude.png` and `codex.png` (16–1024 px) in `packages/scriptable/icons/`. These are not included because they are third-party logos.
-     2. Run `node packages/scriptable/scripts/build.ts`.
-     3. Use `packages/scriptable/dist/Headroom.js`.
+     1. Put `claude.png`, `codex.png` and `gemini.png` (16–1024 px, 64 KB at most) in `packages/scriptable/icons/`. These are not included because they are third-party logos. Crop each to what is visible (little transparent margin): a wide icon is drawn wider and shorter, so it looks as large as a square one.
+     2. Optionally, put a second set with the same names in `packages/scriptable/icons/alt/`. **Settings › Display** in the app then switches each provider's icon between its two, on every widget and the details page at once.
+     3. Run `node packages/scriptable/scripts/build.ts`.
+     4. Use `packages/scriptable/dist/Headroom.js`.
 3. In Scriptable, create a new script named `Headroom` and paste the whole file.
 4. **Run it once inside the app** and enter:
    - the Worker URL: the origin only, like `https://headroom.<your-subdomain>.workers.dev`;
@@ -361,17 +386,18 @@ On macOS, the path is `/Users/<you>/.headroom/bin/headroom`. These examples assu
 
    They are saved together in the iPhone Keychain, never in the script.
 5. Add a Scriptable widget to the home screen or lock screen and choose the `Headroom` script.
-6. Optionally set the widget's **Parameter**. In the app menu, **Widget** > **Make a parameter** builds one and copies it, and **Parameter guide** lists them all:
+6. Optionally set the widget's **Parameter**: words separated by commas or spaces, in any order and case. In the app menu, **Widget** > **Make a parameter** builds one and copies it, and **Parameter guide** lists them all. To see every state with sample values, use **Widget** > **Preview sample data**.
 
    | Parameter | Shows |
    |---|---|
-   | (empty) | Home screen: both providers. Lock screen: the limit with the least left |
-   | `claude` / `codex` | Only that provider |
-   | `top` | The tightest limit of each provider |
-   | `5h`, `weekly`, `claude 5h`, `codex weekly` | Lock screen: that limit |
-   | `claude 5h, codex 5h`, `both weekly` | Lock screen: two limits side by side |
-   | `demo:<name>` | Sample data to preview every state (`normal`, `runout`, `no5h`, `stale`, `reset`, `offline`, `error`, `nochart`) |
+   | (empty) | Home screen: Codex and Claude, and Gemini once it has values. Lock screen: the tightest limit, the one with the least left at its reset at the current pace (one already used up only when all are) |
+   | `claude`, `codex`, `gemini` | Those providers, in that order (up to three) |
+   | `5h`, `wk` | Only that limit (the provider's own 5-hour or weekly one), for example `claude, 5h` |
+   | `most, 5h`, `most, wk` | Large: the provider using most of that limit, larger, then the others |
+   | `5h, others`, `wk, others` | Lock screen (rectangular): rings of the other providers (the next tightest on the left, used-up ones on the right), to put beside a rectangle of `5h` or `wk` |
    | `…, notify` (or just `notify`) | Also send notifications from this widget (see below). Add it to one widget only |
+
+   A word the widget doesn't know is shown at its bottom (`Unknown: …`).
 
 **App menu.** Run the script in the app to open it. Each item comes back to the menu:
 
@@ -380,7 +406,7 @@ On macOS, the path is `/Users/<you>/.headroom/bin/headroom`. These examples assu
 | **Details** | The details page (the same as tapping the widget) |
 | **Widget** | **Preview current values** or **Preview sample data** in any home screen or lock screen size; **Make a parameter** (answer three questions, then copy the Parameter or preview it); **Parameter guide** (every Parameter and what it shows) |
 | **Notifications** | **Send sample notifications**, and turn **Limit alerts** and **Time reminders** on or off |
-| **Settings** | **Server and token**, **Reset saved data**, **Remove all settings** (the last two ask first) |
+| **Settings** | **Server and token**; **Display**: the **Appearance** of every home screen widget and the details page (**Auto** follows the iPhone's Light or Dark setting, or always **Light** or **Dark**) and each provider's icon (with a second set built in); **Saved data**: **Reset saved data**, **Remove all settings** (both ask first) |
 
 iOS decides how often widgets refresh, usually every 15–60 minutes. Countdowns to the reset keep running between refreshes.
 
@@ -392,7 +418,7 @@ iOS decides how often widgets refresh, usually every 15–60 minutes. Countdowns
 2. Add `notify` to the Parameter of **one** widget (for example `notify` or `claude, notify`). Each time that widget refreshes, it:
    - schedules **time reminders** on the iPhone: when a provider at its limit resets, and 15 minutes before a limit is forecast to run out. These ring on time even if the widget isn't refreshed;
    - tells new **limit alerts** from the server (limit reached, reset after a limit, weekly 80%, collection stopped, sign-in required). These arrive on the next refresh, so they can be 15–60 minutes late.
-3. Each kind can be turned off under **Notifications**. **Settings** > **Reset saved data** forgets saved values, scheduled reminders and where the alerts left off.
+3. Each kind can be turned off under **Notifications**. **Settings** > **Saved data** > **Reset saved data** forgets saved values, scheduled reminders and where the alerts left off.
 
 If the widget can't schedule notifications on your iPhone, use a Shortcuts automation instead: add **Run Script**, choose `Headroom`, and pass `notify` as the parameter. It runs without opening a screen and outputs a short summary.
 
@@ -438,5 +464,5 @@ If the widget can't schedule notifications on your iPhone, use a Shortcuts autom
 - **`none (the last fetch's result couldn't be checked; ...)`:** a fetch stopped before its result was checked (the PC slept or the agent was stopped), so whether it was refused can't be told; every PC waits for it. Check `headroom status`. After 5 minutes, run the command it shows on that PC (`headroom collect --provider <name> --force --replace <attempt>`). Another attempt ID replaces nothing.
 - **Widget shows `Check your credentials`:** the read token is wrong or was revoked.
 - **Widget shows `Can't reach the server`:** check the URL, or `ALLOWED_HOST` on the server.
-- **No notifications:** check that notifications are allowed for Scriptable, that exactly one widget has `notify`, and the last check time under **Notifications** in the app menu. After the server's database is recreated, choose **Settings** > **Reset saved data**.
+- **No notifications:** check that notifications are allowed for Scriptable, that exactly one widget has `notify`, and the last check time under **Notifications** in the app menu. After the server's database is recreated, choose **Settings** > **Saved data** > **Reset saved data**.
 - **Values look old:** `headroom status` shows when the agent last sent. The widget marks old values (for example `31m ago`) and limits whose reset time passed since the last value (`↻`).

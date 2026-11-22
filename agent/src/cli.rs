@@ -226,6 +226,15 @@ fn new_request_id() -> String {
     ])
 }
 
+/// The account switch waiting for a provider: its own mark, read from its saved state (None: nothing waits). One whose on or off the
+/// running agent decides at its start is read as well (built only to read what it saved; the agent answers if it runs it turned off)
+fn pending_switch_of(home: &std::path::Path, cfg: &Config, id: &str, log: &Logger) -> Option<i64> {
+    agent::make_providers(home, &agent::reading_saved(cfg, id), log)
+        .into_iter()
+        .find(|p| p.id() == id)
+        .and_then(|p| p.pending_switch())
+}
+
 fn collect(args: &[String], home: &std::path::Path) -> i32 {
     let parsed = match parse_collect_args(args) {
         Ok(p) => p,
@@ -273,9 +282,11 @@ fn collect(args: &[String], home: &std::path::Path) -> i32 {
             1
         };
     }
-    // A provider named but turned off: said so before anything runs (whatever the clock state)
+    // A provider named but turned off: said so before anything runs (whatever the clock state). One whose on or off the agent decides at
+    // its start is asked of the agent (it answers if it's off)
     if let Some(id) = parsed.provider
         && !agent::provider_enabled(&cfg, id)
+        && !agent::decided_at_start(&cfg, id)
     {
         eprintln!("{id} is turned off in config.toml (set enabled = true under [{id}] to use it)");
         return 1;
@@ -311,10 +322,7 @@ fn collect(args: &[String], home: &std::path::Path) -> i32 {
     // The switch the user saw pending (the provider's own mark, read from its saved state): only that one is accepted
     let accept_target = match (account, parsed.provider) {
         (Account::Keep, _) | (_, None) => None,
-        (_, Some(id)) => agent::make_providers(home, &cfg, &log)
-            .into_iter()
-            .find(|p| p.id() == id)
-            .and_then(|p| p.pending_switch()),
+        (_, Some(id)) => pending_switch_of(home, &cfg, id, &log),
     };
     if account != Account::Keep && accept_target.is_none() {
         eprintln!(
@@ -874,16 +882,24 @@ fn status(home: &std::path::Path) -> i32 {
     if let Some((intervals, idle)) = effective {
         println!("{}", interval_line(&intervals, idle));
     }
-    // A provider turned off whose fetch isn't verified yet is shown as not supported (nothing of its CLI is run)
+    // A provider turned off whose fetch isn't verified everywhere: why it is off and how to turn it on (nothing of its CLI is run)
     let from_agent = running && plan.is_some();
     for id in crate::providers::UNVERIFIED_PROVIDERS {
+        let left_out = cfg.as_ref().is_some_and(|c| agent::decided_at_start(c, id));
+        let default = agent::default_on_note(id).unwrap_or_default();
         match on(id) {
             Some(true) => {}
-            Some(false) if from_agent => println!(
-                "{id}: not supported yet (turned off in the running agent; nothing of its CLI is run)"
+            Some(false) if from_agent && left_out => println!(
+                "{id}: off ({default}; set enabled = true under [{id}] in config.toml to turn it on; nothing of its CLI is run)"
+            ),
+            Some(false) if from_agent => {
+                println!("{id}: off (turned off in the running agent; nothing of its CLI is run)")
+            }
+            Some(false) if left_out => println!(
+                "{id}: decided when the agent starts ({default}; set enabled under [{id}] in config.toml to choose)"
             ),
             Some(false) => println!(
-                "{id}: not supported yet (turned off: [{id}] enabled = false in config.toml; nothing of its CLI is run)"
+                "{id}: off ([{id}] enabled = false in config.toml; nothing of its CLI is run)"
             ),
             None if running => println!(
                 "{id}: unknown whether it is turned on (the running agent hasn't written its schedule yet)"
@@ -1009,7 +1025,7 @@ mod tests {
     }
 
     #[test]
-    fn g3_i_what_is_shown_follows_the_clock_read_once_for_the_decision() {
+    fn what_is_shown_follows_the_clock_read_once_for_the_decision() {
         let home = crate::test_util::TempHome::new("headroom-cli-shown-once");
         crate::test_util::trust_clock(&home);
         let epoch = usable_epoch(&home).unwrap();
@@ -1070,6 +1086,25 @@ mod tests {
     }
 
     #[test]
+    fn a_switch_waiting_for_a_provider_on_by_default_is_found_for_its_acceptance() {
+        let home = crate::test_util::TempHome::new("headroom-cli-default-switch");
+        crate::providers::gemini::save_test_state(&home, |s| s.account_changed = true);
+        let log = Logger::stderr();
+        // enabled left out of config.toml (the running agent decides it at its start): the provider's saved mark is read
+        assert!(pending_switch_of(&home, &Config::default(), "gemini", &log).is_some());
+        // turned off in config.toml: nothing waits
+        let mut off = Config::default();
+        off.gemini.enabled = Some(false);
+        assert_eq!(pending_switch_of(&home, &off, "gemini", &log), None);
+        // nothing pending: nothing waits
+        crate::providers::gemini::save_test_state(&home, |_| {});
+        assert_eq!(
+            pending_switch_of(&home, &Config::default(), "gemini", &log),
+            None
+        );
+    }
+
+    #[test]
     fn same_account_is_reported_as_not_used_by_a_provider_that_doesnt_track_its_limits() {
         let home = crate::test_util::TempHome::new("headroom-cli-same");
         crate::test_util::trust_clock(&home);
@@ -1091,7 +1126,7 @@ mod tests {
     }
 
     #[test]
-    fn g3_a_a_refused_clock_runs_nothing_and_an_acceptance_asked_for_fails() {
+    fn refused_clock_runs_nothing_and_an_acceptance_asked_for_fails() {
         let home = crate::test_util::TempHome::new("headroom-cli-refused");
         crate::test_util::trust_clock(&home);
         {
@@ -1703,7 +1738,7 @@ mod tests {
     #[test]
     fn whether_gemini_is_on_comes_from_the_running_agent_then_from_the_config() {
         let mut on_cfg = config::Config::default();
-        on_cfg.gemini.enabled = true;
+        on_cfg.gemini.enabled = Some(true);
         let off_cfg = config::Config::default();
         let run = NextRun {
             at_ms: Some(1),

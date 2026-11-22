@@ -3414,7 +3414,7 @@ mod tests {
     }
 
     #[test]
-    fn g1_b_discarding_the_queue_leaves_no_old_observation_and_the_next_number_above() {
+    fn discarding_the_queue_leaves_no_old_observation_and_the_next_number_above() {
         // a PUT the Worker accepted whose reply was lost: its observations are still queued
         let h = home("g1b");
         let t = FakeTransport::default();
@@ -3529,8 +3529,7 @@ mod tests {
     }
 
     #[test]
-    fn g3_b_the_agent_fetches_nothing_while_refused_and_the_refused_epochs_values_never_come_back()
-    {
+    fn the_agent_fetches_nothing_while_refused_and_the_refused_epochs_values_never_come_back() {
         let h = home("g3b-rounds");
         let t = FakeTransport::default();
         {
@@ -3594,7 +3593,7 @@ mod tests {
     }
 
     #[test]
-    fn g3_e_tidying_that_failed_after_an_epoch_change_is_tried_again_on_the_next_rounds() {
+    fn tidying_that_failed_after_an_epoch_change_is_tried_again_on_the_next_rounds() {
         let h = home("tidy-again");
         crate::test_util::trust_clock(&h);
         let tidy = std::rc::Rc::new(std::cell::RefCell::new((vec![false, false], 0)));
@@ -3610,7 +3609,7 @@ mod tests {
     }
 
     #[test]
-    fn g1_h_nothing_is_fetched_while_the_push_state_cant_be_read() {
+    fn nothing_is_fetched_while_the_push_state_cant_be_read() {
         let h = home("fetch-unreadable");
         let t = FakeTransport::default();
         t.0.lock().unwrap().turns_granted = true;
@@ -3636,7 +3635,7 @@ mod tests {
     }
 
     #[test]
-    fn g2_a_provider_turned_off_after_a_run_with_it_sends_nothing_of_its_own_and_keeps_its_queue() {
+    fn provider_turned_off_after_a_run_with_it_sends_nothing_of_its_own_and_keeps_its_queue() {
         // Installed with the default config: Gemini is off
         let mut cfg = crate::config::Config::default();
         assert!(!crate::agent::provider_enabled(&cfg, "gemini"));
@@ -3679,7 +3678,7 @@ mod tests {
     }
 
     #[test]
-    fn g3_a_a_send_doesnt_start_while_an_acceptance_holds_the_clock_lock() {
+    fn send_doesnt_start_while_an_acceptance_holds_the_clock_lock() {
         let h = home("g3a-lock");
         let t = FakeTransport::default();
         let mut p = pusher(&h, &t, Ok(creds()));
@@ -3694,7 +3693,7 @@ mod tests {
     }
 
     #[test]
-    fn g3_d_a_send_whose_result_wasnt_saved_holds_everything_until_a_check_goes_through() {
+    fn send_whose_result_wasnt_saved_holds_everything_until_a_check_goes_through() {
         let h = home("g3d");
         let t = FakeTransport::default();
         let p = pusher(&h, &t, Ok(creds()));
@@ -3727,7 +3726,7 @@ mod tests {
     }
 
     #[test]
-    fn g3_h_a_lost_answer_is_taken_as_a_refusal_one_that_never_left_isnt() {
+    fn lost_answer_is_taken_as_a_refusal_one_that_never_left_isnt() {
         let h = home("g3h");
         let t = FakeTransport::default();
         t.0.lock().unwrap().replies = vec![Err(SendError::Network)];
@@ -3757,7 +3756,7 @@ mod tests {
     }
 
     #[test]
-    fn g3_g_a_clock_lock_that_cant_be_opened_sends_nothing_until_it_can() {
+    fn clock_lock_that_cant_be_opened_sends_nothing_until_it_can() {
         let h = home("g3g");
         let t = FakeTransport::default();
         let mut p = pusher(&h, &t, Ok(creds()));
@@ -3770,7 +3769,7 @@ mod tests {
     }
 
     #[test]
-    fn g3_i_a_clock_state_that_cant_be_read_for_now_shows_and_sends_nothing() {
+    fn clock_state_that_cant_be_read_for_now_shows_and_sends_nothing() {
         let h = home("g3i");
         let t = FakeTransport::default();
         let mut p = pusher(&h, &t, Ok(creds()));
@@ -3840,7 +3839,7 @@ mod tests {
     }
 
     #[test]
-    fn g3_h_a_422_whose_body_couldnt_be_read_is_still_a_refusal() {
+    fn a_422_whose_body_couldnt_be_read_is_still_a_refusal() {
         let h = home("422-empty");
         let t = FakeTransport::default();
         t.0.lock().unwrap().replies = vec![Ok(422)];
@@ -3870,8 +3869,7 @@ mod tests {
     }
 
     #[test]
-    fn g3_d_g_a_422_whose_result_couldnt_be_saved_holds_everything_and_is_saved_first_once_it_can_be()
-     {
+    fn a_422_whose_result_couldnt_be_saved_holds_everything_and_is_saved_first_once_it_can_be() {
         let h = home("422-unsettled");
         let t = FakeTransport::default();
         t.0.lock().unwrap().replies = vec![Ok(422)];
@@ -3919,8 +3917,7 @@ mod tests {
     }
 
     #[test]
-    fn g3_g_a_426_whose_result_couldnt_be_saved_is_saved_once_it_can_be_though_nothing_more_is_sent()
-     {
+    fn a_426_whose_result_couldnt_be_saved_is_saved_once_it_can_be_though_nothing_more_is_sent() {
         let h = home("426-unsettled");
         let t = FakeTransport::default();
         t.0.lock().unwrap().replies = vec![Ok(426)];
@@ -3939,7 +3936,7 @@ mod tests {
     }
 
     #[test]
-    fn g1_h_a_426_to_the_turn_request_is_kept_too_also_after_a_restart() {
+    fn a_426_to_the_turn_request_is_kept_too_also_after_a_restart() {
         let h = home("turn-426");
         let t = FakeTransport::default();
         t.0.lock().unwrap().post_replies = vec![(426, String::new())];
@@ -3955,7 +3952,7 @@ mod tests {
     }
 
     #[test]
-    fn g3_d_without_pushing_a_send_left_pending_is_left_to_the_agent() {
+    fn without_pushing_a_send_left_pending_is_left_to_the_agent() {
         let h = home("nopush-pending");
         let t = FakeTransport::default();
         let p = pusher(&h, &t, Ok(creds()));
@@ -3977,7 +3974,7 @@ mod tests {
     }
 
     #[test]
-    fn g3_d_a_result_that_couldnt_be_saved_holds_everything_and_is_saved_before_the_next_send() {
+    fn result_that_couldnt_be_saved_holds_everything_and_is_saved_before_the_next_send() {
         let h = home("unsettled");
         let t = FakeTransport::default();
         let mut p = pusher(&h, &t, Ok(creds()));
@@ -4005,7 +4002,7 @@ mod tests {
     }
 
     #[test]
-    fn g1_b_an_outbox_that_cant_be_read_for_now_is_neither_replaced_nor_sent_from() {
+    fn an_outbox_that_cant_be_read_for_now_is_neither_replaced_nor_sent_from() {
         let h = home("outbox-unreadable");
         let t = FakeTransport::default();
         let mut p = pusher(&h, &t, Ok(creds()));
@@ -4032,7 +4029,7 @@ mod tests {
     }
 
     #[test]
-    fn g1_h_after_a_426_this_agent_sends_nothing_and_checks_hourly_with_a_peek_until_the_protocol_is_taken()
+    fn after_a_426_this_agent_sends_nothing_and_checks_hourly_with_a_peek_until_the_protocol_is_taken()
      {
         let h = home("outdated");
         let t = FakeTransport::default();

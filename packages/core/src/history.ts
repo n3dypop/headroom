@@ -23,8 +23,9 @@ export interface WindowMetrics {
   rate_60m: number | null;
   rate_24h: number | null;
   /**
-   * Rate used for the limit forecast (%/hour, unrounded): the first of rate_60m -> rate_15m -> rate_24h that exceeds the
-   * minimum before rounding. Media draw the forecast from this and the remainder (re-picking from rounded values would disagree with the forecast)
+   * Rate used for the limit forecast (%/hour, unrounded): of those at the minimum or more before rounding, rate_60m, else rate_15m,
+   * when reliable (medium or high); else the most reliable of the three. Media draw the forecast from this and the remainder
+   * (re-picking from rounded values would disagree with the forecast)
    */
   rate_pace: number | null;
   eta_minutes: number | null;
@@ -145,6 +146,9 @@ function rate(points: readonly Sample[], latest: Sample, minutes: number): Rate 
   return { value: increase / duration, samples: used.size, minutes: duration, increase, integer };
 }
 
+/** How reliable each confidence is, to pick the forecast's rate */
+const CONFIDENCE_RANK: Record<Confidence, number> = { insufficient: 0, low: 1, medium: 2, high: 3 };
+
 /** Decided by the count and duration of the observations behind the forecast rate (observations excluded from the rate, e.g. decreasing intervals, don't count) */
 function confidenceOf(basis: Rate, fast: number | null, normal: number | null): Confidence {
   const lowResolution = basis.integer && basis.increase < 3;
@@ -222,7 +226,18 @@ export function windowMetrics(
   const fast = fastRate?.value ?? null;
   const normal = normalRate?.value ?? null;
   const long = longRate?.value ?? null;
-  const paceRate = [normalRate, fastRate, longRate].find((r) => r !== null && r.value >= MIN_RATE) ?? null;
+  // The forecast's rate: the 60-minute one, else the 15-minute one, when it is at the minimum or more and reliable (medium or high): a
+  // recent pace that is real, so an acceleration is never hidden behind a slower day. Only when neither is, the most reliable of the
+  // three at the minimum or more (on a tie the first in that order): an integer weekly value moves by 1% steps, so a quiet hour gives
+  // one step and a few points (low) while the day behind it holds many, and the day's rate forecasts then, not a guess from one step
+  const usable = (r: Rate | null): r is Rate => r !== null && r.value >= MIN_RATE;
+  const rank = (r: Rate) => CONFIDENCE_RANK[confidenceOf(r, fast, normal)];
+  const recentPace = [normalRate, fastRate].find((r) => usable(r) && rank(r) >= CONFIDENCE_RANK.medium) ?? null;
+  const paceRate = recentPace ?? [normalRate, fastRate, longRate].filter(usable)
+    .reduce<Rate | null>((best, r) => (best === null || rank(r) > rank(best) ? r : best), null);
+  // Fallen back to the day for want of a reliable recent pace: the recent steps aren't trusted for the faster forecast or sudden
+  // consumption either (one 1% step in ten minutes would ring "limit soon" and "sudden")
+  const fellBack = recentPace === null && paceRate !== null && paceRate === longRate;
   const pace = paceRate?.value ?? null;
   /** Basis for confidence: the rate used for the forecast. Without a forecast, the first available rate in the order 60 min -> 15 min -> 24 h */
   const basis = paceRate ?? normalRate ?? fastRate ?? longRate;
@@ -243,10 +258,10 @@ export function windowMetrics(
     rate_pace: pacePerHour,
     eta_minutes: eta === null ? null : roundPercent(eta),
     eta_at: etaMs === null ? null : new Date(etaMs).toISOString(),
-    eta_fast_minutes: remaining === 0 ? 0 : pace === null ? null : roundPercent(remaining / Math.max(pace, fast ?? 0)),
+    eta_fast_minutes: remaining === 0 ? 0 : pace === null ? null : roundPercent(remaining / Math.max(pace, fellBack ? 0 : fast ?? 0)),
     reset_first: etaMs === null ? null : latest.reset <= etaMs,
     confidence: basis === null ? "insufficient" : confidenceOf(basis, fast, normal),
-    anomalous: fast === null || normal === null || continuous.length < 3 ? null : fast >= 0.10 && fast > normal * 1.75,
+    anomalous: fast === null || normal === null || continuous.length < 3 ? null : !fellBack && fast >= 0.10 && fast > normal * 1.75,
     unobserved_minutes: gap ? roundPercent(elapsed(gap.before, gap.after)) : null,
     unobserved_consumed_percent: gap ? consumed(gap.before, gap.after) : null,
   };

@@ -134,6 +134,27 @@ test("limit soon: show only the smallest minutes crossed at the faster rate; non
   assert.equal(early.events.filter((e) => e.body.kind === "soon").length, 0);
 });
 
+test("limit soon from a reliable recent hour after a slower day; nothing from one weak step when the day forecasts", () => {
+  const weekly = (offset: number, percent: number, reset: number): UsageObservation => ({
+    provider: "claude", window_id: "seven_day", collector: "win", resets_at: at(reset),
+    used_percent: percent, observed_at: at(offset),
+  });
+  const kinds = (events: JudgedEvent[], kind: string) => events.filter((e) => e.body.kind === kind);
+  // a day 65% -> 91%, then 91 -> 93 -> 95 -> 97 every 18 minutes, the reset in 90 minutes: the limit in about 27 minutes
+  const day = Array.from({ length: 77 }, (_, i) => weekly(-1440 + i * 18, Math.min(91, 65 + Math.floor((i * 26) / 77)), 90))
+    .filter((r) => Date.parse(r.observed_at) < Date.parse(at(-54)));
+  const rows = [...day, weekly(-54, 91, 90), weekly(-36, 93, 90), weekly(-18, 95, 90), weekly(0, 97, 90)];
+  const fast = judge([makeWindow("seven_day", 97, at(90), { fetched_at: at(0) })], emptyEventState(), { observations: rows });
+  assert.deepEqual(kinds(fast.events, "soon").filter((e) => e.visible).map((e) => e.body.threshold), [30]);
+  // the hour 98, 98, 98, 99 (the last step in ten minutes) after a slow day, the reset in 5 days: no limit soon, no sudden consumption
+  const slow = Array.from({ length: 93 }, (_, i) => weekly(-1440 + i * 15, 80 + Math.floor((i * 18) / 93), 5 * 1440))
+    .filter((r) => Date.parse(r.observed_at) < Date.parse(at(-60)));
+  const step = [...slow, weekly(-60, 98, 5 * 1440), weekly(-40, 98, 5 * 1440), weekly(-10, 98, 5 * 1440), weekly(0, 99, 5 * 1440)];
+  const quiet = judge([makeWindow("seven_day", 99, at(5 * 1440), { fetched_at: at(0) })], emptyEventState(), { observations: step });
+  assert.deepEqual(kinds(quiet.events, "soon").map((e) => e.key), []);
+  assert.deepEqual(kinds(quiet.events, "anomalous").map((e) => e.key), []);
+});
+
 test("sign-in expired / safety stop: once on change; created again if it recurs after recovering", () => {
   const first = judge([session(10)], emptyEventState(), { error: "login_required" });
   assert.equal(first.events.filter((e) => e.body.kind === "provider_error").length, 1);

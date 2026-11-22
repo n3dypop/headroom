@@ -112,7 +112,7 @@ const MAX_BODY_BYTES = 1_000_000;
 const HISTORY_MS = (24 * 60 + 30) * 60_000;
 /** Derived-value format version. 2: added rate_pace */
 // 3: recomputed after rows an earlier Worker accepted are held to today's rules (observations ahead of their receipt, markers)
-const METRICS_FORMAT = 4;
+const METRICS_FORMAT = 5;
 
 function json(status: number, body: unknown): Response {
   return new Response(body === null ? null : JSON.stringify(body), {

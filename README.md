@@ -1,12 +1,12 @@
 # Headroom
 
-Headroom shows how much of your **Claude Code** and **Codex** usage limits is left (the 5-hour and weekly windows, with their reset times) at a glance, on an iPhone home-screen or lock-screen widget.
+Headroom shows how much of your **Claude Code**, **Codex** and **Gemini** (the Antigravity CLI) usage limits is left (the 5-hour and weekly windows, with their reset times) at a glance, on an iPhone home-screen or lock-screen widget.
 
 - **It is built not to spend your quota.**
-  - Values come from the tools themselves: Claude Code's `claude -p "/usage"` and its statusLine, and Codex's `codex app-server` (`account/rateLimits/read`).
+  - Values come from the tools themselves: Claude Code's `claude -p "/usage"` and its statusLine, Codex's `codex app-server` (`account/rateLimits/read`), and the Antigravity CLI's `agy -p "/usage"` and its statusLine.
   - `/usage` is a local command. After every run, the agent checks the result for proof that no model request was made.
-  - If the agent cannot confirm this, it stops fetching Claude values automatically until you check and resume.
-- **It never reads your Claude or Codex credentials.** Sign-in is handled by each CLI; Headroom only runs the CLI.
+  - If the agent cannot confirm this, it stops fetching that provider's values automatically until you check and resume.
+- **It never reads your Claude, Codex or Gemini credentials.** Sign-in is handled by each CLI; Headroom only runs the CLI.
 - **No account data leaves your PCs.** The server stores usage values, window names, reset times, plan names and fixed status codes, plus the PC names you choose. It stores no tokens, emails, names, organization or account IDs, raw CLI output or file paths.
 - **It stays on Cloudflare's free plan.** Client reads touch only a few precomputed rows, and all other work runs within a daily budget that the Worker counts before it touches D1.
 
@@ -16,7 +16,8 @@ Headroom shows how much of your **Claude Code** and **Codex** usage limits is le
  Your PCs (Windows / macOS, not always on)
    headroom agent (Rust, runs in the background)
      ├─ Claude: claude -p "/usage" about every 15 min + statusLine
-     └─ Codex : codex app-server, account/rateLimits/read about every 15 min
+     ├─ Codex : codex app-server, account/rateLimits/read about every 15 min
+     └─ Gemini: agy -p "/usage" about every 15 min + statusLine (on by default only on Windows 11 with agy 1.5.14)
         │  (PCs take turns through the server; longer gaps while nothing changes)
         │  PUT with a per-PC write token
         ▼

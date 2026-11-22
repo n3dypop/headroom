@@ -84,6 +84,8 @@ pub enum Diag {
     VersionTimeout,
     UnrecognizedOutput,
     UnsupportedCli,
+    /// On by default, and agy is a version with verified guards but not one verified for being on by default
+    UnverifiedDefault,
     LoginRequired,
     ApiKey,
     FetchFailed,
@@ -114,6 +116,9 @@ impl Diag {
             Diag::UnrecognizedOutput => "Could not read the Antigravity CLI's output",
             Diag::UnsupportedCli => {
                 "This Antigravity CLI version is older than the verified one. Update it (agy update)"
+            }
+            Diag::UnverifiedDefault => {
+                "Gemini is on by default only with the agy versions checked for it, and this one isn't. To use it, set enabled = true under [gemini] in config.toml, then restart the agent (headroom stop, then headroom start)"
             }
             Diag::LoginRequired => "Sign in to the Antigravity CLI (run agy once in a terminal)",
             Diag::ApiKey => {
@@ -637,6 +642,76 @@ impl GeminiCli for RealCli {
         cmd.args(usage_args()).current_dir(cwd);
         classify_usage_output(run_capturing(cmd, USAGE_TIMEOUT))
     }
+}
+
+/// The agy versions on which the whole fetch (the statusLine and `/usage`) was verified by hand on a verified OS: there Gemini is on
+/// without an `enabled` in config.toml. Any other version, or another OS, starts it only when config.toml turns it on
+pub const DEFAULT_ON_VERSIONS: &[&str] = &["1.5.14"];
+
+/// Windows 11 is Windows NT build 22000 or later (Windows 10 is under it)
+const WINDOWS_11_BUILD: u32 = 22_000;
+
+/// Whether this OS is one the whole fetch was verified on: Windows 11, not Windows Server (the key read once from the registry,
+/// hidden; anything that can't be read is not)
+pub fn default_on_os() -> bool {
+    if !cfg!(windows) {
+        return false;
+    }
+    crate::providers::claude::background_command("reg")
+        .args([
+            "query",
+            r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion",
+        ])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()
+        .is_some_and(|out| verified_windows(&String::from_utf8_lossy(&out.stdout)))
+}
+
+/// Whether `reg query ...\CurrentVersion` output is Windows 11's: a build of 22000 or later on a client installation (Windows Server
+/// shares the build numbers; its InstallationType is "Server" or "Server Core")
+pub fn verified_windows(text: &str) -> bool {
+    reg_value(text, "CurrentBuildNumber")
+        .and_then(|b| b.parse::<u32>().ok())
+        .is_some_and(|build| build >= WINDOWS_11_BUILD)
+        && reg_value(text, "InstallationType") == Some("Client")
+}
+
+/// A value in `reg query` output: the rest of the line whose name is exactly `name` ("    CurrentBuildNumber    REG_SZ    26300")
+fn reg_value<'a>(text: &'a str, name: &str) -> Option<&'a str> {
+    text.lines().find_map(|line| {
+        let rest = line.trim_start().strip_prefix(name)?;
+        if !rest.starts_with(char::is_whitespace) {
+            return None;
+        }
+        let rest = rest.trim_start().strip_prefix("REG_")?;
+        let (_, value) = rest.split_once(char::is_whitespace)?;
+        Some(value.trim())
+    })
+}
+
+/// Whether a version of agy is one to run: on by default, only one verified for that; turned on in config.toml, one with verified
+/// guards (MIN_VERIFIED_CLI or later)
+pub fn verified_version(version: &str, by_default: bool) -> bool {
+    if by_default {
+        DEFAULT_ON_VERSIONS.contains(&version)
+    } else {
+        parse_agy_version(version).is_some_and(|got| got >= MIN_VERIFIED_CLI)
+    }
+}
+
+/// Whether Gemini is on for a config that leaves `enabled` out: on a verified OS, with agy found and its version one of
+/// DEFAULT_ON_VERSIONS (asked once with `agy --version`; nothing else of agy runs). Elsewhere off, with nothing launched
+pub fn default_on(cli: &mut dyn GeminiCli, verified_os: bool) -> bool {
+    if !verified_os {
+        return false;
+    }
+    let Some(bin) = cli.locate() else {
+        return false;
+    };
+    cli.version(&bin)
+        .is_ok_and(|v| DEFAULT_ON_VERSIONS.contains(&v.as_str()))
 }
 
 /// The version a run of `agy --version` printed: only from a clean exit whose output was read whole (text that isn't UTF-8 or was cut
@@ -1239,7 +1314,10 @@ impl GeminiProvider {
 
     /// When `/usage` may next run (every 5 minutes by default, extended on repeated failures and while a limit is reached)
     pub fn usage_due_ms(&self, now: i64) -> i64 {
-        if !self.cfg.enabled || self.stopped() || self.state.cli_supported != Some(true) {
+        if self.cfg.enabled != Some(true)
+            || self.stopped()
+            || self.state.cli_supported != Some(true)
+        {
             return i64::MAX;
         }
         if self.state.last_attempt_ms > now {
@@ -1277,7 +1355,7 @@ impl GeminiProvider {
 
     /// When to next check the CLI version (hourly; at once in a new process and before the first check)
     pub fn version_due_ms(&self, now: i64) -> i64 {
-        if !self.cfg.enabled {
+        if self.cfg.enabled != Some(true) {
             return i64::MAX;
         }
         if !self.version_looked || self.state.cli_supported.is_none() {
@@ -1318,15 +1396,24 @@ impl GeminiProvider {
         };
         match result {
             Ok(v) => {
-                let ok = parse_agy_version(&v).is_some_and(|got| got >= MIN_VERIFIED_CLI);
+                // On by default: only the versions verified for that, also when agy was updated while the agent runs
+                let ok = verified_version(&v, self.cfg.by_default);
+                let guarded = verified_version(&v, false);
                 self.state.cli_version = Some(v);
                 self.state.cli_supported = Some(ok);
                 if !ok {
-                    self.state.last_error = Some(Diag::UnsupportedCli);
+                    // A version with verified guards, only not one checked for being on by default: turning it on is the way, not
+                    // an update
+                    self.state.last_error = Some(if guarded {
+                        Diag::UnverifiedDefault
+                    } else {
+                        Diag::UnsupportedCli
+                    });
                 } else if matches!(
                     self.state.last_error,
                     Some(
                         Diag::UnsupportedCli
+                            | Diag::UnverifiedDefault
                             | Diag::CliNotFound
                             | Diag::CliStartFailed
                             | Diag::VersionTimeout
@@ -1895,7 +1982,7 @@ impl Provider for GeminiProvider {
 
     fn next_due_ms(&self, now: i64) -> i64 {
         // Turned off: never due (nothing of agy runs, its statusLine input isn't taken either)
-        if !self.cfg.enabled {
+        if self.cfg.enabled != Some(true) {
             return i64::MAX;
         }
         // A state that couldn't be read is read again a minute on: nothing is due before
@@ -1918,7 +2005,7 @@ impl Provider for GeminiProvider {
         let confirmed = std::mem::take(&mut self.safety_confirmed);
         let asked = accept || same;
         self.accepted = asked.then_some(false);
-        if !self.cfg.enabled {
+        if self.cfg.enabled != Some(true) {
             return ProviderSnapshot::empty(
                 ProviderStatus::Unavailable,
                 "Disabled in config",
@@ -2227,7 +2314,7 @@ impl Provider for GeminiProvider {
     }
 
     fn sync_saved(&mut self, now: i64) -> Option<ProviderSnapshot> {
-        if !self.cfg.enabled {
+        if self.cfg.enabled != Some(true) {
             return None;
         }
         // This process couldn't save what it found (a switch, a pause, a result): the saved state is older and isn't taken, and
@@ -2261,7 +2348,7 @@ impl Provider for GeminiProvider {
     fn holds_queue(&self) -> bool {
         // Waiting for the user's choice, for a state that can be read or saved, for the result of a fetch (another process's, or one
         // whose result couldn't be saved), or for the account after a lost state
-        self.cfg.enabled
+        self.cfg.enabled == Some(true)
             && (self.saved_unread
                 || self.unsaved
                 || self.state.usage_in_flight_ms.is_some()
@@ -2269,6 +2356,17 @@ impl Provider for GeminiProvider {
                 || self.state.limits_changed
                 || self.state.account_changed)
     }
+}
+
+/// Writes a saved state of this version, changed by `edit` (for other modules' tests)
+#[cfg(test)]
+pub(crate) fn save_test_state(home: &Path, edit: impl FnOnce(&mut GeminiState)) {
+    let mut state = GeminiState {
+        state_version: STATE_VERSION,
+        ..Default::default()
+    };
+    edit(&mut state);
+    std::fs::write(home.join(STATE_FILE), serde_json::to_vec(&state).unwrap()).unwrap();
 }
 
 #[cfg(test)]
@@ -2363,7 +2461,7 @@ mod tests {
 
     fn provider(h: &Path, fake: &Fake) -> GeminiProvider {
         let cfg = GeminiConfig {
-            enabled: true,
+            enabled: Some(true),
             ..GeminiConfig::default()
         };
         GeminiProvider::with_cli(h, cfg, Logger::stderr(), Box::new(fake.clone()))
@@ -2676,12 +2774,108 @@ mod tests {
     }
 
     #[test]
+    fn on_by_default_only_windows_11_and_only_the_versions_verified_for_it_also_after_an_update() {
+        let key = |build: &str, kind: &str| {
+            format!(
+                "\r\nHKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\r\n    CurrentBuild    REG_SZ    1\r\n    CurrentBuildNumber    REG_SZ    {build}\r\n    InstallationType    REG_SZ    {kind}\r\n    ProductName    REG_SZ    Windows 10 Home\r\n"
+            )
+        };
+        assert!(
+            verified_windows(&key("26300", "Client")),
+            "Windows 11 (its ProductName still says 10)"
+        );
+        assert!(verified_windows(&key("22000", "Client")));
+        assert!(!verified_windows(&key("19045", "Client")), "Windows 10");
+        assert!(
+            !verified_windows(&key("26100", "Server")),
+            "Windows Server 2025"
+        );
+        assert!(!verified_windows(&key("26100", "Server Core")));
+        assert!(
+            !verified_windows("    CurrentBuildNumber    REG_SZ    26300"),
+            "no installation type"
+        );
+        assert!(
+            !verified_windows("    InstallationType    REG_SZ    Client"),
+            "no build"
+        );
+        assert!(!verified_windows("nothing"));
+        assert!(verified_version("1.5.14", true));
+        assert!(
+            !verified_version("1.5.15", true),
+            "on by default: only a version verified for it"
+        );
+        assert!(
+            verified_version("1.5.15", false),
+            "turned on in config.toml: guards verified from 1.5.13"
+        );
+        assert!(!verified_version("1.5.12", false));
+        // on by default, and agy updated to a version not verified for it while the agent runs: no /usage
+        let h = home("default-update");
+        let fake = Fake::default();
+        fake.0.lock().unwrap().version = Some(Ok("1.5.15".into()));
+        identify(&h, "a@example.com", NOW);
+        let cfg = GeminiConfig {
+            enabled: Some(true),
+            by_default: true,
+            ..GeminiConfig::default()
+        };
+        let mut p =
+            GeminiProvider::with_cli(&h, cfg.clone(), Logger::stderr(), Box::new(fake.clone()));
+        p.collect(NOW, true);
+        assert_eq!(fake.usages(), 0, "nothing run");
+        assert_eq!(p.state.cli_supported, Some(false));
+        // the guidance: turn it on in config.toml (an update wouldn't make it one checked for being on by default)
+        assert_eq!(p.state.last_error, Some(Diag::UnverifiedDefault));
+        assert!(Diag::UnverifiedDefault.message().contains("enabled = true"));
+        assert_eq!(Diag::UnverifiedDefault.error_code(), ErrorCode::FetchFailed);
+        // older than the verified guards: an update
+        let old = home("default-old");
+        let fake = Fake::default();
+        fake.0.lock().unwrap().version = Some(Ok("1.5.12".into()));
+        identify(&old, "a@example.com", NOW);
+        let mut p = GeminiProvider::with_cli(&old, cfg, Logger::stderr(), Box::new(fake.clone()));
+        p.collect(NOW, true);
+        assert_eq!(
+            (fake.usages(), p.state.last_error),
+            (0, Some(Diag::UnsupportedCli))
+        );
+    }
+
+    #[test]
+    fn gemini_is_on_by_default_only_with_a_verified_agy_on_a_verified_os() {
+        let run =
+            |verified_os: bool, bin: Option<Option<PathBuf>>, version: Result<String, Diag>| {
+                let fake = Fake::default();
+                {
+                    let mut c = fake.0.lock().unwrap();
+                    c.bin = bin;
+                    c.version = Some(version);
+                }
+                let on = default_on(&mut fake.clone(), verified_os);
+                let c = fake.0.lock().unwrap();
+                (on, c.versions, c.usages)
+            };
+        // the verified version on a verified OS: on, after one version check and nothing else
+        assert_eq!(run(true, None, Ok("1.5.14".into())), (true, 1, 0));
+        // another version (older, newer, or one whose guards were checked but not the whole fetch): off
+        for v in ["1.5.13", "1.5.15", "1.6.0"] {
+            assert_eq!(run(true, None, Ok(v.into())), (false, 1, 0), "{v}");
+        }
+        assert!(!run(true, None, Err(Diag::UnrecognizedOutput)).0);
+        // no agy, or an OS not verified: off with nothing launched
+        assert_eq!(run(true, Some(None), Ok("1.5.14".into())), (false, 0, 0));
+        assert_eq!(run(false, None, Ok("1.5.14".into())), (false, 0, 0));
+    }
+
+    #[test]
     fn nothing_of_agy_runs_while_gemini_is_turned_off() {
         let h = home("off");
         let fake = Fake::default();
         identify(&h, "a@example.com", NOW);
+        // left out of config.toml: off until the agent decides it at its start, and nothing runs meanwhile
         let cfg = GeminiConfig::default();
-        assert!(!cfg.enabled, "off by default");
+        assert_eq!(cfg.enabled, None);
         let mut p = GeminiProvider::with_cli(&h, cfg, Logger::stderr(), Box::new(fake.clone()));
         p.on_event(&Event::GeminiStatuslineCaptured);
         let s = p.collect(NOW, true);

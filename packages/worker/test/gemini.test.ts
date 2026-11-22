@@ -1,4 +1,4 @@
-// The examples agreed for Gemini's G2 (three providers): what the Worker stores, serves and judges
+// The examples agreed for Gemini (three providers): what the Worker stores, serves and judges
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { test } from "node:test";

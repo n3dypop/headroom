@@ -194,7 +194,58 @@ test("a window that hasn't started (0%, no reset time) has an exact recent consu
   assert.equal(metrics.eta_minutes, null);
 });
 
-test("rate_pace is the rate used for the forecast (the first exceeding the minimum before rounding); not re-picked from the rounded rate_60m", () => {
+test("the forecast takes the most reliable rate: a quiet hour of an integer weekly value (one 1% step) gives way to the day behind it", () => {
+  const weekly = (offset: number, percent: number): UsageObservation => ({
+    provider: "claude", window_id: "seven_day", collector: "win", resets_at: at(5 * 1440),
+    used_percent: percent, observed_at: at(offset),
+  });
+  // a day of fetches every 15 minutes, 43% -> 63% (0.83%/hour); in the last hour only 62% -> 63%
+  const rows = Array.from({ length: 97 }, (_, i) => weekly(-1440 + i * 15, 43 + Math.floor((i * 20) / 96)));
+  assert.deepEqual(rows.slice(-5).map((r) => r.used_percent), [62, 62, 62, 62, 63], "the last hour: one step");
+  const metrics = windowMetrics(makeWindow("seven_day", 63, at(5 * 1440), { fetched_at: at(0) }), rows);
+  assert.ok(metrics.rate_60m !== null && metrics.rate_60m >= 0.6, `a 60-minute rate: ${metrics.rate_60m}`);
+  assert.ok(Math.abs(metrics.rate_pace! - metrics.rate_24h!) < 0.01, `the day's rate forecasts: ${metrics.rate_pace} vs ${metrics.rate_24h}`);
+  assert.ok(metrics.confidence === "high" || metrics.confidence === "medium", metrics.confidence);
+  assert.equal(metrics.reset_first, false, "37% left at 0.83%/hour: used up before the reset in 5 days");
+  // as reliable as the day (both high): the hour's pace, the most recent
+  const fast = Array.from({ length: 289 }, (_, i) => {
+    const t = -1440 + i * 5;
+    return weekly(t, t <= -60 ? 30 + ((t + 1440) / 1380) * 10 : 40 + (t + 60) / 10);
+  });
+  const recent = windowMetrics(makeWindow("seven_day", 46, at(5 * 1440), { fetched_at: at(0) }), fast);
+  assert.equal(recent.confidence, "high");
+  assert.ok(Math.abs(recent.rate_pace! - recent.rate_60m!) < 0.01 && recent.rate_60m! > 3 * recent.rate_24h!, String([recent.rate_pace, recent.rate_60m, recent.rate_24h]));
+  // the same hour alone (no day behind it): its own rate, and low
+  const hour = windowMetrics(makeWindow("seven_day", 63, at(5 * 1440), { fetched_at: at(0) }), rows.slice(-5));
+  assert.equal(hour.confidence, "low");
+  assert.ok(Math.abs(hour.rate_pace! - hour.rate_60m!) < 0.01);
+});
+
+test("a reliable recent pace is never hidden behind a slower day; the day's fallback rings nothing from a weak recent step", () => {
+  const weekly = (offset: number, percent: number): UsageObservation => ({
+    provider: "claude", window_id: "seven_day", collector: "win", resets_at: at(90),
+    used_percent: percent, observed_at: at(offset),
+  });
+  // a day 65% -> 91%, then 91 -> 93 -> 95 -> 97 every 18 minutes: the hour's 6.67%/hour is medium, and it forecasts (the limit in 27
+  // minutes, before the reset in 90)
+  const day = Array.from({ length: 77 }, (_, i) => weekly(-1440 + i * 18, Math.min(91, 65 + Math.floor((i * 26) / 77))));
+  const rows = [...day.filter((r) => Date.parse(r.observed_at) < Date.parse(at(-54))), weekly(-54, 91), weekly(-36, 93), weekly(-18, 95), weekly(0, 97)];
+  const fast = windowMetrics(makeWindow("seven_day", 97, at(90), { fetched_at: at(0) }), rows);
+  assert.ok(Math.abs(fast.rate_pace! - fast.rate_60m!) < 0.01, String([fast.rate_pace, fast.rate_60m, fast.rate_24h]));
+  assert.equal(fast.confidence, "medium");
+  assert.equal(fast.reset_first, false);
+  assert.ok(fast.eta_fast_minutes !== null && fast.eta_fast_minutes <= 30, String(fast.eta_fast_minutes));
+  // the hour 98, 98, 98, 99 (the last step in ten minutes) after a slow day: the day forecasts, and nothing rings from the one step
+  const quiet = (offset: number, percent: number): UsageObservation => ({ ...weekly(offset, percent), resets_at: at(5 * 1440) });
+  const slow = Array.from({ length: 93 }, (_, i) => quiet(-1440 + i * 15, 80 + Math.floor((i * 18) / 93)));
+  const step = [...slow.filter((r) => Date.parse(r.observed_at) < Date.parse(at(-60))), quiet(-60, 98), quiet(-40, 98), quiet(-10, 98), quiet(0, 99)];
+  const weak = windowMetrics(makeWindow("seven_day", 99, at(5 * 1440), { fetched_at: at(0) }), step);
+  assert.ok(Math.abs(weak.rate_pace! - weak.rate_24h!) < 0.01, String([weak.rate_pace, weak.rate_60m, weak.rate_24h]));
+  assert.ok(Math.abs(weak.eta_fast_minutes! - weak.eta_minutes!) < 0.01, "the faster forecast is the day's too");
+  assert.notEqual(weak.anomalous, true, "no sudden consumption from one step");
+});
+
+test("rate_pace is the rate used for the forecast (the minimum is judged before rounding); not re-picked from the rounded rate_60m", () => {
   // The 60-minute rate is just below the minimum (0.01%/min = 0.6%/hour; 0.6 when rounded). The 15-minute rate is about 2%/hour
   const rows = [[-60, 98.4], [-50, 98.45], [-40, 98.5], [-30, 98.55], [-20, 98.6], [-10, 98.65], [-5, 98.83], [0, 99]]
     .map(([m, p]) => observation(m!, p!, 60));
