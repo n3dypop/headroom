@@ -1665,9 +1665,16 @@ mod tests {
         // Written by the running one
         crate::store::write_json_atomic(&home.join(SCHEDULE_FILE), &schedule("new")).unwrap();
         assert_eq!(current_schedule(&home), Some(providers.clone()));
-        // Its writer is gone (crashed) and both files remain, e.g. while an older agent version runs: not used
+        // Its writer is gone (crashed) and both files remain, e.g. while an older agent version runs: not used. A process another test
+        // starts at this moment shares the lock until it runs its program (fork before exec), so it is asked again for a while
         drop(held);
-        assert_eq!(current_schedule(&home), None);
+        let released = (0..40).any(|_| {
+            current_schedule(&home).is_none() || {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                false
+            }
+        });
+        assert!(released, "the schedule of a session whose writer is gone");
         // Another `status` probing at the same moment (shared lock) is not mistaken for the agent
         let other_status = std::fs::File::open(home.join(SESSION_LOCK_FILE)).unwrap();
         other_status.try_lock_shared().unwrap();
