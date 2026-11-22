@@ -1743,7 +1743,10 @@ test("Lock screen: circular progress around the icon. The rectangle shows the on
   assert.ok(r.includes("Wk limit") && !r.some((x) => x.includes("Codex")) && r.includes("71%") && r.includes("31m"), r.join(" | "));
   assert.ok(images(rect.widget.node).some((n) => n.props.symbol === lib.TIME_SYMBOLS.reset), "reset time");
   const inline = await runWidget({ family: "accessoryInline", parameter: "codex" });
-  assert.deepEqual(texts(inline.widget.node), ["Codex wk 71% · ↻ Fri 19:51"], "one limit: the provider, the limit, what is left and its time");
+  // the weekday and time in the device's time zone (the test machine's)
+  const line = texts(inline.widget.node);
+  assert.equal(line.length, 1);
+  assert.match(line[0]!, /^Codex wk 71% · ↻ \w{3} \d{2}:\d{2}$/, "one limit: the provider, the limit, what is left and its time");
   const circular = await runWidget({ family: "accessoryCircular", now: later });
   const ring = images(circular.widget.node).find((n) => n.props.ring);
   assert.equal((ring?.props.drawnTexts as string[]).at(-1), "wk", "the limit's name is inside the ring (below the icon)");
