@@ -12,8 +12,7 @@ import {
   parseResult,
   parseTurnRequest,
   type HoldRow,
-  type TurnRequest,
-} from "../src/holds.ts";
+  type TurnRequest, rateJitter, RATE_JITTER } from "../src/holds.ts";
 import { handle as handleRequest, runCron, type Env } from "../src/index.ts";
 import { MAX_STORED_COLLECTORS } from "../src/store.ts";
 import { sqliteD1 } from "./d1-sqlite.ts";
@@ -186,12 +185,27 @@ test("applyResult: only the pending attempt's result applies; a fetch's ok takes
   assert.deepEqual(Object.keys(notRun.update).sort(), ["pending_attempt", "pending_collector", "pending_kind", "pending_since", "retired"]);
   // a failure hands this PC's lease back
   assert.equal(applyResult(pending("fetch", { holder: "mac" }), "mac", rep("failed"), t)!.update.holder, null);
-  // 429: 30, 60, 120, 240 minutes, at least the interval and the wait named (6 hours stays 21,600 s)
+  // 429: 30, 60, 120, 240 minutes, at least the interval and the wait named (6 hours stays 21,600 s), each lengthened by up to 20 %
+  // (never shortened), the same for the same report
   const stage = (s: number, extra = {}) => applyResult(pending("fetch", { rate_stage: s }), "mac", rep("rate_limited", extra), t)!.update;
-  assert.deepEqual([stage(0).rate_stage, stage(0).rate_until], [1, iso(t + 30 * MIN)]);
-  assert.deepEqual([stage(3).rate_stage, stage(3).rate_until], [4, iso(t + 240 * MIN)]);
-  assert.equal(stage(4).rate_until, iso(t + 240 * MIN), "the last stage stays");
-  assert.equal(stage(0, { retry_s: 21_600 }).rate_until, iso(t + 21_600_000));
+  const share = rateJitter("mac", "claude", A1);
+  assert.ok(share >= 0 && share <= RATE_JITTER, String(share));
+  const after = (minutes: number) => iso(t + Math.round(minutes * MIN * (1 + share)));
+  assert.deepEqual([stage(0).rate_stage, stage(0).rate_until], [1, after(30)]);
+  assert.deepEqual([stage(3).rate_stage, stage(3).rate_until], [4, after(240)]);
+  assert.equal(stage(4).rate_until, after(240), "the last stage stays");
+  assert.equal(stage(0, { retry_s: 21_600 }).rate_until, after(360));
+  assert.equal(stage(0).rate_until, stage(0).rate_until, "the same report, the same wait");
+  // never past the longest wait a PC takes (366 days): the longest named is kept as it is, a shorter one lengthened up to it
+  const DAY = 1_440 * MIN;
+  assert.ok(share > 0.003, String(share));
+  assert.equal(stage(0, { retry_s: 366 * 86_400 }).rate_until, iso(t + 366 * DAY));
+  assert.equal(stage(0, { retry_s: 365 * 86_400 }).rate_until, iso(t + 366 * DAY));
+  assert.equal(stage(0, { retry_s: 300 * 86_400 }).rate_until, iso(t + Math.round(300 * DAY * (1 + share))));
+  // spread over the range by the attempt (its identifier is the agent's random one)
+  const shares = Array.from({ length: 200 }, (_, i) => rateJitter("mac", "claude", `attempt-${i}`));
+  assert.ok(Math.min(...shares) < 0.02 && Math.max(...shares) > 0.18, `${Math.min(...shares)} - ${Math.max(...shares)}`);
+  assert.ok(shares.every((x) => x >= 0 && x < RATE_JITTER));
   assert.equal(applyResult(pending("fetch", leased), "mac", rep("rate_limited"), t)!.update.holder, null, "the lease goes");
   // 403: a stop starts once (its generation), and a resume's success ends it
   const denied = applyResult(pending("fetch", { denied_gen: 3 }), "mac", rep("access_denied"), t)!;
@@ -262,15 +276,18 @@ test("PC-A's 6-hour rate limit holds PC-B, also restarted and due for its own fe
   const { turn, result, at } = await setup();
   assert.equal((await turn("mac", "fetch", A1)).go, true);
   const limited = await result("mac", A1, "rate_limited", at(0.2), { retry_s: 21_600 });
-  assert.deepEqual({ ...limited.body.state, version: 0 }, { denied: false, denied_gen: 0, rate_stage: 1, rate_wait_s: 21_600, version: 0 });
+  // the named 6 hours, lengthened a little by the Worker (the same for the same report)
+  const waitMs = Math.round(21_600_000 * (1 + rateJitter("mac", "claude", A1)));
+  assert.deepEqual({ ...limited.body.state, version: 0 }, { denied: false, denied_gen: 0, rate_stage: 1, rate_wait_s: Math.ceil(waitMs / 1000), version: 0 });
   for (const kind of ["fetch", "own", "force"]) {
     const a = await turn("win", kind, A2, at(120));
-    assert.deepEqual([a.go, a.reason, a.wait_s], [false, "rate_limited", 21_600 - 119.8 * 60], kind);
+    assert.deepEqual([a.go, a.reason, a.wait_s], [false, "rate_limited", Math.ceil((waitMs - 119.8 * 60_000) / 1000)], kind);
   }
   // after the wait one PC is granted; its success ends the stage
-  assert.equal((await turn("win", "own", A2, at(360.3))).go, true);
-  assert.equal((await turn("mac", "fetch", A3, at(360.4))).reason, "pending");
-  assert.equal((await result("win", A2, "ok", at(360.5))).body.state.rate_stage, 0);
+  const over = waitMs / 60_000 + 0.2;
+  assert.equal((await turn("win", "own", A2, at(over + 0.1))).go, true);
+  assert.equal((await turn("mac", "fetch", A3, at(over + 0.2))).reason, "pending");
+  assert.equal((await result("win", A2, "ok", at(over + 0.3))).body.state.rate_stage, 0);
 });
 
 test("an access denial stops the provider on every PC, shows on the read endpoint over another PC's older success, and makes one event per stop", async () => {
@@ -329,9 +346,15 @@ test("no budget left, or a PC that can't deliver: nothing granted and nothing wr
   assert.equal((await turn("mac", "fetch", A1)).go, true);
   raw.prepare("INSERT INTO d1_budget (day, reads, writes) VALUES ('2026-11-16', 0, ?) ON CONFLICT (day) DO UPDATE SET writes = excluded.writes")
     .run(DAILY_BUDGET.writes - RESERVE.turn.writes + 1);
-  const refused = await turn("win", "fetch", A2, at(1));
-  assert.deepEqual([refused.go, refused.reason], [false, "unavailable"]);
-  assert.equal((await result("mac", A1, "ok", at(1))).status, 503, "not acknowledged: the PC sends it again");
+  // no budget: refused as an upload is (503 d1_budget with its wait), so the PC asks again only then
+  const refused = await call("POST", "/v2/turns/win-desktop", WIN, { claude: { kind: "fetch", attempt: A2, base: 0 } }, at(1));
+  assert.equal(refused.status, 503);
+  const told = (await refused.json()) as { error: string; retry_after_s: number };
+  assert.ok(told.error === "d1_budget" && told.retry_after_s > 0 && told.retry_after_s <= 15 * 60, JSON.stringify(told));
+  const unacknowledged = await call("POST", "/v2/turns/mac/result", MAC, { claude: { attempt: A1, kind: "fetch", outcome: "ok", interval_s: 900, minutes: 18 } }, at(1));
+  assert.equal(unacknowledged.status, 503, "not acknowledged: the PC sends it again");
+  assert.equal(((await unacknowledged.json()) as { error: string }).error, "d1_budget");
+  void result;
   raw.exec("DELETE FROM d1_budget");
   assert.equal((await result("mac", A1, "ok", at(2))).body.applied, true);
   // registrable names used up: an unregistered PC gets nothing, and a lease it took before holds no one off

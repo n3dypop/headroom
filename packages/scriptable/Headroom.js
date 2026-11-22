@@ -11,7 +11,7 @@
 // From here down to "Widget rendering below" everything is a pure function that doesn't use the Scriptable API (tested with Node).
 // Startup is at the end (main runs after all constants are defined)
 
-const HEADROOM_VERSION = 97;
+const HEADROOM_VERSION = 98;
 /** View version this script can read (VIEW_VERSION in packages/core) */
 const VIEW_VERSION = 1;
 /** Settings are stored as JSON in a single Keychain item (so the server and credentials are always read as a pair) */
@@ -110,14 +110,19 @@ const MAX_PROVIDERS = 3;
  */
 const VIEW_PROVIDERS = ["claude", "codex"];
 /**
- * Providers whose fetch isn't verified on a real machine yet: turned off on the PCs by default, so without values of theirs they are
- * shown as not supported (not as missing data)
+ * Providers whose fetch is verified only on some OS and CLI versions: off on a PC unless turned on (or on by default where verified),
+ * so without values of theirs they are shown as not set up (not as missing data)
  */
 const UNVERIFIED_PROVIDERS = ["gemini"];
 /** Short provider names for the lock screen's line when the names don't fit otherwise (three providers) */
 const SHORT_PROVIDER_NAMES = { codex: "Cx", claude: "Cl", gemini: "Gm" };
-/** Shown where the limits (and on the lock screen, the limit name) of a provider not supported yet would be */
-const NOT_SUPPORTED = "Not supported";
+/**
+ * Shown where the limits (and on the lock screen, the limit name) of such a provider would be while it has no values: it is off on the
+ * PCs, or hasn't sent a value yet
+ */
+const NOT_SET_UP = "Not set up";
+/** The details page's note under it: how to set it up */
+const NOT_SET_UP_HINT = "Not turned on on any PC, or no value sent yet. Gemini is on by default only on Windows 11 with a checked agy; elsewhere set enabled = true under [gemini] in config.toml, and set up Antigravity's statusLine (docs/install.md 2.8)";
 /** Without an icon image: the SF Symbol, the letter drawn in the lock screen ring and the mark of the details screen */
 const FALLBACK_MARKS = {
   claude: { symbol: "asterisk", letter: "C", css: "✳︎" },
@@ -371,8 +376,9 @@ function sanitizeProvider(p) {
     status: oneOf(p.status, PROVIDER_STATUSES),
     plan: oneOf(p.plan, Object.keys(PLAN_NAMES)),
     error_code,
-    // At its limit (true / false / unknown); the header dot turns red while values stop updating at the limit
-    blocked: typeof p.blocked === "boolean" ? p.blocked : null,
+    // At its limit (true / false / unknown); the header dot turns red while values stop updating at the limit. Not for a denied one:
+    // its values are withheld, and the dot says nothing of a limit
+    blocked: !denied && typeof p.blocked === "boolean" ? p.blocked : null,
     main_window_ids: denied ? [] : main, window_ids: denied ? [] : all, windows: denied ? {} : windows,
   };
 }
@@ -475,7 +481,7 @@ function recentSettledAt(w) {
 
 /**
  * Short mark (lock screen). ↻ for a value whose reset time has passed since its fetch (shown as 0% used until a newer value comes; left out
- * where a time row says "↻ Reset"), or the age the home screen shows next to its gray dot (32m, 2h; over 15 minutes).
+ * where a time row says "↻ Reset"), or the age the home screen shows next to its gray dot (32m, 2h; over 20 minutes).
  * The lock screen has no colors, so the dot itself isn't drawn: fresh values, values of unknown age (gray dot alone) and values at the limit
  * (red dot alone) get no mark, as at home. Approximate values get no mark either
  */
@@ -530,9 +536,9 @@ function defaultProviders(view) {
   return [...DEFAULT_PROVIDERS, ...PROVIDER_ORDER.filter((p) => !DEFAULT_PROVIDERS.includes(p) && view?.[p])].slice(0, MAX_PROVIDERS);
 }
 
-/** Why a provider shown has no value: not supported yet (a provider whose fetch isn't verified, turned off on the PCs), or no data */
+/** Why a provider shown has no value: not set up (a provider off on the PCs unless turned on, or not sending yet), or no data */
 function missingText(provider) {
-  return UNVERIFIED_PROVIDERS.includes(provider) ? NOT_SUPPORTED : "No data";
+  return UNVERIFIED_PROVIDERS.includes(provider) ? NOT_SET_UP : "No data";
 }
 
 /**
@@ -740,7 +746,7 @@ function barPieces(segments, width, height, brandHex) {
 }
 
 /**
- * Freshness of a provider's values (the header dot), by time since fetch: fresh, caution (over 15 min), old (over 60 min).
+ * Freshness of a provider's values (the header dot), by time since fetch: fresh, caution (over 20 min), old (over 75 min).
  * While the provider is at its limit the dot is "limit" (red) whatever the age: fetching slows down to about once an hour until the reset,
  * so a dot by age would turn green for a few minutes after each fetch. Once the limit has most likely lifted (limitLifted), the dot goes
  * back to the age. At the limit the dot is red even when the fetch time is unknown
@@ -958,8 +964,8 @@ function inlineText(items, cached, prefix = "", now = new Date()) {
   const build = (step) => {
     const body = items.map((x) => {
       const who = step >= 2 ? SHORT_PROVIDER_NAMES[x.provider] ?? x.providerName : x.providerName;
-      // A reason, shortened with the names (Not supported and Not available as N/A)
-      if (x.missing) return `${who} ${step >= 2 ? (x.label === NOT_SUPPORTED ? "N/A" : (x.short ?? x.label).replace(NOT_AVAILABLE, "N/A")) : x.label}`;
+      // A reason, shortened with the names (Not set up and Not available as N/A)
+      if (x.missing) return `${who} ${step >= 2 ? (x.label === NOT_SET_UP ? "N/A" : (x.short ?? x.label).replace(NOT_AVAILABLE, "N/A")) : x.label}`;
       const reset = x.window.value_status === "reset_estimated";
       const value = reset ? `${RESET_MARK}${compactPercent(x.window)}` : compactPercent(x.window);
       const name = step >= 3 ? "" : LIMIT_NAMES[x.window.id] ?? shortName(x.window);
@@ -1201,7 +1207,7 @@ const NOTIFY_KEEP_MS = 8 * 24 * 60 * 60000;
 const CYCLE_TOLERANCE_MS = 10 * 60000;
 /** Errors worth a notification (the kinds the server makes provider_error events of; a failed fetch retries on its own) */
 /** What the details screen says to do about an access denial */
-const DENIED_HINT = "The service denied access, so fetching stopped on every PC. Check the account, then run headroom collect --provider <name> --resume-access on a PC";
+const DENIED_HINT = "The service denied access, so fetching stopped on every PC. Check the account, then on a PC run the command headroom status shows (headroom collect --provider <name> --resume-access <stop>)";
 const ALERT_ERRORS = ["login_required", "safety_stop", "access_denied"];
 /**
  * Monochrome symbols shared by the notifications and the details screen (characters without a color emoji form, or with the text
@@ -2237,7 +2243,11 @@ function detailHtml(input) {
     const head = `<header class="ph"><i class="ic ic-${id}"></i><span class="pn"><h2 style="color:${BRAND_COLORS[id]}">${esc(PROVIDER_NAMES[id])}</h2>` +
       `${p?.plan ? `<span class="plan">${esc(PLAN_NAMES[p.plan] ?? "")}</span>` : ""}</span>` +
       `<span class="fresh">${ageText ? `<span>${esc(ageText)}</span>` : ""}<i class="dot" style="background:${FRESH_COLORS[fresh.level]}"></i></span></header>`;
-    if (!p) return `<section>${head}<p class="message">${esc(SYMBOLS.unknown)} ${esc(missingText(id))}</p></section>`;
+    // A provider without values: why, and for one that may be off, how to set it up
+    if (!p) {
+      const hint = missingText(id) === NOT_SET_UP ? `<p class="na-note">${esc(NOT_SET_UP_HINT)}</p>` : "";
+      return `<section>${head}<p class="message">${esc(SYMBOLS.unknown)} ${esc(missingText(id))}</p>${hint}</section>`;
+    }
     const message = p.window_ids.length === 0 ? `<p class="message">${esc(SYMBOLS.runout)} ${esc(ERROR_NAMES[p.error_code] ?? "No limits to show")}</p>` +
       (p.error_code === "access_denied" ? `<p class="na-note">${esc(DENIED_HINT)}</p>` : "") : "";
     const missing = missingFiveHour(p)
@@ -4574,7 +4584,7 @@ function drawLockOthers(widget, picks) {
 
 /** What ③'s empty ring shows for a provider without a value: N/A for a limit it hasn't or a provider not supported yet, else – */
 function othersMissing(pick) {
-  return pick.label === NOT_SUPPORTED || pick.short.includes(NOT_AVAILABLE) ? "N/A" : "–";
+  return pick.label === NOT_SET_UP || pick.short.includes(NOT_AVAILABLE) ? "N/A" : "–";
 }
 
 /** Width of ②'s text column: ③'s right ring's, so the text sits where that ring does */
@@ -5727,6 +5737,6 @@ if (typeof Script !== "undefined" && typeof ListWidget !== "undefined") {
     splitNotify, notifyPrefs, reminderPlan, reconcileReminders, reminderId, sanitizeEvents, selectAlerts, alertNotifications, sampleNotifications, eventPhrase, notifyTitle, SYMBOLS, eventsFileName, eventsCursor,
     readNotifyState, readRecords, forgetSwitched, withdrawnAt, accountMark, emptyViewAt, recordName, parseRecord, eventMark, lockFree, holdsLock, withoutCancelled, orphanFiles, fileTag, deliveredSeqs, keepTold, readConfigState, LOCK_SETTLE_MS, detailUrl, parameterGuideHtml, buildParameter, PARAMETER_CHOICES, PARAMETER_GUIDE, detailHtml, detailTiles, tilesHtml, tileTime, providerAge, worstText, fullLimitName, detailChart, dayLabel, iconCss, missingFiveHour, esc, KEYCHAIN_NOTIFY, RUNOUT_LEAD_MINUTES,
     resetDate, errorText, cachedNote, readCache, originTag, cacheTag, sameConfig, DEFAULT_CONFIG_ID, cacheFileName, seenFileName, pickCache, seenFrom, OWN_FILE, formatDuration,
-    TIME_MARKS, timeMarkOf, providerList, defaultProviders, missingText, demoParameter, MAX_REMINDERS, KEPT_REMINDERS, SHORT_PROVIDER_NAMES, NOT_SUPPORTED, UNVERIFIED_PROVIDERS, DEFAULT_PROVIDERS, MAX_PROVIDERS, VIEW_PROVIDERS, FALLBACK_MARKS, PROVIDER_NAMES,
+    TIME_MARKS, timeMarkOf, providerList, defaultProviders, missingText, demoParameter, MAX_REMINDERS, KEPT_REMINDERS, SHORT_PROVIDER_NAMES, NOT_SET_UP, NOT_SET_UP_HINT, DENIED_HINT, UNVERIFIED_PROVIDERS, DEFAULT_PROVIDERS, MAX_PROVIDERS, VIEW_PROVIDERS, FALLBACK_MARKS, PROVIDER_NAMES,
   };
 }

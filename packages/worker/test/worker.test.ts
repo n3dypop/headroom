@@ -5,7 +5,7 @@ import { test } from "node:test";
 import { nextSendSeq, type Snapshot } from "../../core/src/index.ts";
 import { AGENT_PROTOCOL, MAX_COLLECTORS, parseTokens, sha256Hex } from "../src/auth.ts";
 import { handle as handleRequest, refreshDerived, repairPublicState, runCron, type Env } from "../src/index.ts";
-import { DAILY_BUDGET, MIN_BUDGET_PERCENT, RESERVE, budgetLimit, daysToReserve, endOfDays, reserve, settle } from "../src/budget.ts";
+import { DAILY_BUDGET, MIN_BUDGET_PERCENT, RESERVE, budgetLimit, budgetRetrySeconds, daysToReserve, endOfDays, reserve, settle } from "../src/budget.ts";
 import { MAX_WINDOWS, WITHHELD_ERROR } from "../src/sanitize.ts";
 import { sanitizeUpload } from "../src/sanitize.ts";
 import { PROVIDERS } from "../../core/src/index.ts";
@@ -923,11 +923,15 @@ test("if the daily D1 budget doesn't fit, uploads are refused without touching D
   const before = (raw.prepare("SELECT COUNT(*) AS n FROM observations").get() as { n: number }).n;
   const res = await call("PUT", "/v2/snapshots/win-desktop", WIN, upload(2, fixture(), [obs("five_hour", 2, "2026-11-16T12:05:00.000Z")]));
   assert.equal(res.status, 503);
-  assert.deepEqual(await res.json(), { error: "d1_budget", retry_after_s: 11 * 3600 });
+  // asked again in 15 minutes (another run's reservation may be what doesn't leave room), never after the reset
+  assert.deepEqual(await res.json(), { error: "d1_budget", retry_after_s: 15 * 60 });
+  assert.equal(budgetRetrySeconds(new Date("2026-11-16T23:55:00.000Z")), 5 * 60);
+  assert.equal(budgetRetrySeconds(new Date("2026-11-16T23:59:59.500Z")), 1);
   assert.equal((raw.prepare("SELECT COUNT(*) AS n FROM observations").get() as { n: number }).n, before);
-  // A sharing PC never fetches without a go: it waits and asks again
+  // A sharing PC never fetches without a go: refused as an upload is, it asks again only after the wait
   const turn = await call("POST", "/v2/turns/mac", MAC, { claude: { kind: "fetch", attempt: "0123456789abcdef", base: 0 } });
-  assert.deepEqual(await turn.json(), { claude: { go: false, kind: "fetch", attempt: "0123456789abcdef", reason: "unavailable" } });
+  assert.equal(turn.status, 503);
+  assert.deepEqual(await turn.json(), { error: "d1_budget", retry_after_s: 15 * 60 });
   assert.equal((raw.prepare("SELECT COUNT(*) AS n FROM provider_holds").get() as { n: number }).n, 0);
   assert.equal((await call("GET", "/v2/view", READ)).status, 200, "client reads continue");
 

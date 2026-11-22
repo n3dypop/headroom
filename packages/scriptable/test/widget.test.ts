@@ -1657,7 +1657,7 @@ test("Demo: draws every state with made-up values only (no network, no saving; D
   const expect: Record<string, RegExp> = {
     normal: /Fable wk/, runout: /Wk limit/, no5h: /Not available|5h limit/, stale: /^30m$|30m ago/,
     reset: /Reset \(est\.\)|^0%$/, offline: /Can't update/, error: /Sign in required/, nochart: /No weekly data yet/,
-    three: /^Argon wk$/, unsupported: /^Not supported$/, reached: /^0%$/, firstuse: /On first use/, attention: /Paused|Sign in required/,
+    three: /^Argon wk$/, unsupported: /^Not set up$/, reached: /^0%$/, firstuse: /On first use/, attention: /Paused|Sign in required/,
   };
   for (const s of lib.DEMO_SCENARIOS) {
     for (const family of ["small", "medium", "large", "accessoryRectangular", "accessoryCircular", "accessoryInline"]) {
@@ -1910,7 +1910,7 @@ test("Lock screen ② and ③ rings fill the rectangle's height, the same size, 
   picks.forEach((p: any, i: number) => assert.ok(drawn[i]!.includes(letters[p.provider]!), p.provider));
   // without a value, the empty ring says why inside (it doesn't read as nothing left)
   assert.equal(lib.othersMissing({ label: "5h: Not available", short: "5h Not available" }), "N/A");
-  assert.equal(lib.othersMissing({ label: "Not supported", short: "Not supported" }), "N/A");
+  assert.equal(lib.othersMissing({ label: "Not set up", short: "Not set up" }), "N/A");
   assert.equal(lib.othersMissing({ label: "No data", short: "No data" }), "–");
   const no5h = { status: 200, body: { ...lib.demoResult("no5h", now).view, data_version: 1, view_version: 1 } };
   const missing = await runWidget({ family: "accessoryRectangular", parameter: "5h, others", response: no5h, now });
@@ -3083,7 +3083,7 @@ test("The parameter guide lists what the Parameter can say; every builder choice
   // Without Gemini's values: the default is the two; Gemini named shows as not supported
   const two = lib.demoResult("normal", now).view;
   assert.deepEqual(plain(lib.groupsOf(two, "", now).map((g: any) => g.provider)), ["codex", "claude"]);
-  assert.deepEqual(plain(lib.groupsOf(two, "claude, gemini", now).map((g: any) => [g.provider, g.message])), [["claude", null], ["gemini", "Not supported"]]);
+  assert.deepEqual(plain(lib.groupsOf(two, "claude, gemini", now).map((g: any) => [g.provider, g.message])), [["claude", null], ["gemini", "Not set up"]]);
   const html: string = lib.parameterGuideHtml();
   for (const p of ["claude", "5h", "wk", "notify", "most, 5h", "claude, 5h", "5h, others", "claude, codex, 5h"]) assert.ok(html.includes(`<code>${p}</code>`), p);
   for (const p of ["top", "both", "demo", "claude.five_hour", "+"]) assert.ok(!html.includes(`<code>${p}`) && !html.includes(`${p}</code>`), `no ${p}`);
@@ -5254,8 +5254,8 @@ test("the parameter names one to three providers in its order; empty shows Codex
   const shown = (view: any, p: string) => plain(lib.groupsOf(view, p, NOW).map((g: any) => [g.provider, g.message]));
   assert.deepEqual(shown(three, ""), [["codex", null], ["claude", null], ["gemini", null]]);
   assert.deepEqual(shown(two, ""), [["codex", null], ["claude", null]], "Gemini without values isn't added");
-  assert.deepEqual(shown(two, "gemini"), [["gemini", "Not supported"]]);
-  assert.deepEqual(shown(two, "claude, codex, gemini"), [["claude", null], ["codex", null], ["gemini", "Not supported"]]);
+  assert.deepEqual(shown(two, "gemini"), [["gemini", "Not set up"]]);
+  assert.deepEqual(shown(two, "claude, codex, gemini"), [["claude", null], ["codex", null], ["gemini", "Not set up"]]);
   assert.deepEqual(plain(lib.groupsOf(two, "codex, claude", NOW).map((g: any) => g.provider)), ["codex", "claude"]);
 });
 
@@ -5272,7 +5272,7 @@ test("a limit shown in the details only never appears on the widget, the lock sc
   assert.ok(!lib.reminderPlan(view, NOW).some((r: any) => r.window_id === "partner_five_hour"));
 });
 
-test("medium and large draw three columns of one width; a demo says Demo once at the bottom; Not supported where the limits go", async () => {
+test("medium and large draw three columns of one width; a demo says Demo once at the bottom; Not set up where the limits go", async () => {
   const view = lib.demoResult("three", NOW).view;
   for (const family of ["medium", "large"]) {
     const layout = lib.layoutGroups(view, family, "", NOW, { demo: true });
@@ -5290,7 +5290,7 @@ test("medium and large draw three columns of one width; a demo says Demo once at
   assert.ok(large.includes("Argon wk") && large.includes("Weekly usage"), large.join(" | "));
   assert.equal(large.filter((t) => t === "Gemini").length, 2, "its column and the chart's legend");
   const off = texts((await runWidget({ family: "medium", demo: "unsupported", now: NOW })).widget.node);
-  assert.ok(off.includes("Gemini") && off.includes("Not supported"), off.join(" | "));
+  assert.ok(off.includes("Gemini") && off.includes("Not set up"), off.join(" | "));
   const small = texts((await runWidget({ family: "small", demo: "three", now: NOW })).widget.node);
   for (const name of ["Codex", "Claude", "Gemini"]) assert.ok(small.includes(name), small.join(" | "));
 });
@@ -5302,11 +5302,11 @@ test("the lock screen takes Gemini as any provider, and one not supported says s
   // both limits named: each provider's tightest, the least left at its reset at the current pace (no pace in this view: Gemini's
   // weekly, 60% left, before its 5h, 70% left)
   assert.deepEqual(pick(three, "gemini weekly, claude 5h"), ["gemini.seven_day", "claude.five_hour"]);
-  assert.deepEqual(pick(lib.demoResult("normal", NOW).view, "gemini"), ["gemini:Not supported"]);
+  assert.deepEqual(pick(lib.demoResult("normal", NOW).view, "gemini"), ["gemini:Not set up"]);
   const rect = texts((await runWidget({ family: "accessoryRectangular", demo: "unsupported", parameter: "gemini", now: NOW })).widget.node);
-  assert.ok(rect.some((t) => t.includes("Gemini: Not supported")), rect.join(" | "));
+  assert.ok(rect.some((t) => t.includes("Gemini: Not set up")), rect.join(" | "));
   const circle = texts((await runWidget({ family: "accessoryCircular", demo: "unsupported", parameter: "gemini", now: NOW })).widget.node);
-  assert.ok(circle.some((t) => t.includes("Not supported")), circle.join(" | "));
+  assert.ok(circle.some((t) => t.includes("Not set up")), circle.join(" | "));
 });
 
 test("Lock screen ②'s time line fits its column: a countdown keeps counting over the whole width, right-aligned; texts fitted", async () => {
@@ -5476,7 +5476,19 @@ test("the details list the providers the widget shows by default, Gemini's detai
   const two: string = lib.detailHtml({ view: lib.demoResult("normal", NOW).view, events: [], trends: {}, now: NOW });
   assert.ok(!two.includes(">Gemini</h2>"), "not listed without values");
   const tapped: string = lib.detailHtml({ view: lib.demoResult("normal", NOW).view, events: [], trends: {}, now: NOW, provider: "gemini" });
-  assert.ok(tapped.includes("Not supported"));
+  assert.ok(tapped.includes("Not set up"));
+  // and how to set it up
+  assert.ok(tapped.includes(lib.esc(lib.NOT_SET_UP_HINT)), "the note under it");
+  assert.ok(!two.includes(lib.esc(lib.NOT_SET_UP_HINT)), "only for the provider without values");
+  // an access denial: the stop's number, as headroom status shows it; and no red limit dot from before the denial
+  assert.match(lib.DENIED_HINT, /--resume-access <stop>/);
+  const denied = structuredClone(threeView());
+  Object.assign(denied.claude, { error_code: "access_denied", blocked: true });
+  const clean = lib.sanitizeView({ ...denied, data_version: 3 });
+  assert.deepEqual(plain([clean.claude.blocked, Object.keys(clean.claude.windows).length]), [null, 0]);
+  const limited = structuredClone(threeView());
+  limited.claude.blocked = true;
+  assert.equal(lib.sanitizeView({ ...limited, data_version: 3 }).claude.blocked, true, "a limit without a denial stays");
 });
 
 test("past 50 time reminders, the earliest are planned and every one planned is read back (none rings twice)", () => {
@@ -5530,8 +5542,8 @@ test("past 50 time reminders, the earliest are planned and every one planned is 
 test("a limit named still shows a provider named without values and why one has none", () => {
   const view = lib.demoResult("unsupported", NOW).view;
   const shown = (v: any, p: string) => plain(lib.groupsOf(v, p, NOW).map((g: any) => [g.provider, g.message, g.rows.length]));
-  assert.deepEqual(shown(view, "gemini, 5h"), [["gemini", "Not supported", 0]]);
-  assert.deepEqual(shown(view, "claude, gemini, 5h"), [["claude", null, 1], ["gemini", "Not supported", 0]]);
+  assert.deepEqual(shown(view, "gemini, 5h"), [["gemini", "Not set up", 0]]);
+  assert.deepEqual(shown(view, "claude, gemini, 5h"), [["claude", null, 1], ["gemini", "Not set up", 0]]);
   // a provider whose fetch failed says so
   const failed = lib.demoResult("error", NOW).view;
   assert.deepEqual(shown(failed, "codex, claude, 5h"), [["codex", "No data", 0], ["claude", "Sign in required", 0]]);
@@ -5585,7 +5597,7 @@ test("a provider named by its window is drawn with its reason, and the lock scre
   const items = [
     { missing: true, provider: "codex", providerName: "Codex", label: "No data", short: "No data" },
     { missing: true, provider: "claude", providerName: "Claude", label: "Sign in required", short: "Sign in" },
-    { missing: true, provider: "gemini", providerName: "Gemini", label: "Not supported", short: "Not supported" },
+    { missing: true, provider: "gemini", providerName: "Gemini", label: "Not set up", short: "Not set up" },
   ];
   const line = lib.inlineText(items, false, "Demo · ");
   assert.ok(lib.textWidth(line, 11) <= lib.INLINE_WIDTH, `${line}: ${lib.textWidth(line, 11)}`);

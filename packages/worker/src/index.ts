@@ -35,11 +35,11 @@ import {
   BudgetDeadline,
   RESERVE,
   budgetLimit,
+  budgetRetrySeconds,
   daysToReserve,
   endOfDays,
   metered,
   reserve,
-  secondsUntilReset,
   settle,
   type Usage,
 } from "./budget.ts";
@@ -261,7 +261,7 @@ async function withinBudget<T>(
 /** Budget exhaustion returns seconds until 00:00 UTC. Transient D1 failures/aborts get a different response, and the PC resends after its normal wait */
 const refused = (reason: "exhausted" | "unavailable", at: Date) =>
   reason === "exhausted"
-    ? json(503, { error: "d1_budget", retry_after_s: secondsUntilReset(at) })
+    ? json(503, { error: "d1_budget", retry_after_s: budgetRetrySeconds(at) })
     : json(503, { error: "unavailable" });
 
 /**
@@ -343,6 +343,8 @@ export async function handle(request: Request, env: Env, now: () => Date = () =>
       // A PC that can't deliver (registrable PC names are used up) is granted nothing; a PC whose request can't be decided now (no
       // budget, a race) is granted nothing either: it waits and asks again (a sharing PC never fetches without a go)
       const decided = await withinBudget(env, at, RESERVE.turn, (db) => takeTurn(db, collector, provider, req, at, (name) => mayWrite(db, name)), now);
+      // No D1 budget left today: as for an upload, the PC waits until it resets (it asks for no turn until then)
+      if (!decided.ok && decided.reason === "exhausted") return refused("exhausted", at);
       const answer = decided.ok && decided.value !== null
         ? decided.value
         : { go: false, kind: req.kind, attempt: req.attempt, reason: "unavailable" as const };
@@ -354,7 +356,9 @@ export async function handle(request: Request, env: Env, now: () => Date = () =>
     // Accepted for the PC's own pending attempt also when its name could no longer be registered (it was granted before). One that can't
     // be applied now is not acknowledged: the PC sends it again
     const applied = await withinBudget(env, at, RESERVE.turn, (db) => reportResult(db, collector, provider, rep, at, WRITER), now);
-    if (!applied.ok || applied.value === null) return json(503, { error: "unavailable" });
+    // Not acknowledged: the PC sends it again (after the budget resets, when that is why)
+    if (!applied.ok) return refused(applied.reason, at);
+    if (applied.value === null) return json(503, { error: "unavailable" });
     return json(200, { [provider]: { ack: true, ...applied.value } });
   }
 

@@ -4,7 +4,8 @@
 //! - Runs the official CLI's `/usage` in print mode (`agy -p /usage --output-format json`, slash commands turned on for that run
 //!   only) on the common schedule (schedule.rs), and takes the limits Antigravity gives its statusLine (`headroom statusline
 //!   --gemini`) as passive values, which put the active fetch off. **The fetch is verified only on some OS and CLI versions**, so
-//!   `[gemini] enabled` is false by default, and while it is off nothing of agy is ever started.
+//!   with `[gemini] enabled` left out it is on only there (Windows 11 with a verified agy; decided at the agent's start), and while it
+//!   is off nothing of agy is ever started.
 //! - Safety guards (layered):
 //!   1. Check the version of the executable about to run (once per process, whenever another one would run, and hourly); don't
 //!      fetch with one older than the verified version.
@@ -838,7 +839,7 @@ pub fn classify_usage_output(r: Result<RunOutput, RunError>) -> Result<Value, Us
                     // what it says on the other)
                     Err(UsageError::Retry(d))
                         if !matches!(d, Diag::AccessDenied | Diag::RateLimited)
-                            && says_rate_limited(&format!(
+                            && super::says_rate_limited(&format!(
                                 "{} {}",
                                 error_text(v.get("error")),
                                 out.stderr
@@ -963,35 +964,6 @@ fn error_text(error: Option<&Value>) -> String {
 
 /// Whether an error's text says the service rate limited the request (Google's 429 RESOURCE_EXHAUSTED, as its API errors carry it;
 /// not seen on this PC)
-fn says_rate_limited(text: &str) -> bool {
-    let text = text.to_ascii_lowercase();
-    // As a status says it ("RESOURCE_EXHAUSTED (code 429): …", "429 Too Many Requests", a structured error's code read as "code
-    // 429"), never a number in a name ("quota-429.json")
-    [
-        "code 429",
-        "status 429",
-        "http 429",
-        "error 429:",
-        "429 too many requests",
-        "429 resource_exhausted",
-    ]
-    .iter()
-    .any(|w| has_term(&text, w))
-}
-
-/// Whether the text has the term as a whole: a number at its start or end isn't part of a longer one ("code 4290", "1429 too many")
-fn has_term(text: &str, term: &str) -> bool {
-    let bytes = text.as_bytes();
-    let digit_start = term.as_bytes().first().is_some_and(u8::is_ascii_digit);
-    let digit_end = term.as_bytes().last().is_some_and(u8::is_ascii_digit);
-    text.match_indices(term).any(|(at, _)| {
-        let before = at.checked_sub(1).map(|i| bytes[i]);
-        let after = bytes.get(at + term.len()).copied();
-        !(digit_start && before.is_some_and(|b| b.is_ascii_digit()))
-            && !(digit_end && after.is_some_and(|b| b.is_ascii_digit()))
-    })
-}
-
 fn says_api_key(text: &str) -> bool {
     ["api key", "api_key", "ai studio"]
         .iter()
@@ -1051,7 +1023,7 @@ fn failure_diag(text: &str, code: Option<i32>) -> Diag {
         return Diag::AccessDenied;
     }
     // Rate limited upstream: every PC waits (its stages), instead of each retrying on its own
-    if says_rate_limited(text) {
+    if super::says_rate_limited(text) {
         return Diag::RateLimited;
     }
     if code == Some(2) && says_api_key(text) {
@@ -1312,7 +1284,8 @@ impl GeminiProvider {
         }
     }
 
-    /// When `/usage` may next run (every 5 minutes by default, extended on repeated failures and while a limit is reached)
+    /// When `/usage` may next run (at least the floor between fetches after the last, the common schedule planning the interval;
+    /// extended on repeated failures and while a limit is reached)
     pub fn usage_due_ms(&self, now: i64) -> i64 {
         if self.cfg.enabled != Some(true)
             || self.stopped()
@@ -2172,10 +2145,16 @@ impl Provider for GeminiProvider {
     }
 
     fn forget_cached(&mut self) -> bool {
+        let state_path = self.home.join(STATE_FILE);
+        // Nothing saved on this PC: nothing cached to forget, and nothing is made (not even the lock)
+        if matches!(std::fs::symlink_metadata(&state_path), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+        {
+            self.state = state_from(Err(std::io::ErrorKind::NotFound.into()));
+            return true;
+        }
         let Some(_lock) = FileLock::acquire(&self.home, LOCK_FILE, LOCK_WAIT) else {
             return false;
         };
-        let state_path = self.home.join(STATE_FILE);
         let Some(state) = read_state(&state_path) else {
             self.log
                 .log("gemini: couldn't read the state to forget the cached values");

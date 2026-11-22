@@ -246,8 +246,17 @@ export async function settle(
   await db.batch(statements);
 }
 
-/** Seconds until 00:00 UTC (returned when refusing due to the limit) */
+/** Seconds until 00:00 UTC */
 export function secondsUntilReset(now: Date): number {
   const next = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1);
   return Math.max(1, Math.ceil((next - now.getTime()) / 1000));
+}
+
+/**
+ * The wait (seconds) told with a refusal due to the limit: until 00:00 UTC, at most MAX_RUN_MS. A refusal may come from other runs'
+ * reservations, not from the day's use: a run gives the unused part back when it settles, and runs for MAX_RUN_MS at most. The PC
+ * asks again after that wait, never after the reset
+ */
+export function budgetRetrySeconds(now: Date): number {
+  return Math.min(secondsUntilReset(now), MAX_RUN_MS / 1000);
 }

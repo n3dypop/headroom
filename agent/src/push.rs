@@ -43,6 +43,8 @@ const OUTDATED_RECHECK_MS: i64 = 60 * 60 * 1000;
 const UNREADABLE_RECHECK_MS: i64 = 60 * 1000;
 /// The longest wait (seconds) a service may name that is kept as it is (366 days, the destination's limit too)
 pub const MAX_WAIT_S: i64 = 366 * 86_400;
+/// The longest wait (seconds) kept after the turn endpoint refused for a while (503): the day's budget resets within a day
+const TURN_WAIT_MAX_S: i64 = 86_400;
 /// Outbox format. 1: queued observations of collision ids are known to be windows that are sent. 2: each queued observation carries
 /// the clock epoch it was taken in (one without is never sent)
 const OUTBOX_VERSION: u32 = 2;
@@ -1412,17 +1414,32 @@ impl Pusher {
                 .ok()
                 .and_then(|v| v["retry_after_s"].as_i64())
                 .filter(|w| (0..=MAX_WAIT_S).contains(w))
-                .map(|w| {
-                    self.clock
-                        .map_or_else(crate::time::now_ms, |c| c())
-                        .saturating_add(w * 1000)
-                });
+                .map(|w| self.now().saturating_add(w.min(TURN_WAIT_MAX_S) * 1000));
             return None;
         }
         if status != 200 {
             return None;
         }
         serde_json::from_str(&text).ok()
+    }
+
+    /// The OS clock (or the one set for a test)
+    fn now(&self) -> i64 {
+        self.clock.map_or_else(crate::time::now_ms, |c| c())
+    }
+
+    /// Whether the wait the turn endpoint named with a 503 (the day's budget used up) still lasts: until then nothing is sent to it
+    /// (a fetch waits for its turn, a result is kept and sent again). Past it, or with the clock moved back over a day, it is forgotten
+    fn turn_waits(&mut self) -> bool {
+        let Some(at) = self.turn_retry_at else {
+            return false;
+        };
+        let now = self.now();
+        if now < at && at - now <= TURN_WAIT_MAX_S * 1000 {
+            return true;
+        }
+        self.turn_retry_at = None;
+        false
     }
 }
 
@@ -1446,7 +1463,7 @@ impl TurnAsker for Pusher {
     /// destination (426, or an answer of another form), an answer without the shared state, or one for another kind or attempt than
     /// asked
     fn ask(&mut self, provider: &str, ask: Ask<'_>) -> Option<Answer> {
-        if self.outdated() {
+        if self.outdated() || self.turn_waits() {
             return None;
         }
         let kind = ask.kind;
@@ -1521,7 +1538,7 @@ impl TurnAsker for Pusher {
         interval_min: i64,
         lease_min: i64,
     ) -> Option<Ack> {
-        if self.outdated() {
+        if self.outdated() || self.turn_waits() {
             return None;
         }
         let mut entry = json!({
@@ -4130,6 +4147,69 @@ mod tests {
         set(due);
         p.push(&snapshot(&latest(40.0, NOW, None)), due);
         assert_eq!(posts(&t), 2);
+    }
+
+    #[test]
+    fn turns_refused_for_the_day_s_budget_send_nothing_until_it_resets_then_the_result_and_the_turn_again()
+     {
+        static AT: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+        fn at() -> i64 {
+            AT.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        let set = |t: i64| AT.store(t, std::sync::atomic::Ordering::SeqCst);
+        let h = home("turn-budget");
+        let t = FakeTransport::default();
+        let mut p = pusher(&h, &t, Ok(creds()));
+        p.clock = Some(at);
+        set(NOW);
+        let posts = |t: &FakeTransport| t.0.lock().unwrap().posts.len();
+        let result =
+            |p: &mut Pusher| p.report("claude", ATTEMPT, Kind::Fetch, Reported::Ok, 15, 18);
+        let fetch = |p: &mut Pusher| {
+            p.ask(
+                "claude",
+                Ask {
+                    base: None,
+                    ..FETCH_ASK
+                },
+            )
+        };
+        // a result is refused: the day's budget is used up for 3 hours
+        t.0.lock().unwrap().post_replies =
+            vec![(503, r#"{"error":"d1_budget","retry_after_s":10800}"#.into())];
+        assert_eq!(result(&mut p), None);
+        assert_eq!(posts(&t), 1);
+        // until then nothing is sent to the turn endpoint: neither the kept result nor a turn
+        t.0.lock().unwrap().turns_granted = true;
+        for later in [NOW + MINUTE_MS, NOW + 90 * MINUTE_MS, NOW + 179 * MINUTE_MS] {
+            set(later);
+            assert_eq!(result(&mut p), None);
+            assert_eq!(fetch(&mut p), None);
+            assert_eq!(posts(&t), 1, "{} minutes on", (later - NOW) / MINUTE_MS);
+        }
+        // after it the kept result is sent again and acknowledged, and the next turn is asked for and granted
+        let reset = NOW + 181 * MINUTE_MS;
+        set(reset);
+        assert!(result(&mut p).is_some_and(|a| a.applied));
+        assert!(fetch(&mut p).is_some_and(|a| a.go));
+        assert_eq!(posts(&t), 3);
+        // a wait named beyond a day is kept for a day at most
+        t.0.lock().unwrap().post_replies = vec![(
+            503,
+            r#"{"error":"d1_budget","retry_after_s":2592000}"#.into(),
+        )];
+        assert_eq!(fetch(&mut p), None);
+        set(reset + 1_440 * MINUTE_MS - MINUTE_MS);
+        assert_eq!(fetch(&mut p), None);
+        assert_eq!(posts(&t), 4);
+        set(reset + 1_440 * MINUTE_MS + MINUTE_MS);
+        assert!(fetch(&mut p).is_some_and(|a| a.go));
+        assert_eq!(posts(&t), 5);
+        // a 503 that names no wait (the destination unavailable) holds nothing back
+        t.0.lock().unwrap().post_replies = vec![(503, r#"{"error":"unavailable"}"#.into())];
+        assert_eq!(fetch(&mut p), None);
+        assert!(fetch(&mut p).is_some_and(|a| a.go));
+        assert_eq!(posts(&t), 7);
     }
 
     #[test]

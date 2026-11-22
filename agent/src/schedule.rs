@@ -818,6 +818,18 @@ impl Coordinator {
         (base_ms + base_ms * bp / 10_000).max(crate::config::MIN_INTERVAL_MIN * MINUTE_MS)
     }
 
+    /// A rate limit's wait lengthened by up to 20 % (never shortened: its retries keep no fixed rhythm), from a hash of this PC, the
+    /// provider and the moment it was told (the same report, the same wait)
+    fn lengthened(&self, id: &str, told_ms: i64, wait_ms: i64) -> i64 {
+        let h = u64::from_str_radix(
+            &crate::store::fnv1a_hex(&[&self.salt, id, "rate", &told_ms.to_string()]),
+            16,
+        )
+        .unwrap_or(0);
+        let bp = (h % (JITTER_BP as u64 + 1)) as i64;
+        wait_ms + wait_ms * bp / 10_000
+    }
+
     /// The interval to plan after a fetch (minutes) and why it is longer than normal
     fn base_interval(
         &self,
@@ -1040,6 +1052,17 @@ impl Coordinator {
     /// The stops a result starts or ends on this PC's own word (a PC that doesn't share; one that does until the destination answers)
     fn take_result(&mut self, id: &str, kind: Kind, r: Reported, interval_min: i64, now: i64) {
         let sharing = self.sharing;
+        let stage_after = (self.slot(id).rate_stage + 1).min(RATE_STAGES_MIN.len() as u32);
+        let rate_wait = match r {
+            Reported::RateLimited { retry_ms } => self.lengthened(
+                id,
+                now,
+                (RATE_STAGES_MIN[stage_after as usize - 1] * MINUTE_MS)
+                    .max(interval_min * MINUTE_MS)
+                    .max(retry_ms.unwrap_or(0)),
+            ),
+            _ => 0,
+        };
         let slot = self.slot(id);
         match r {
             Reported::Ok => {
@@ -1049,13 +1072,10 @@ impl Coordinator {
                     slot.denied = false;
                 }
             }
-            Reported::RateLimited { retry_ms } => {
-                slot.rate_stage = (slot.rate_stage + 1).min(RATE_STAGES_MIN.len() as u32);
-                let stage = RATE_STAGES_MIN[slot.rate_stage as usize - 1] * MINUTE_MS;
-                slot.rate_until = now
-                    + stage
-                        .max(interval_min * MINUTE_MS)
-                        .max(retry_ms.unwrap_or(0));
+            Reported::RateLimited { .. } => {
+                // The stage's wait (at least the interval and the wait named), lengthened a little (lengthened)
+                slot.rate_stage = stage_after;
+                slot.rate_until = now + rate_wait;
                 slot.rate_set_at = now;
             }
             Reported::AccessDenied => {
@@ -2944,9 +2964,19 @@ mod tests {
             None,
             T0,
         );
+        let length = c.slots["claude"].rate_until - T0;
+        assert_eq!(
+            length,
+            c.lengthened("claude", T0, 360 * MINUTE_MS),
+            "the named wait, lengthened a little"
+        );
         let back = T0 - 5 * MINUTE_MS;
         c.notice_clock("claude", back);
-        assert_eq!(c.slots["claude"].rate_until, back + 360 * MINUTE_MS);
+        assert_eq!(
+            c.slots["claude"].rate_until,
+            back + length,
+            "its length kept"
+        );
         // another PC's lease is checked again within 21 minutes, also with a 120-minute interval
         let desk = RefCell::new(Desk::default());
         let mut a = Pc {
@@ -3311,6 +3341,32 @@ mod tests {
     }
 
     #[test]
+    fn a_rate_limit_s_wait_is_lengthened_by_up_to_a_fifth_never_shortened_and_spread() {
+        let c = coord();
+        let wait = 30 * MINUTE_MS;
+        let all: Vec<i64> = (0..200)
+            .map(|i| c.lengthened("claude", T0 + i * 1_000, wait))
+            .collect();
+        assert!(
+            all.iter().all(|&w| w >= wait && w <= wait * 12 / 10),
+            "{all:?}"
+        );
+        assert!(
+            all.iter().any(|&w| w < wait * 102 / 100),
+            "some near the stage's wait"
+        );
+        assert!(
+            all.iter().any(|&w| w > wait * 118 / 100),
+            "some near a fifth longer"
+        );
+        // the same report, the same wait
+        assert_eq!(
+            c.lengthened("claude", T0, wait),
+            c.lengthened("claude", T0, wait)
+        );
+    }
+
+    #[test]
     fn a_pc_without_push_keeps_its_own_stops() {
         let s = snap(10.0, ProviderStatus::Ok);
         let limited = |retry| Some(Run::Ran(Outcome::RateLimited { retry_ms: retry }));
@@ -3322,27 +3378,42 @@ mod tests {
             }
             go
         };
-        // 30, then 60 minutes; a named wait longer than the stage wins
+        // 30, then 60 minutes; a named wait longer than the stage wins. Each wait lengthened by up to 20 %, never shortened
+        let waited = |c: &Coordinator, from: i64, minutes: i64| {
+            let until = c.slots["claude"].rate_until;
+            assert!(
+                until >= from + minutes * MINUTE_MS
+                    && until <= from + minutes * MINUTE_MS * 12 / 10,
+                "{minutes} minutes from {from}: until {until}"
+            );
+            assert_eq!(
+                until,
+                from + c.lengthened("claude", from, minutes * MINUTE_MS),
+                "the same report, the same wait"
+            );
+            until
+        };
         assert!(step(&mut c, T0, Mode::Auto, limited(None)));
+        let first = waited(&c, T0, 30);
         assert!(!step(
             &mut c,
-            T0 + 29 * MINUTE_MS,
+            first - MINUTE_MS,
             Mode::Force { replace: None },
             OK
         ));
-        assert!(step(&mut c, T0 + 30 * MINUTE_MS, Mode::Auto, limited(None)));
-        assert_eq!(c.slots["claude"].rate_until, T0 + 90 * MINUTE_MS);
+        assert!(step(&mut c, first, Mode::Auto, limited(None)));
+        let second = waited(&c, first, 60);
         assert!(step(
             &mut c,
-            T0 + 90 * MINUTE_MS,
+            second,
             Mode::Auto,
             limited(Some(300 * MINUTE_MS))
         ));
-        assert_eq!(c.slots["claude"].rate_until, T0 + 390 * MINUTE_MS);
-        assert!(step(&mut c, T0 + 390 * MINUTE_MS, Mode::Auto, OK));
+        let third = waited(&c, second, 300);
+        assert!(step(&mut c, third, Mode::Auto, OK));
         assert_eq!(c.slots["claude"].rate_stage, 0);
         // a denial stops it, also forced, until a resume succeeds
-        let t = T0 + 410 * MINUTE_MS;
+        let t = third + 20 * MINUTE_MS;
         assert!(step(
             &mut c,
             t,

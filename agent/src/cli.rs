@@ -14,7 +14,7 @@ use crate::schema::build_snapshot;
 use crate::store::{Logger, read_json};
 use crate::time::now_ms;
 
-const HELP: &str = "headroom — background agent that collects Claude / Codex usage limits
+const HELP: &str = "headroom — background agent that collects Claude / Codex / Gemini usage limits
 
 Usage:
   headroom agent                          Run in the background (on Windows, use headroomw.exe)
@@ -745,17 +745,28 @@ fn discard_queue(home: &std::path::Path) -> i32 {
         }
     };
     // Then the providers tidy what they cached (only tidying: a value left behind is of the epoch before and never used)
-    let log = Logger::stderr();
-    let mut tidied = true;
-    for mut p in agent::make_providers(home, &cfg, &log) {
-        tidied &= p.forget_cached();
-    }
-    if !tidied {
+    if !tidy_cached(home, &cfg, &Logger::stderr()) {
         eprintln!(
             "A provider's cached values couldn't be tidied away now (they aren't used); the agent tidies them later"
         );
     }
     result
+}
+
+/// The providers tidy what they cached of the epoch before: also one whose on or off the agent decides at its start (its saved state
+/// read; nothing of its CLI runs, and no state is made). false if one couldn't now
+fn tidy_cached(home: &std::path::Path, cfg: &Config, log: &Logger) -> bool {
+    let mut tidied = true;
+    for mut p in agent::make_providers(home, &agent::reading_saved(cfg, "gemini"), log) {
+        tidied &= p.forget_cached();
+    }
+    tidied
+}
+
+/// Whether status shows Gemini's saved state (its stop, its last error): turned on, or, with no running agent to say, left to the
+/// agent's start (config.toml leaves `enabled` out). Never when config.toml turns it off
+fn shows_left_out_state(on: Option<bool>, from_agent: bool, left_out: bool) -> bool {
+    on == Some(true) || (!from_agent && left_out)
 }
 
 fn status(home: &std::path::Path) -> i32 {
@@ -907,7 +918,11 @@ fn status(home: &std::path::Path) -> i32 {
             None => println!("{id}: unknown whether it is turned on (config.toml can't be read)"),
         }
     }
-    if on("gemini") == Some(true)
+    // Turned on, or (with no agent to say) left to the agent's start: its saved state shows (a stop, its last error)
+    let gemini_left_out = cfg
+        .as_ref()
+        .is_some_and(|c| agent::decided_at_start(c, "gemini"));
+    if shows_left_out_state(on("gemini"), from_agent, gemini_left_out)
         && let Some(line) = state_file_line(
             home,
             "gemini",
@@ -1083,6 +1098,48 @@ mod tests {
             "no request, no fetch: {names:?}"
         );
         assert!(!home.join("schedule-plan.json").exists() && !home.join("outbox.json").exists());
+    }
+
+    #[test]
+    fn discarding_the_queue_tidies_a_provider_left_to_the_agent_s_start_and_status_shows_its_state_while_stopped()
+     {
+        let home = crate::test_util::TempHome::new("headroom-cli-tidy-left-out");
+        crate::test_util::trust_clock(&home);
+        // a value of an epoch gone, saved by Gemini on by default (enabled left out of config.toml)
+        crate::providers::gemini::save_test_state(&home, |s| {
+            s.last_ok = Some(crate::providers::gemini::Observation {
+                epoch: Some(999_999),
+                ..Default::default()
+            })
+        });
+        assert!(tidy_cached(&home, &Config::default(), &Logger::stderr()));
+        let path = home.join("state-gemini.json");
+        assert!(
+            crate::providers::gemini::load_state(&path)
+                .last_ok
+                .is_none(),
+            "the old value tidied away"
+        );
+        // nothing saved: none made
+        let empty = crate::test_util::TempHome::new("headroom-cli-tidy-none");
+        crate::test_util::trust_clock(&empty);
+        assert!(tidy_cached(&empty, &Config::default(), &Logger::stderr()));
+        assert!(!empty.join("state-gemini.json").exists());
+        assert!(!empty.join("state-gemini.lock").exists(), "nor its lock");
+        // status: shown when on, or left out with no running agent to say; never when turned off
+        assert!(shows_left_out_state(Some(true), true, false));
+        assert!(
+            shows_left_out_state(Some(false), false, true),
+            "stopped, left out"
+        );
+        assert!(
+            !shows_left_out_state(Some(false), true, true),
+            "the running agent turned it off"
+        );
+        assert!(
+            !shows_left_out_state(Some(false), false, false),
+            "turned off in config.toml"
+        );
     }
 
     #[test]

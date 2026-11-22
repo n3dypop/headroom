@@ -43,7 +43,7 @@ Headroom shows how much of your **Claude Code**, **Codex** and **Gemini** (the A
 See **[docs/install.md](docs/install.md)**. In short:
 
 1. Deploy the Worker and D1 to your Cloudflare account (once).
-2. On each PC: install and sign in to Claude Code and/or Codex CLI, install the Headroom agent from the release package (or build it), and store its write token.
+2. On each PC: install and sign in to Claude Code, Codex CLI and/or the Antigravity CLI, install the Headroom agent from the release package (or build it), and store its write token.
 3. On the iPhone: paste the widget script into Scriptable and enter the Worker URL and a read token.
 
 ## Requirements
@@ -52,6 +52,7 @@ See **[docs/install.md](docs/install.md)**. In short:
 |---|---|---|
 | Claude Code CLI (standalone install, or Homebrew `claude-code@latest` on macOS) with a Claude subscription (Pro, Max or higher) | Claude values | 2.1.325 or later |
 | Codex CLI (standalone install), signed in with ChatGPT | Codex values | Needs `app-server` and `account/rateLimits/read`. Developed against 0.169.0 |
+| Antigravity CLI (`agy`), signed in with a Google account | Gemini values (optional) | On by default only on Windows 11 with `agy` 1.5.14; elsewhere set `enabled = true` under `[gemini]` (1.5.13 or later). Its statusLine must be set up ([docs/install.md](docs/install.md), 2.8) |
 | Windows 10/11 (x64) or macOS on Apple silicon | Agent | Intel Macs are not supported. macOS support is still being verified |
 | Cloudflare account (Workers Free plan), Node.js 24+ | Deploying the Worker | `wrangler` is used through `npx` |
 | iPhone with [Scriptable](https://apps.apple.com/app/id1405459188) | Widget | |

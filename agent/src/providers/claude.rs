@@ -1,7 +1,8 @@
 //! Claude provider.
 //!
 //! - **Never does anything that consumes usage quota.**
-//! - Primary: runs the official `claude -p "/usage"` every 5 minutes and reads the usage text the CLI prints (no model is called).
+//! - Primary: runs the official `claude -p "/usage"` on the common schedule (about every 15 minutes) and reads the usage text the CLI
+//!   prints (no model is called).
 //! - Secondary: statusLine captures (values while the CLI is in use). Per window, the newer value wins; each window keeps its own fetch time.
 //! - Safety guards (layered):
 //!   1. Pass a nonexistent model name. Also pass a different nonexistent name to `--fallback-model`,
@@ -563,7 +564,8 @@ impl ClaudeProvider {
         self.tz = tz;
     }
 
-    /// When `/usage` may next run (every 5 minutes by default, extended up to 60 minutes on repeated failures)
+    /// When `/usage` may next run (at least the floor between fetches after the last, the common schedule planning the interval;
+    /// extended up to 60 minutes on repeated failures)
     pub fn usage_due_ms(&self, now: i64) -> i64 {
         let account = self.state.account.as_ref();
         // No schedule while /usage won't run (the next version/auth check wakes us; keeps the agent from waking every second)
@@ -849,7 +851,7 @@ impl ClaudeProvider {
         let result = self.cli.usage(&cwd).and_then(|text| {
             let lower = text.to_ascii_lowercase();
             // Rate limited also when the last-known values are shown with it (they aren't a new observation either way)
-            if lower.contains("rate limited") {
+            if super::says_rate_limited(&lower) {
                 return Err(UsageError::Retry(Diag::RateLimited));
             }
             if lower.contains("last-known usage") {
@@ -1849,6 +1851,9 @@ pub fn classify_usage_run(r: Result<RunOutput, RunError>) -> Result<String, Usag
     };
     let complete = out.complete;
     let denied_on_stderr = super::says_access_denied(&out.stderr);
+    // Told on the error output, and not against what the reply says (a failure status of another kind there is that failure)
+    let rate_limited_on_stderr = super::says_rate_limited(&out.stderr)
+        && super::says_rate_limited(&format!("{} {}", out.stdout, out.stderr));
     let result = if complete {
         classify_usage_output(Ok(CmdOutput {
             stdout: out.stdout,
@@ -1864,6 +1869,12 @@ pub fn classify_usage_run(r: Result<RunOutput, RunError>) -> Result<String, Usag
         }
         Err(UsageError::Stop(d)) if denied_on_stderr && d != Diag::AccessDeniedUnverified => {
             Err(UsageError::Stop(Diag::AccessDeniedUnverified))
+        }
+        // A rate limit told only on the error output, with zero use confirmed: every PC waits
+        Err(UsageError::Retry(d))
+            if rate_limited_on_stderr && !matches!(d, Diag::AccessDenied | Diag::RateLimited) =>
+        {
+            Err(UsageError::Retry(Diag::RateLimited))
         }
         r => r,
     }
@@ -1967,6 +1978,9 @@ pub fn check_usage_result(v: &Value) -> Result<String, UsageError> {
                 || super::is_denial_code(subtype)
             {
                 Diag::AccessDenied
+            } else if super::is_rate_limit_code(error) || super::says_rate_limited(&said) {
+                // A rate limit told as an error (zero use confirmed above): every PC waits, as for the usage text's
+                Diag::RateLimited
             } else if looks_like_login(text) {
                 Diag::LoginRequired
             } else {
@@ -4681,6 +4695,75 @@ Current session limit for org: 100% used
         );
         p.collect(NOW, true);
         assert_eq!(fake.calls(), 0, "nothing launched past the go");
+    }
+
+    #[test]
+    fn a_rate_limit_told_as_an_error_or_on_the_error_output_is_a_rate_limit_every_pc_waits_for() {
+        // an error reply with zero use confirmed, saying it is rate limited
+        let mut limited = on_hold();
+        limited["result"] = json!("Usage is rate limited until 3:14am");
+        limited["error"] = Value::Null;
+        limited["subtype"] = json!("error_during_execution");
+        assert_eq!(
+            check_usage_result(&limited),
+            Err(UsageError::Retry(Diag::RateLimited))
+        );
+        // or saying so only by its error code, the field's whole value
+        let mut coded = on_hold();
+        coded["result"] = json!("Something went wrong");
+        coded["error"] = json!("rate_limit");
+        assert_eq!(
+            check_usage_result(&coded),
+            Err(UsageError::Retry(Diag::RateLimited))
+        );
+        coded["error"] = json!("cannot open rate_limit.json");
+        assert_eq!(
+            check_usage_result(&coded),
+            Err(UsageError::Retry(Diag::CliError))
+        );
+        // a denial still wins over it
+        assert_eq!(
+            check_usage_result(&on_hold()),
+            Err(UsageError::Retry(Diag::AccessDenied))
+        );
+        // told only on the error output, beside a reply that confirms zero use
+        let mut failed = on_hold();
+        failed["result"] = json!("Something went wrong");
+        failed["error"] = Value::Null;
+        let run = Ok(RunOutput {
+            stdout: failed.to_string(),
+            stderr: "API Error: 429 Too Many Requests".into(),
+            code: Some(1),
+            complete: true,
+        });
+        assert_eq!(
+            classify_usage_run(run),
+            Err(UsageError::Retry(Diag::RateLimited))
+        );
+        // not when the reply names a failure of another kind (that failure is what it is)
+        let mut unavailable = failed.clone();
+        unavailable["result"] = json!("API Error: 503 Service Unavailable");
+        let run = Ok(RunOutput {
+            stdout: unavailable.to_string(),
+            stderr: "rate limited upstream".into(),
+            code: Some(1),
+            complete: true,
+        });
+        assert_eq!(
+            classify_usage_run(run),
+            Err(UsageError::Retry(Diag::CliError))
+        );
+        // the control: the same reply without it is an ordinary failure
+        let plain = Ok(RunOutput {
+            stdout: failed.to_string(),
+            stderr: String::new(),
+            code: Some(1),
+            complete: true,
+        });
+        assert_eq!(
+            classify_usage_run(plain),
+            Err(UsageError::Retry(Diag::CliError))
+        );
     }
 
     #[test]

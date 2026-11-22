@@ -9,7 +9,8 @@ use crate::schema::ProviderSnapshot;
 /// Every provider id, in a fixed order (the agent's counterpart of core's PROVIDERS)
 pub const PROVIDER_IDS: [&str; 3] = ["claude", "codex", "gemini"];
 
-/// Providers whose fetch isn't verified on a real machine yet: shown as not supported while turned off
+/// Providers whose fetch is verified only on some OS and CLI versions: off unless turned on (or on by default where verified), and
+/// without values of theirs the widget says they aren't set up
 pub const UNVERIFIED_PROVIDERS: &[&str] = &["gemini"];
 
 /// Passive values a provider holds (its statusLine): when they were received, and the windows they carry
@@ -77,13 +78,115 @@ pub fn says_access_denied(text: &str) -> bool {
         // The Antigravity message in full (the phrase alone may be in a local error, as a file's name)
         "service has been disabled in this account for violation of terms of service",
     ]) || (t.contains("api error: 403") && any(&["permission_error", "forbidden"]))
-        || (t.contains("permission_denied") && any(&["code 403", "403 permission_denied"]))
+        || (t.contains("permission_denied")
+            && [
+                "code 403",
+                "code: 403",
+                "status 403",
+                "http 403",
+                "403 permission_denied",
+            ]
+            .iter()
+            .any(|w| has_term(&t, w)))
+}
+
+/// Whether a CLI's text says the service rate limits the requests (a 429). As the services say it, never a number in a name
+/// ("quota-429.json", "status 429.json"), and never beside a failure status of another kind ("code: 503 … too many requests in the
+/// queue": that failure is what it is). Shapes:
+/// - Claude Code `/usage`: `Usage is rate limited until 3:14am` (seen on a real machine)
+/// - a status: `RESOURCE_EXHAUSTED (code 429): …`, `429 Too Many Requests`, a structured error's code read as `code 429` or
+///   `code: 429`, `HTTP/2 429`
+pub fn says_rate_limited(text: &str) -> bool {
+    let t = text.to_ascii_lowercase();
+    if names_other_failure_status(&t) {
+        return false;
+    }
+    t.contains("rate limited")
+        || [
+            "code 429",
+            "code: 429",
+            "status 429",
+            "status: 429",
+            "http 429",
+            "http/1.1 429",
+            "http/2 429",
+            "error 429:",
+            "api error: 429",
+            "429 too many requests",
+            "429: too many requests",
+            "429 resource_exhausted",
+        ]
+        .iter()
+        .any(|w| has_term(&t, w))
+}
+
+/// Where a status is named in the lowercase text: what precedes its number
+const STATUS_LEADS: [&str; 9] = [
+    "code ",
+    "code: ",
+    "status ",
+    "status: ",
+    "http ",
+    "http/1.1 ",
+    "http/2 ",
+    "error ",
+    "error: ",
+];
+
+/// Whether the lowercase text names a failure status (4xx or 5xx) other than a rate limit's 429, as a whole term
+fn names_other_failure_status(t: &str) -> bool {
+    let bytes = t.as_bytes();
+    STATUS_LEADS.iter().any(|lead| {
+        t.match_indices(lead).any(|(at, _)| {
+            let number = &bytes[at + lead.len()..];
+            let len = number.iter().take_while(|b| b.is_ascii_digit()).count();
+            len == 3
+                && matches!(number[0], b'4' | b'5')
+                && &number[..3] != b"429"
+                && whole_at(bytes, at, lead.len() + 3)
+        })
+    })
+}
+
+/// Whether the text has the term as a whole: not part of a longer word, number or name ("code 4290", "1429 too many",
+/// "quota-code 429", "status 429.json")
+pub fn has_term(text: &str, term: &str) -> bool {
+    let bytes = text.as_bytes();
+    text.match_indices(term)
+        .any(|(at, _)| whole_at(bytes, at, term.len()))
+}
+
+/// Whether `len` bytes at `at` stand as a whole term: an alphanumeric start isn't joined to a word or a name before it (a letter, a
+/// digit, `_`, `-`, `/` or `.`), and an alphanumeric end isn't followed by more of one (a letter, a digit, `_`, or `.` or `-` with
+/// a letter or digit after it, as in a file's name)
+fn whole_at(bytes: &[u8], at: usize, len: usize) -> bool {
+    let word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let first = bytes[at];
+    let last = bytes[at + len - 1];
+    let before = at.checked_sub(1).map(|i| bytes[i]);
+    let after = bytes.get(at + len).copied();
+    let after_next = bytes.get(at + len + 1).copied();
+    let joined_before = first.is_ascii_alphanumeric()
+        && before.is_some_and(|b| word(b) || matches!(b, b'-' | b'/' | b'.'));
+    let joined_after = last.is_ascii_alphanumeric()
+        && after.is_some_and(|b| {
+            word(b)
+                || (matches!(b, b'.' | b'-')
+                    && after_next.is_some_and(|n| n.is_ascii_alphanumeric()))
+        });
+    !joined_before && !joined_after
 }
 
 /// Whether an error code a CLI gives (a field of its result, never free text: a local file may be named so) says the service denies
 /// the account (Claude Code's -p codes)
 pub fn is_denial_code(code: &str) -> bool {
     matches!(code.trim(), "account_on_hold" | "oauth_org_not_allowed")
+}
+
+/// Whether an error code a CLI gives (a field of its result, never free text) says the service rate limited the request (Claude
+/// Code's -p `rate_limit`, the API's `rate_limit_error`)
+pub fn is_rate_limit_code(code: &str) -> bool {
+    matches!(code.trim(), "rate_limit" | "rate_limit_error")
 }
 
 /// The go of one attempt: usable until both deadlines, fixed right before the turn was asked (this PC's clock and the monotonic one).
@@ -217,7 +320,67 @@ pub trait Provider {
 
 #[cfg(test)]
 mod tests {
-    use super::says_access_denied;
+    use super::{is_rate_limit_code, says_access_denied, says_rate_limited};
+
+    #[test]
+    fn a_rate_limit_is_told_by_the_services_words_and_status_never_a_number_in_a_name() {
+        for yes in [
+            "Usage is rate limited until 3:14am",
+            "RESOURCE_EXHAUSTED (code 429): Too many requests",
+            "429 Too Many Requests",
+            "error: code: 429",
+            "HTTP/2 429",
+            "status 429",
+            "status 429.",
+            "googleapi: Error 429: Quota exceeded",
+            "429: Too Many Requests",
+            "API Error: 429: Too Many Requests",
+            r#"API Error: 429 {"type":"error","error":{"type":"rate_limit_error"}}"#,
+            // a status that isn't a failure's beside it
+            "HTTP/1.1 200 OK, code 429",
+        ] {
+            assert!(says_rate_limited(yes), "{yes}");
+        }
+        for no in [
+            r#"cannot open local file "quota-429.json""#,
+            r#"cannot open local file "status 429.json""#,
+            r#"cannot open local file "cache/code 429-old""#,
+            "quota-code 429",
+            "error_code 429",
+            "code 4290",
+            "1429 requests",
+            "Not logged in · Please run /login",
+            "Current session 35% used",
+            // the words alone, without a status
+            "Too Many Requests",
+            // another failure's status, whatever the words with it
+            "code: 503, status: UNAVAILABLE: Too many requests in the queue",
+            "HTTP/2 503: rate limited upstream",
+            "code 429 then status 500",
+            "Error 502: 429 Too Many Requests",
+        ] {
+            assert!(!says_rate_limited(no), "{no}");
+        }
+        // a number in a name doesn't count as another failure's status
+        assert!(says_rate_limited(
+            r#"code 429 (cannot open "status 503.json")"#
+        ));
+    }
+
+    #[test]
+    fn a_rate_limit_code_is_a_field_s_whole_value() {
+        for yes in ["rate_limit", "rate_limit_error", " rate_limit "] {
+            assert!(is_rate_limit_code(yes), "{yes}");
+        }
+        for no in [
+            "",
+            "rate_limited.json",
+            "server_error",
+            "rate_limit_exceeded_file",
+        ] {
+            assert!(!is_rate_limit_code(no), "{no}");
+        }
+    }
 
     #[test]
     fn only_the_documented_denials_of_an_account_count() {
@@ -228,12 +391,15 @@ mod tests {
             r#"API Error: 403 {"error":{"type":"forbidden","message":"Request not allowed"}}"#,
             "Eligibility check failed: PERMISSION_DENIED (code 403): This service has been disabled in this account for violation of Terms of Service.",
             "403 PERMISSION_DENIED",
+            "PERMISSION_DENIED (code: 403)",
+            "HTTP 403: PERMISSION_DENIED",
         ] {
             assert!(says_access_denied(yes), "{yes}");
         }
         for no in [
             "permission denied: cannot open settings.json",
             "HTTP 403",
+            "PERMISSION_DENIED (code 4031)",
             "forbidden",
             "API Error: 403",
             "PERMISSION_DENIED",
@@ -243,6 +409,7 @@ mod tests {
             r#"cannot open local file "violation of terms of service.txt""#,
             r#"cannot open local file "account_on_hold.json""#,
             r#"cannot open local file "cache/claude.ai/restricted.json""#,
+            r#"PERMISSION_DENIED: cannot open local file "code 403.json""#,
         ] {
             assert!(!says_access_denied(no), "{no}");
         }

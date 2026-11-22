@@ -173,6 +173,28 @@ export function parseResult(body: unknown): { provider: ProviderId; rep: ResultR
 }
 
 const msLeft = (iso: string | null, now: number) => (iso === null ? 0 : Math.max(0, Date.parse(iso) - now));
+
+/** The most a rate limit's wait is lengthened (a share of it): never shortened, so its retries keep no fixed rhythm */
+export const RATE_JITTER = 0.2;
+
+/**
+ * The share (0 to RATE_JITTER) a rate limit's wait is lengthened by: from a hash of the PC, the provider and the attempt (FNV-1a,
+ * then mixed so a change at the end moves every bit), so the same report always gets the same wait, and the attempt's identifier
+ * (the agent's random one) keeps it from being foretold
+ */
+export function rateJitter(collector: string, provider: string, attempt: string): number {
+  let h = 0x811c9dc5;
+  for (const ch of `${collector}|${provider}|${attempt}`) {
+    h ^= ch.codePointAt(0)!;
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  h ^= h >>> 16;
+  h = Math.imul(h, 0x85ebca6b) >>> 0;
+  h ^= h >>> 13;
+  h = Math.imul(h, 0xc2b2ae35) >>> 0;
+  h ^= h >>> 16;
+  return ((h >>> 0) / 0x1_0000_0000) * RATE_JITTER;
+}
 const iso = (ms: number) => new Date(ms).toISOString();
 
 export function stateOf(row: HoldRow, now: number): SharedState {
@@ -283,8 +305,14 @@ export function applyResult(row: HoldRow, collector: string, rep: ResultReport, 
       break;
     case "rate_limited": {
       const stage = Math.min(row.rate_stage + 1, RATE_STAGES_MIN.length);
+      // The stage's wait, at least the interval and the wait the service named, then lengthened a little (never shortened, and never
+      // past the longest wait a PC takes: a long one named is kept as it is)
       const wait = Math.max(RATE_STAGES_MIN[stage - 1]! * 60, rep.interval_s, rep.retry_s ?? 0);
-      Object.assign(update, noLease, { rate_stage: stage, rate_until: iso(now + wait * 1000) });
+      const jittered = Math.min(
+        Math.round(wait * 1000 * (1 + rateJitter(collector, row.provider, rep.attempt))),
+        Math.max(wait, MAX_RETRY_S) * 1000,
+      );
+      Object.assign(update, noLease, { rate_stage: stage, rate_until: iso(now + jittered) });
       break;
     }
     case "access_denied":
