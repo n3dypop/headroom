@@ -262,7 +262,7 @@ fn collect(args: &[String], home: &std::path::Path) -> i32 {
             cfg.schedule.clone(),
             log,
             home,
-            &collector_id(&cfg),
+            &crate::store::schedule_seed(home, &collector_id(&cfg), true),
             pushing,
         );
         return if coord.reset() {
@@ -669,11 +669,12 @@ fn interval_line(intervals: &BTreeMap<String, i64>, idle: (i64, i64)) -> String 
 /// read), read only. None without config.toml
 fn stopped_plan(home: &std::path::Path) -> Option<BTreeMap<String, NextRun>> {
     let cfg = config::load(home).ok()?;
+    // Read only: the seed the agent keeps, never made here
     let coord = Coordinator::with_plan(
         cfg.schedule.clone(),
         Logger::stderr(),
         home,
-        &collector_id(&cfg),
+        &crate::store::schedule_seed(home, &collector_id(&cfg), false),
         !cfg.push.url.trim().is_empty(),
     );
     let now = now_ms();

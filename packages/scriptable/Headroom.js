@@ -11,7 +11,7 @@
 // From here down to "Widget rendering below" everything is a pure function that doesn't use the Scriptable API (tested with Node).
 // Startup is at the end (main runs after all constants are defined)
 
-const HEADROOM_VERSION = 69;
+const HEADROOM_VERSION = 70;
 /** View version this script can read (VIEW_VERSION in packages/core) */
 const VIEW_VERSION = 1;
 /** Settings are stored as JSON in a single Keychain item (so the server and credentials are always read as a pair) */
@@ -629,13 +629,13 @@ function limitLifted(p, ids, now) {
   return windows.some(passed) && ![...windows, ...overall].some((w) => w.used_percent >= 100 && !passed(w));
 }
 
-/** Short form of the reset: a running timer within 24 hours, "Fri 9 AM" beyond that. null if passed */
+/** Short form of the reset: a running timer within 24 hours, "Fri 09:00" beyond that. null if passed */
 function resetShort(window, now) {
   const date = resetDate(window, now);
   return date ? whenShort(date, now) : null;
 }
 
-/** Short time form: countdown (H:MM:SS) within 24 hours, weekday and time (Fri 4 PM) beyond that */
+/** Short time form: countdown (H:MM:SS) within 24 hours, weekday and time (Fri 16:00) beyond that */
 function whenShort(date, now) {
   if (date.getTime() - now.getTime() <= 24 * 60 * 60000) return { kind: "timer", date };
   return { kind: "text", text: clockText(date, now) };
@@ -799,11 +799,14 @@ function cachedNote(savedAtIso, now) {
   return `${WARN_MARK} Can't update · data from ${formatDuration(minutes)} ago`;
 }
 
-/** Short time form ("6:10 PM" within 24 hours, "Fri 6:10 PM" beyond that) */
+/** A 24-hour clock with a two-digit hour ("06:10", "18:10"; midnight is "00:05", never "24:05") */
+const CLOCK_24H = { hour: "2-digit", minute: "2-digit", hourCycle: "h23" };
+
+/** Short time form ("18:10" within 24 hours, "Fri 18:10" beyond that) */
 function clockText(date, now) {
   const soon = date.getTime() - now.getTime() <= 24 * 60 * 60000;
   try {
-    return new Intl.DateTimeFormat("en-US", soon ? { hour: "numeric", minute: "2-digit" } : { weekday: "short", hour: "numeric", minute: "2-digit" }).format(date);
+    return new Intl.DateTimeFormat("en-US", soon ? CLOCK_24H : { weekday: "short", ...CLOCK_24H }).format(date);
   } catch (_) {
     return date.toISOString().slice(soon ? 11 : 5, 16).replace("T", " ");
   }
@@ -1384,7 +1387,7 @@ function selectAlerts(events, view, now, opts = {}) {
     title_limit: e.window_id ? fullLimitName({ id: e.window_id, scope: e.scope, label: e.label }) : null, text, mark });
   for (const e of list) {
     const overall = e.window_id !== null && e.scope === null;
-    // When the limit comes back, after the phrase: "⊘ Limit reached · ↻ 3:00 PM"
+    // When the limit comes back, after the phrase: "⊘ Limit reached · ↻ 15:00"
     const back = future(e.resets_at) ? ` · ${SYMBOLS.reset} ${clockText(new Date(Date.parse(e.resets_at)), now)}` : "";
     if (e.kind === "limit") {
       if (!e.provider) continue;
@@ -1459,7 +1462,7 @@ function selectAlerts(events, view, now, opts = {}) {
 
 /**
  * Notifications for the alerts of a run: one per provider (Codex, Claude, then those without a provider), so the title says whose it is.
- * One alert: "Claude · 5h limit" / "⊘ Limit reached · ↻ 3:00 PM" (the limit's full name in the title). Several: "Claude · 2 updates" with a
+ * One alert: "Claude · 5h limit" / "⊘ Limit reached · ↻ 15:00" (the limit's full name in the title). Several: "Claude · 2 updates" with a
  * line each ("5h limit ⊘ Limit reached"), up to MAX_ALERT_LINES. [{ provider, title, body, alerts (the alerts in it) }]
  */
 function alertNotifications(alerts) {
@@ -1792,10 +1795,10 @@ function esc(value) {
   return String(value ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
 }
 
-/** Time of day with a two-digit hour ("02:10 PM"), so the history's times line up */
+/** Time of day on the 24-hour clock with a two-digit hour ("14:10"), so the history's times line up */
 function timeOfDay(date) {
   try {
-    return new Intl.DateTimeFormat("en-US", { hour: "2-digit", minute: "2-digit" }).format(date);
+    return new Intl.DateTimeFormat("en-US", CLOCK_24H).format(date);
   } catch (_) {
     return date.toISOString().slice(11, 16);
   }
@@ -1855,7 +1858,7 @@ function tileTime(date, now, tail) {
       return fallback;
     }
   };
-  const main = format({ hour: "numeric", minute: "2-digit" }, date.toISOString().slice(11, 16));
+  const main = format(CLOCK_24H, date.toISOString().slice(11, 16));
   const day = left > 24 * 60 ? format({ weekday: "short" }, "") : "";
   const text = typeof tail === "function" ? tail(left) : tail;
   return { main: esc(main), sub: [day, text].filter(Boolean).join(" · ") };

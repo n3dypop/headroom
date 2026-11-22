@@ -528,7 +528,8 @@ test("Widget (medium): shows headings, usage, bars and reset timers, doesn't fol
   assert.deepEqual(images(widget.node).filter((n) => n.props.symbol === "asterisk" || n.props.symbol === "terminal").map((n) => n.props.symbol), ["terminal", "asterisk"], "icons (SF Symbols when none are embedded)");
   assert.ok(images(widget.node).some((n) => n.props.symbol === "arrow.clockwise"), "reset uses the ↻ symbol");
   assert.equal((JSON.stringify(widget.node).match(/"timer":true/g) ?? []).length, 1, "resets within 24 hours are timers (clock fixed)");
-  assert.ok(all.some((x) => /^\w{3} \d{1,2}(:\d{2})? [AP]M$/.test(x)), "later ones are weekday and time (Fri 4 PM)");
+  assert.ok(all.some((x) => /^\w{3} \d{2}:\d{2}$/.test(x)), "later ones are weekday and time on the 24-hour clock (Fri 16:00)");
+  assert.ok(!all.some((x) => /\b[AP]M\b/.test(x)), "no AM or PM anywhere");
   assert.ok(!all.some((x) => x.startsWith("Updated") || x.startsWith("Resets")), "less text (last update is a dot, reset is a symbol)");
   const saved = latestCache(files)!;
   assert.ok(saved && !saved.includes("read-token-xyz") && JSON.parse(saved).origin === "https://headroom.example.com");
@@ -1065,7 +1066,7 @@ test("Freshness dot, short reset and marks", () => {
   assert.deepEqual(plain(lib.freshnessOf(view, "claude", new Date("2026-11-16T13:30:00.000Z"))), { level: "stale", text: "32m" }, "from the oldest fetch among overall limits (12:58)");
   assert.equal(lib.freshnessOf(view, "claude", new Date("2026-11-16T15:30:00.000Z")).level, "old");
   assert.equal(lib.resetShort({ resets_at: "2026-11-16T15:00:00.000Z", reset_passed: false }, NOW).kind, "timer");
-  assert.match(lib.resetShort({ resets_at: "2026-11-20T07:00:00.000Z", reset_passed: false }, NOW).text, /^Fri \d{1,2}(:\d{2})? [AP]M$/);
+  assert.match(lib.resetShort({ resets_at: "2026-11-20T07:00:00.000Z", reset_passed: false }, NOW).text, /^Fri \d{2}:\d{2}$/);
   assert.equal(lib.rowMark({ value_status: "stale", recent_quality: "approx" }), "", "staleness is shown by the dot; approximations get no mark");
   assert.equal(lib.rowMark({ value_status: "reset_estimated", recent_quality: "unknown" }), "est.");
 });
@@ -1553,7 +1554,7 @@ test("Asks to be redrawn at the drawn warning's run-out time; limits not shown d
 test("Weekday times in narrow columns stay at 0.7x or more; demos that failed to fetch draw no trend", async () => {
   const now = new Date("2026-11-16T13:05:00.000Z");
   const s = lib.SCALES.large;
-  const need = s.small + 1 + lib.textWidth("Fri 10:01 PM", s.small);
+  const need = s.small + 1 + lib.textWidth("Fri 22:01", s.small);
   assert.ok(123 / need >= 0.7, String(need));
   const off = await runWidget({ family: "large", parameter: "demo:offline", now });
   assert.ok(texts(off.widget.node).includes("No weekly data yet"), texts(off.widget.node).join(" | "));
@@ -1799,7 +1800,7 @@ test("Inline default and top keep Codex first even with reasons added; the lock 
 test("Version 46: weekday times to the minute; chart heading (Usage) on the left with a right-aligned legend; the lower line in front; Not available without a 5-hour limit", async () => {
   const now = new Date("2026-11-16T13:05:00.000Z");
   assert.equal(lib.whenShort(new Date("2026-11-20T07:00:00.000Z"), now).text, lib.clockText(new Date("2026-11-20T07:00:00.000Z"), now));
-  assert.match(lib.whenShort(new Date("2026-11-20T07:00:00.000Z"), now).text, /^\w{3} \d{1,2}:\d{2} [AP]M$/, "Fri 4:00 PM form");
+  assert.match(lib.whenShort(new Date("2026-11-20T07:00:00.000Z"), now).text, /^\w{3} \d{2}:\d{2}$/, "Fri 16:00 form");
   const run = await runWidget({ family: "large", parameter: "demo:normal", now });
   const all = texts(run.widget.node);
   const usage = all.indexOf("Weekly usage");
@@ -2228,7 +2229,7 @@ const ev = (seq: number, kind: string, o: Record<string, unknown> = {}) => ({
   cycle: "2026-11-19T15:00:00.000Z", threshold: null, used_percent: null, eta_minutes: null, resets_at: "2026-11-19T15:00:00.000Z",
   blocked: null, error_code: null, confirmed: null, last_received_at: null, ...o,
 });
-/** What each alert says: provider, limit and text ("claude 5h ⊘ Limit reached · ↻ 3:00 PM") */
+/** What each alert says: provider, limit and text ("claude 5h ⊘ Limit reached · ↻ 15:00") */
 const titles = (r: any) => plain(r.alerts.map((a: any) => [a.provider, a.limit, a.text].filter(Boolean).join(" ")));
 const S = lib.SYMBOLS;
 
@@ -2615,7 +2616,8 @@ test("The details page heads the chart with the providers' dots and lines up the
   const html: string = lib.detailHtml({ view: demo.view, events, trends: demo.trends, now, provider: null, note: "" });
   assert.ok(html.includes(`<div class="chead"><h3>Weekly usage</h3><div class="plegend"><span><i class="dot" style="background:${lib.BRAND_COLORS.codex}"></i>Codex</span>`),
     "Codex then Claude as colored dots, at the top as on the widget");
-  assert.ok(html.includes("<time>09:05 AM</time>"), "two-digit hours");
+  assert.ok(html.includes("<time>09:05</time>"), "two-digit hours on the 24-hour clock");
+  assert.ok(!/\b[AP]M\b/.test(html), "no AM or PM in the details");
   assert.ok(html.includes('<span class="pn"><h2'), "the name and the plan share a baseline");
   const none = lib.detailHtml({ view: demo.view, events: [], trends: {}, now, provider: null, note: "" });
   assert.ok(none.includes("<span>No weekly data yet</span>"));

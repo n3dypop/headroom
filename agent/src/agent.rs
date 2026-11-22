@@ -486,7 +486,9 @@ impl Round {
         // A PC that doesn't share keeps its stops in the plan alone: started with that file gone, an access denial its last values
         // show stays a stop until resumed (one that shares reads the destination's)
         let plan_lost = !sharing && !home.join(crate::schedule::PLAN_FILE).exists();
-        let mut coord = Coordinator::with_plan(cfg.schedule.clone(), log, home, collector, sharing);
+        // The fetch times are spread with this PC's own random seed (made here once; the PC's name only when none can be kept)
+        let seed = crate::store::schedule_seed(home, collector, true);
+        let mut coord = Coordinator::with_plan(cfg.schedule.clone(), log, home, &seed, sharing);
         if plan_lost
             && let Some(shown) =
                 crate::store::read_json::<crate::schema::Snapshot>(&home.join("snapshot.json"))
@@ -2473,5 +2475,14 @@ mod tests {
             );
             assert_eq!(b["snapshot"]["providers"]["codex"]["status"], "ok");
         }
+    }
+
+    #[test]
+    fn the_agent_spreads_its_fetches_with_its_own_random_seed() {
+        let h = crate::test_util::TempHome::new("headroom-round-u45-seed");
+        let (_r, _p, _wire) = shared(&h);
+        let seed = std::fs::read_to_string(h.join(crate::store::SCHEDULE_SEED_FILE)).unwrap();
+        assert_eq!(seed.len(), 32, "made on start, not the PC's name");
+        assert_ne!(seed, "mac");
     }
 }

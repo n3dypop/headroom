@@ -108,6 +108,35 @@ impl Logger {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_schedule_seed_is_a_random_secret_made_once_per_pc() {
+        let a = crate::test_util::TempHome::new("headroom-store-seed-a");
+        let b = crate::test_util::TempHome::new("headroom-store-seed-b");
+        // read only: none made, the PC's name
+        assert_eq!(schedule_seed(&a, "win", false), "win");
+        assert!(!a.join(SCHEDULE_SEED_FILE).exists());
+        let seed = schedule_seed(&a, "win", true);
+        assert_eq!(seed.len(), 32);
+        assert!(seed.bytes().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(
+            std::fs::read_to_string(a.join(SCHEDULE_SEED_FILE)).unwrap(),
+            seed
+        );
+        // kept: the same for every later process and for a read only one
+        assert_eq!(schedule_seed(&a, "win", true), seed);
+        assert_eq!(schedule_seed(&a, "win", false), seed);
+        // another PC of the same name gets its own
+        assert_ne!(schedule_seed(&b, "win", true), seed);
+        // one that isn't a seed is made again; one that can't be made gives the name
+        std::fs::write(a.join(SCHEDULE_SEED_FILE), "x").unwrap();
+        assert_eq!(schedule_seed(&a, "win", false), "win");
+        let again = schedule_seed(&a, "win", true);
+        assert!(again.len() == 32 && again != seed);
+        std::fs::remove_file(a.join(SCHEDULE_SEED_FILE)).unwrap();
+        std::fs::create_dir(a.join(SCHEDULE_SEED_FILE)).unwrap();
+        assert_eq!(schedule_seed(&a, "win", true), "win");
+    }
+
     use super::*;
 
     #[test]
@@ -219,4 +248,54 @@ pub fn known_account(home: &std::path::Path, provider: &str) -> Option<String> {
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
+}
+
+/// This PC's schedule seed (in the Headroom folder; never sent or logged)
+pub const SCHEDULE_SEED_FILE: &str = "schedule-seed.txt";
+
+/// The seed that spreads this PC's fetch times (the jitter) and marks its attempt ids: a random secret made once on this PC (with
+/// `create`) and kept in the Headroom folder, so the next fetch time can't be worked out from the public source and the PC's name. A
+/// seed that can't be read or made gives `fallback` (the PC's name): every process of this PC still plans alike
+pub fn schedule_seed(home: &Path, fallback: &str, create: bool) -> String {
+    let path = home.join(SCHEDULE_SEED_FILE);
+    let read = || {
+        std::fs::read_to_string(&path)
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| s.len() == 32 && s.bytes().all(|b| b.is_ascii_hexdigit()))
+    };
+    if let Some(seed) = read() {
+        return seed;
+    }
+    if !create {
+        return fallback.to_string();
+    }
+    let seed = random_hex();
+    let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
+    let saved = std::fs::create_dir_all(home)
+        .and_then(|_| std::fs::write(&tmp, &seed))
+        .and_then(|_| std::fs::rename(&tmp, &path));
+    let _ = std::fs::remove_file(&tmp);
+    // Read back: what is kept is what every process uses
+    match (saved, read()) {
+        (Ok(()), Some(kept)) => kept,
+        _ => fallback.to_string(),
+    }
+}
+
+/// 32 hex digits from the OS's randomness (the standard library's hash keys are seeded from it; no added dependency)
+fn random_hex() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    (0..2u8)
+        .map(|i| {
+            let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+            h.write_u8(i);
+            h.write_u128(nanos);
+            h.write_u32(std::process::id());
+            format!("{:016x}", h.finish())
+        })
+        .collect()
 }
