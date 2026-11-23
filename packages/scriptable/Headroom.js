@@ -11,7 +11,7 @@
 // From here down to "Widget rendering below" everything is a pure function that doesn't use the Scriptable API (tested with Node).
 // Startup is at the end (main runs after all constants are defined)
 
-const HEADROOM_VERSION = 100;
+const HEADROOM_VERSION = 101;
 /** View version this script can read (VIEW_VERSION in packages/core) */
 const VIEW_VERSION = 1;
 /** Settings are stored as JSON in a single Keychain item (so the server and credentials are always read as a pair) */
@@ -1027,7 +1027,8 @@ function paceText(w) {
 
 /**
  * Validate the history response (GET /v2/history) and keep only one window's points. null if malformed.
- * Points are { at (ms), used (0-100), brk (don't connect the line to the previous point) } (last `hours` hours, up to 500 points; default is the weekly limit's 7 days)
+ * Points are { at (ms), used (0-100), brk (don't connect the line to the previous point: only after a reset; across a gap in fetching the
+ * line joins the points straight) } (last `hours` hours, up to 500 points; default is the weekly limit's 7 days)
  */
 function sanitizeHistory(body, provider, windowId, now, hours = TREND_HOURS) {
   if (!body || typeof body !== "object" || body.provider !== provider || !body.windows || typeof body.windows !== "object") return null;
@@ -1044,7 +1045,7 @@ function sanitizeHistory(body, provider, windowId, now, hours = TREND_HOURS) {
     const brk = p.break;
     if (brk !== null && brk !== "gap" && brk !== "reset") return null;
     if (at < since || at > now.getTime() + 60000) continue;
-    out.push({ at, used, brk: brk !== null });
+    out.push({ at, used, brk: brk === "reset" });
   }
   out.sort((a, b) => a.at - b.at);
   return thinPoints(out, 240);
@@ -1075,7 +1076,7 @@ function trendY(used, height, inset = 0) {
   return Math.round((pad + (1 - used / 100) * (height - 2 * pad)) * 10) / 10;
 }
 
-/** Polyline of the 7-day weekly trend: point lists (pixels) split at each break (gap or reset) */
+/** Polyline of the 7-day weekly trend: point lists (pixels) split at each reset (a gap in fetching is joined straight) */
 function sparkLines(points, now, width, height, inset = 0, hours = TREND_HOURS, range = null) {
   // The x axis: the given range (e.g. this week), or the last `hours` up to now
   const span = range ? range.end - range.start : hours * 60 * 60000;

@@ -1314,10 +1314,16 @@ test("The number of rows fits the height budget (dropping from the last rows)", 
 });
 
 test("History over 500 points is accepted and thinned; unknown break values are rejected", () => {
-  const list = Array.from({ length: 618 }, (_, i) => ({ at: new Date(NOW.getTime() - (618 - i) * 140000).toISOString(), used_percent: 10 + i / 100, resets_at: null, break: i === 300 ? "gap" : null }));
+  const list = Array.from({ length: 618 }, (_, i) => ({ at: new Date(NOW.getTime() - (618 - i) * 140000).toISOString(), used_percent: 10 + i / 100, resets_at: null, break: i === 300 ? "gap" : i === 400 ? "reset" : null }));
   const points = lib.sanitizeHistory({ provider: "codex", windows: { seven_day: list } }, "codex", "seven_day", NOW);
   assert.ok(points && points.length <= 260 && points.length > 200, String(points?.length));
-  assert.equal(points.filter((p: any) => p.brk).length, 1, "break points are kept");
+  assert.equal(points.filter((p: any) => p.brk).length, 1, "a reset's break is kept; a gap's is joined straight");
+  // across a gap the line goes on; at a reset it is split
+  const line = (b: string | null) => [{ at: "2026-11-16T10:00:00.000Z", used_percent: 20, break: null }, { at: "2026-11-16T12:00:00.000Z", used_percent: 30, break: b }];
+  const lines = (b: string | null) => lib.sparkLines(lib.sanitizeHistory({ provider: "codex", windows: { seven_day: line(b) } }, "codex", "seven_day", NOW), NOW, 100, 40).length;
+  assert.equal(lines("gap"), 1);
+  assert.equal(lines("reset"), 2);
+  assert.equal(lines(null), 1);
   assert.equal(points[points.length - 1].at, Date.parse(list[617]!.at), "the last point is kept");
   const typo = { provider: "claude", windows: { five_hour: [{ at: "2026-11-16T11:00:00.000Z", used_percent: 80, break: null }, { at: "2026-11-16T12:00:00.000Z", used_percent: 2, break: "typo" }] } };
   assert.equal(lib.sanitizeHistory(typo, "claude", "five_hour", NOW), null);
