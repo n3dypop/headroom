@@ -446,19 +446,52 @@ pub fn startup_folder() -> Option<PathBuf> {
         data3: u16,
         data4: [u8; 8],
     }
-    #[link(name = "shell32")]
+    // shell32 and ole32 are loaded here, only for this lookup (install, uninstall, status), and let go after: linked to the program,
+    // they would load with the background agent too and stay in its memory for nothing
+    type GetKnownFolderPath =
+        unsafe extern "system" fn(*const Guid, u32, isize, *mut *mut u16) -> i32;
+    type TaskMemFree = unsafe extern "system" fn(*mut core::ffi::c_void);
+    #[link(name = "kernel32")]
     unsafe extern "system" {
-        fn SHGetKnownFolderPath(
-            id: *const Guid,
-            flags: u32,
-            token: isize,
-            path: *mut *mut u16,
-        ) -> i32;
+        fn LoadLibraryExW(name: *const u16, file: isize, flags: u32) -> isize;
+        fn GetProcAddress(module: isize, name: *const u8) -> *const core::ffi::c_void;
+        fn FreeLibrary(module: isize) -> i32;
     }
-    #[link(name = "ole32")]
-    unsafe extern "system" {
-        fn CoTaskMemFree(memory: *mut core::ffi::c_void);
+    /// From the system folder only, never one found elsewhere
+    const LOAD_LIBRARY_SEARCH_SYSTEM32: u32 = 0x0000_0800;
+    struct Library(isize);
+    impl Library {
+        fn load(name: &str) -> Option<Library> {
+            let wide: Vec<u16> = name.encode_utf16().chain([0]).collect();
+            // SAFETY: a NUL-terminated wide name; a failure returns 0
+            let handle = unsafe { LoadLibraryExW(wide.as_ptr(), 0, LOAD_LIBRARY_SEARCH_SYSTEM32) };
+            (handle != 0).then(|| Library(handle))
+        }
+        fn get(&self, name: &[u8]) -> Option<*const core::ffi::c_void> {
+            // SAFETY: a loaded module and a NUL-terminated name; a failure returns null
+            let f = unsafe { GetProcAddress(self.0, name.as_ptr()) };
+            (!f.is_null()).then_some(f)
+        }
     }
+    impl Drop for Library {
+        fn drop(&mut self) {
+            // SAFETY: a module this value loaded, freed once; nothing from it is used after (the functions are dropped before)
+            unsafe { FreeLibrary(self.0) };
+        }
+    }
+    let shell32 = Library::load("shell32.dll")?;
+    let ole32 = Library::load("ole32.dll")?;
+    // SAFETY: the documented signatures of SHGetKnownFolderPath and CoTaskMemFree
+    let (get_path, free): (GetKnownFolderPath, TaskMemFree) = unsafe {
+        (
+            std::mem::transmute::<*const core::ffi::c_void, GetKnownFolderPath>(
+                shell32.get(b"SHGetKnownFolderPath\0")?,
+            ),
+            std::mem::transmute::<*const core::ffi::c_void, TaskMemFree>(
+                ole32.get(b"CoTaskMemFree\0")?,
+            ),
+        )
+    };
     // FOLDERID_Startup {B97D20BB-F46A-4C97-BA10-5E3608430854}
     const STARTUP: Guid = Guid {
         data1: 0xB97D_20BB,
@@ -473,15 +506,14 @@ pub fn startup_folder() -> Option<PathBuf> {
     // SAFETY: the GUID has the Win32 layout; on success the function hands over a NUL-terminated wide string it allocated, read up to
     // its NUL and then freed with CoTaskMemFree as documented (also on failure, where it may be null)
     unsafe {
-        let ok = SHGetKnownFolderPath(&STARTUP, KF_FLAG_DONT_VERIFY, 0, &mut path) >= 0
-            && !path.is_null();
+        let ok = get_path(&STARTUP, KF_FLAG_DONT_VERIFY, 0, &mut path) >= 0 && !path.is_null();
         let folder = ok.then(|| {
             let len = (0..).take_while(|&i| *path.add(i) != 0).count();
             PathBuf::from(std::ffi::OsString::from_wide(std::slice::from_raw_parts(
                 path, len,
             )))
         });
-        CoTaskMemFree(path.cast());
+        free(path.cast());
         folder.filter(|f| f.is_absolute())
     }
 }
@@ -916,6 +948,58 @@ mod tests {
         drop(session);
         drop(f);
         let _ = std::fs::remove_dir_all(h);
+    }
+
+    /// The DLL names a Windows program imports (its PE import table)
+    #[cfg(windows)]
+    fn imported_dlls(exe: &[u8]) -> Vec<String> {
+        let u16_at = |o: usize| u16::from_le_bytes([exe[o], exe[o + 1]]) as usize;
+        let u32_at = |o: usize| u32::from_le_bytes(exe[o..o + 4].try_into().unwrap()) as usize;
+        let pe = u32_at(0x3C);
+        assert_eq!(&exe[pe..pe + 4], b"PE\0\0");
+        let sections = u16_at(pe + 6);
+        let optional = pe + 24;
+        let optional_size = u16_at(pe + 20);
+        // PE32+ (64-bit): the import table's address is data directory 1
+        assert_eq!(u16_at(optional), 0x20B);
+        let imports = u32_at(optional + 112 + 8);
+        let table = optional + optional_size;
+        let offset = |rva: usize| {
+            (0..sections)
+                .map(|i| table + i * 40)
+                .find_map(|s| {
+                    let (va, size, raw) = (
+                        u32_at(s + 12),
+                        u32_at(s + 8).max(u32_at(s + 16)),
+                        u32_at(s + 20),
+                    );
+                    (va..va + size).contains(&rva).then(|| rva - va + raw)
+                })
+                .unwrap()
+        };
+        let mut names = Vec::new();
+        let mut d = offset(imports);
+        while u32_at(d + 12) != 0 {
+            let name = offset(u32_at(d + 12));
+            let end = exe[name..].iter().position(|&b| b == 0).unwrap();
+            names.push(String::from_utf8_lossy(&exe[name..name + end]).to_ascii_lowercase());
+            d += 20;
+        }
+        names
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_program_doesn_t_link_the_shell_libraries_the_background_agent_never_uses() {
+        // this test program is built from the same code as headroom.exe and headroomw.exe
+        let dlls = imported_dlls(&std::fs::read(std::env::current_exe().unwrap()).unwrap());
+        assert!(dlls.iter().any(|d| d == "kernel32.dll"), "{dlls:?}");
+        for heavy in ["shell32.dll", "ole32.dll", "combase.dll", "oleaut32.dll"] {
+            assert!(
+                !dlls.iter().any(|d| d == heavy),
+                "{heavy} is linked: {dlls:?}"
+            );
+        }
     }
 
     #[cfg(windows)]
