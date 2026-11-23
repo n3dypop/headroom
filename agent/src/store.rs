@@ -109,6 +109,24 @@ impl Logger {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn an_account_is_kept_whole_and_one_that_can_t_be_written_is_told() {
+        let h = crate::test_util::TempHome::new("keep-account");
+        assert!(super::keep_account(&h, "codex", Some("a/b")));
+        assert_eq!(super::known_account(&h, "codex").as_deref(), Some("a/b"));
+        assert!(super::keep_account(&h, "codex", None), "nothing to keep");
+        std::fs::remove_file(h.join("account-codex.txt")).unwrap();
+        std::fs::create_dir(h.join("account-codex.txt")).unwrap();
+        assert!(!super::keep_account(&h, "codex", Some("c")));
+        assert!(
+            std::fs::read_dir(&*h).unwrap().all(|e| !e
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".tmp"))
+        );
+    }
+
+    #[test]
     fn the_schedule_seed_is_a_random_secret_made_once_per_pc() {
         let a = crate::test_util::TempHome::new("headroom-store-seed-a");
         let b = crate::test_util::TempHome::new("headroom-store-seed-b");
@@ -230,16 +248,20 @@ fn known_account_path(home: &std::path::Path, provider: &str) -> std::path::Path
     home.join(format!("account-{provider}.txt"))
 }
 
-/// Keeps the account hash the state just saved (written only when it changed)
-pub fn keep_account(home: &std::path::Path, provider: &str, hash: Option<&str>) {
+/// Keeps the account hash the state just saved (written only when it changed, whole: a file cut short is never left). false when it
+/// couldn't be written (tried again at the next save)
+pub fn keep_account(home: &std::path::Path, provider: &str, hash: Option<&str>) -> bool {
     let Some(hash) = hash else {
-        return;
+        return true;
     };
     let path = known_account_path(home, provider);
     if std::fs::read_to_string(&path).is_ok_and(|kept| kept.trim() == hash) {
-        return;
+        return true;
     }
-    let _ = std::fs::write(path, hash);
+    let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
+    let kept = std::fs::write(&tmp, hash).and_then(|_| std::fs::rename(&tmp, &path));
+    let _ = std::fs::remove_file(&tmp);
+    kept.is_ok()
 }
 
 /// The account hash kept for a state that is gone (None: none kept)

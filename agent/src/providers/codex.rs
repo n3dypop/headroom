@@ -34,11 +34,17 @@ enum FetchError {
     AccountChanged,
     AccountIdentityUnknown,
     AccessDenied,
-    RateLimited { retry_ms: Option<i64> },
+    RateLimited {
+        retry_ms: Option<i64>,
+    },
     GrantExpired,
     ClockChanged,
     Start,
     Timeout,
+    /// Cut off because the computer slept while the request waited (its wait ran out, or the server went away): an ordinary
+    /// failure, tried again. Saved as a timeout, so a state an earlier version reads back stays readable
+    #[serde(rename(serialize = "Timeout"))]
+    Suspended,
     Disconnected,
     Protocol,
     Unsupported,
@@ -65,6 +71,9 @@ impl FetchError {
             Self::GrantExpired => "The Codex fetch turn expired before the request",
             Self::Start => "Could not start Codex App Server",
             Self::Timeout => "Timed out waiting for a response from Codex App Server",
+            Self::Suspended => {
+                "The Codex App Server request was cut off because the computer slept while it ran; tries again at the next check"
+            }
             Self::Disconnected => "Lost the connection to Codex App Server",
             Self::Protocol => "Could not interpret the Codex App Server response",
             Self::Unsupported => {
@@ -78,8 +87,10 @@ impl FetchError {
         }
     }
 
+    /// No values shown while it lasts (signed out, or a sign-in that gives no ChatGPT limits). A CLI that can't be found keeps the last
+    /// values shown as old, as for every provider: it may be mid-update, or not on PATH yet at logon
     fn unavailable(self) -> bool {
-        matches!(self, Self::MissingCli | Self::SignedOut | Self::WrongAuth)
+        matches!(self, Self::SignedOut | Self::WrongAuth)
     }
 
     fn code(self) -> ErrorCode {
@@ -191,6 +202,26 @@ struct Identity {
 }
 
 impl Identity {
+    /// As kept beside the state (crate::store::keep_account): the user's hash, and the workspace's after a slash
+    fn kept(&self) -> Option<String> {
+        let user = self.user_hash.as_deref()?;
+        Some(match self.workspace_hash.as_deref() {
+            Some(workspace) => format!("{user}/{workspace}"),
+            None => user.to_string(),
+        })
+    }
+
+    fn from_kept(kept: &str) -> Self {
+        let (user, workspace) = match kept.split_once('/') {
+            Some((user, workspace)) => (user, Some(workspace)),
+            None => (kept, None),
+        };
+        Self {
+            user_hash: Some(user.to_string()).filter(|u| !u.is_empty()),
+            workspace_hash: workspace.map(str::to_string).filter(|w| !w.is_empty()),
+        }
+    }
+
     fn differs_from(&self, other: &Self) -> bool {
         changed(&self.user_hash, &other.user_hash)
             || changed(&self.workspace_hash, &other.workspace_hash)
@@ -295,7 +326,12 @@ impl State {
             snapshot
         } else {
             ProviderSnapshot::empty(
-                ProviderStatus::Error,
+                // No values: a CLI not found is unavailable, as for every provider (an error would hide another PC's sign-in stop)
+                if error == Some(FetchError::MissingCli) {
+                    ProviderStatus::Unavailable
+                } else {
+                    ProviderStatus::Error
+                },
                 error.map_or(
                     "Codex usage limits have not been fetched yet",
                     FetchError::message,
@@ -325,7 +361,8 @@ fn changed(previous: &Option<String>, current: &Option<String>) -> bool {
 
 /// Codex status for the CLI. The running agent supplies the next run through schedule.json.
 pub(crate) struct CodexStatus {
-    pub failures: u32,
+    /// None while the state can't be read (not known)
+    pub failures: Option<u32>,
     pub last_error: &'static str,
     /// Why no fetch is scheduled, when the reason is absent from the agent schedule.
     pub not_scheduled: Option<&'static str>,
@@ -417,6 +454,10 @@ impl CodexProvider {
     }
 
     fn next_due_in_epoch(&self, now: i64, epoch: Option<u64>) -> i64 {
+        // A state that couldn't be read is read again a minute on: nothing is due before (neither a read nor a fetch)
+        if let Some(at) = crate::time::reread_due(self.state_retry_at, now) {
+            return at;
+        }
         if self.last_collect_ms > now
             || (self.retry_at.is_none() && self.state.needs_clock_repair(now, epoch))
         {
@@ -430,9 +471,33 @@ impl CodexProvider {
         self.state.snapshot(now, error, trusted_epoch(&self.home))
     }
 
+    /// Keeps the account this state knows beside it (not while a switch waits to be accepted), so a state that is gone starts again
+    /// knowing it
+    fn keep_account(&self) {
+        if !self.state.account_changed
+            && !crate::store::keep_account(
+                &self.home,
+                "codex",
+                self.state.identity.kept().as_deref(),
+            )
+        {
+            self.log
+                .log("codex: couldn't keep the account beside the state (kept at the next save)");
+        }
+    }
+
+    /// A state still unread whose read couldn't be made now (the lock): read again a minute on, not every second
+    fn reread_later(&mut self, now: i64) {
+        if self.state_retry_at.is_some() {
+            self.state_retry_at = Some(now.saturating_add(MINUTE_MS));
+        }
+    }
+
     fn state_error(&mut self, now: i64) -> ProviderSnapshot {
+        self.reread_later(now);
         self.retry_at = Some(now.saturating_add(self.interval_ms()));
-        self.log.log(FetchError::StateIo.message());
+        self.log
+            .log(&format!("codex: {}", FetchError::StateIo.message()));
         let error = match self.run {
             Some(Run::Ran(Outcome::AccessDenied)) => FetchError::AccessDenied,
             Some(Run::Ran(Outcome::RateLimited { retry_ms })) => {
@@ -444,7 +509,13 @@ impl CodexProvider {
     }
 
     fn state_read_error(&mut self, now: i64) -> ProviderSnapshot {
-        self.state_retry_at = Some(now.saturating_add(self.interval_ms()));
+        // Read again a minute on (said once until it can be read)
+        if self.state_retry_at.is_none() {
+            self.log.log(
+                "codex: skipped this round: the state file couldn't be read (read again every minute)",
+            );
+        }
+        self.state_retry_at = Some(now.saturating_add(MINUTE_MS));
         self.retry_at = self.state_retry_at;
         // Leave the file untouched after a permissions or I/O error and withhold current values until it is resolved.
         ProviderSnapshot::empty(
@@ -480,6 +551,15 @@ impl CodexProvider {
             self.unsaved_account_stop = false;
         }
         self.state = load_state(path).map_err(|_| FetchError::StateUnreadable)?;
+        // Looked at after the read: a state deleted meanwhile counts as gone too (one written meanwhile can't be: the lock is held)
+        let gone = matches!(path.try_exists(), Ok(false));
+        // A state that is gone starts again knowing the account it knew (another one seen is a switch to accept)
+        if gone
+            && self.state.identity.user_hash.is_none()
+            && let Some(kept) = crate::store::known_account(&self.home, "codex")
+        {
+            self.state.identity = Identity::from_kept(&kept);
+        }
         self.state_retry_at = None;
         Ok(lock)
     }
@@ -518,6 +598,9 @@ impl CodexProvider {
         let _lock = match lock {
             Ok(Some(lock)) => lock,
             Ok(None) => {
+                self.log.log(
+                    "codex: skipped this round: another process holds the state lock (tried again in 30 seconds)",
+                );
                 self.retry_at = Some(now.saturating_add(LOCK_RETRY_MS));
                 return self.snapshot(now, None);
             }
@@ -573,6 +656,9 @@ impl CodexProvider {
             return self.state.snapshot(now, None, None);
         };
         if grant.is_some_and(|g| g.passed(now)) {
+            self.log.log(
+                "codex: the fetch turn came too long ago; not fetched (asked again next round)",
+            );
             return self.snapshot(now, None);
         }
         let previous_attempt = self.state.last_attempt_ms;
@@ -611,6 +697,12 @@ impl CodexProvider {
                 result,
                 Err(FetchError::GrantExpired | FetchError::ClockChanged)
             ) {
+                self.log.log(match result {
+                    Err(FetchError::GrantExpired) => {
+                        "codex: the fetch turn ran out before the request; not fetched (asked again next round)"
+                    }
+                    _ => "codex: the clock changed before the request; not fetched (fetched again next time)",
+                });
                 if write_json_atomic(&state_path, &self.state).is_err() {
                     return self.state_error(now);
                 }
@@ -626,7 +718,8 @@ impl CodexProvider {
             self.state.pending_identity = identity;
             self.state.last_ok = None;
             self.state.last_error = Some(FetchError::AccountChanged);
-            self.log.log(FetchError::AccountChanged.message());
+            self.log
+                .log(&format!("codex: {}", FetchError::AccountChanged.message()));
             self.unsaved_account_stop = true;
             if write_json_atomic(&state_path, &self.state).is_err() {
                 return self.state_error(now);
@@ -674,62 +767,83 @@ impl CodexProvider {
                     return self.state_error(now);
                 }
                 self.state = next;
+                self.keep_account();
                 self.run = Some(Run::Ran(Outcome::Ok));
                 if accepting {
                     self.accepted = Some(true);
+                }
+            }
+            // The clock changed during the fetch (its values are of another epoch, or the clock couldn't be pinned to save them):
+            // dropped, as for every provider, but nothing upstream failed, so neither a failure counted nor a longer wait
+            Err(FetchError::ClockChanged) => {
+                self.log.log(
+                    "codex: the clock changed during the fetch; its values aren't used (fetched again next time)",
+                );
+                // The query was made: its time is kept, as for every provider
+                if write_json_atomic(&state_path, &self.state).is_err() {
+                    return self.state_error(now);
                 }
             }
             Err(error) => {
                 if matches!(error, FetchError::SignedOut | FetchError::WrongAuth) {
                     self.state.last_ok = None;
                 }
-                if !accepting && error != FetchError::ClockChanged {
+                if !accepting {
                     self.state.identity =
                         std::mem::take(&mut self.state.identity).with_observed(identity);
                 }
                 self.state.failures = self.state.failures.saturating_add(1);
                 self.state.last_error = Some(error);
-                self.log.log(error.message());
+                self.log.log(&format!("codex: {}", error.message()));
                 if write_json_atomic(&state_path, &self.state).is_err() {
                     return self.state_error(now);
                 }
+                self.keep_account();
             }
         }
         self.snapshot(snapshot_ms, None)
     }
 
-    pub(crate) fn status_parts(home: &Path, cfg: &CodexConfig) -> Option<CodexStatus> {
+    /// `enabled`: whether Codex is turned on, as the shared status line has it (None: not known). A state that can't be read, or isn't
+    /// one at all, says nothing for a provider turned off (its old file isn't used), as for every provider
+    pub(crate) fn status_parts(home: &Path, enabled: Option<bool>) -> Option<CodexStatus> {
         let path = home.join(STATE_FILE);
         if matches!(path.try_exists(), Ok(false)) {
             return None;
         }
         let state = match load_state(&path) {
             Ok(state) => state,
+            Err(_) if enabled == Some(false) => return None,
             Err(_) => {
                 return Some(CodexStatus {
-                    failures: 0,
+                    failures: None,
                     last_error: FetchError::StateUnreadable.message(),
-                    not_scheduled: Some(if cfg.enabled {
-                        "waiting to retry the state read"
-                    } else {
-                        "disabled"
-                    }),
+                    not_scheduled: Some("waiting to retry the state read"),
                 });
             }
         };
+        if enabled == Some(false)
+            && state.last_error == Some(FetchError::StateUnreadable)
+            && state.account_changed
+        {
+            return None;
+        }
         let last_error = state
             .stop_message()
             .or(state.last_error.map(FetchError::message))
             .unwrap_or("none");
         let not_scheduled = if state.account_changed {
             Some("waiting for manual resume")
-        } else if !cfg.enabled {
+        } else if enabled == Some(false) {
             Some("disabled")
         } else {
             None
         };
+        // A state that wasn't one (read as corrupt): its failures aren't known
+        let corrupt =
+            state.account_changed && state.last_error == Some(FetchError::StateUnreadable);
         Some(CodexStatus {
-            failures: state.failures,
+            failures: (!corrupt).then_some(state.failures),
             last_error,
             not_scheduled,
         })
@@ -773,7 +887,9 @@ impl Provider for CodexProvider {
     }
 
     fn fetch_due_ms(&self, now: i64) -> i64 {
-        if !self.cfg.enabled || self.state.account_changed {
+        // No turn is asked for while the state can't be read: it is read again first (its own collect), and only a read that succeeds
+        // lets a fetch be due again
+        if !self.cfg.enabled || self.state.account_changed || self.state_retry_at.is_some() {
             return i64::MAX;
         }
         let Some(epoch) = trusted_epoch(&self.home) else {
@@ -790,11 +906,23 @@ impl Provider for CodexProvider {
     }
 
     fn forget_cached(&mut self) -> bool {
+        let path = self.home.join(STATE_FILE);
+        // Nothing saved on this PC: nothing cached to forget, and nothing is made (not even the lock)
+        if matches!(path.try_exists(), Ok(false)) && !self.unsaved_account_stop {
+            return true;
+        }
         let Ok(Some(_lock)) = self.try_state_lock() else {
             return false;
         };
-        let path = self.home.join(STATE_FILE);
+        // A file that exists but can't be read may still hold a value (it would come back once readable): not forgotten, tried again
         let Ok(saved) = load_state(&path) else {
+            self.log
+                .log("codex: couldn't read the state to forget the cached values");
+            self.state_retry_at = Some(
+                self.clock
+                    .map_or_else(now_ms, |clock| clock())
+                    .saturating_add(MINUTE_MS),
+            );
             return false;
         };
         if !self.unsaved_account_stop {
@@ -808,8 +936,9 @@ impl Provider for CodexProvider {
         else {
             return false;
         };
-        if let Some(saved_epoch) = self.state.last_ok.as_ref().and_then(|o| o.epoch)
-            && saved_epoch != epoch
+        // A value of another epoch, or of none (cached before epochs were kept), was stamped by a clock no longer trusted
+        if let Some(cached) = self.state.last_ok.as_ref()
+            && cached.epoch != Some(epoch)
         {
             self.state.last_ok = None;
         } else if !self.unsaved_account_stop {
@@ -1213,6 +1342,7 @@ mod tests {
             input: sent,
             replies: &rx,
             deadline: Instant::now() + Duration::from_secs(5),
+            asleep: rpc::Asleep::never(),
         };
         read_limits(&mut rpc, query)
     }
@@ -1266,6 +1396,34 @@ mod tests {
             }
         }
         assert_eq!(test_provider(&home).last_fetch_attempt_ms(), Some(NOW));
+    }
+
+    #[test]
+    fn a_sign_in_refused_upstream_is_a_known_failure_that_asks_to_sign_in_again() {
+        let (_root, home) = temp_home("rpc-401");
+        let mut p = test_provider(&home);
+        p.collect_with(NOW, true, |_, _, _| {
+            (Identity::default(), Ok(observation()))
+        });
+        // synthetic: the 403 fixture's form with the status of a refused sign-in
+        let mut refused = failures()["denied"].clone();
+        refused["error"]["data"]["codexErrorInfo"]["httpConnectionFailed"] =
+            json!({"httpStatusCode":401});
+        let snap = p.collect_with(NOW + 1, true, |_, _, q| {
+            replay(
+                q,
+                &[initialize(), refused],
+                FetchError::Disconnected,
+                &mut Vec::new(),
+            )
+        });
+        assert_eq!(
+            p.take_run(),
+            Some(Run::Ran(Outcome::Failed)),
+            "a reply is known"
+        );
+        assert_eq!(snap.error_code, Some(ErrorCode::LoginRequired));
+        assert!(snap.windows.is_empty(), "the values before aren't shown");
     }
 
     #[test]
@@ -1421,8 +1579,11 @@ mod tests {
         assert!(late.windows.is_empty());
         let saved = load_state(&home.join(STATE_FILE)).unwrap();
         assert!(saved.last_ok.is_none());
+        // nothing failed upstream: no failure counted, so no longer wait than the interval; the query made is kept
+        assert_eq!((saved.failures, saved.last_error), (0, None));
+        assert_eq!(saved.last_query_ms, Some(NOW));
         let mut again = test_provider(&home);
-        let due = NOW + 2 * MIN_INTERVAL_MS;
+        let due = NOW + MIN_INTERVAL_MS;
         assert_eq!(again.fetch_due_ms(NOW), due);
         let cached = again.collect_with(NOW, false, |_, _, _| panic!("early poll"));
         assert!(cached.windows.is_empty());
@@ -1582,7 +1743,12 @@ mod tests {
         });
         assert_eq!(failed.error_code, Some(ErrorCode::FetchFailed));
         assert!(failed.windows.is_empty());
-        let status = CodexProvider::status_parts(&home, &CodexConfig::default()).unwrap();
+        let status = CodexProvider::status_parts(&home, Some(true)).unwrap();
+        assert_eq!(status.failures, None, "not known while unreadable");
+        assert!(
+            CodexProvider::status_parts(&home, Some(false)).is_none(),
+            "turned off: its old file isn't used"
+        );
         assert!(status.last_error.contains("retry automatically"));
         assert!(status.last_error.contains("permissions"));
         assert!(!status.last_error.contains("--accept-account"));
@@ -1590,9 +1756,27 @@ mod tests {
             status.not_scheduled,
             Some("waiting to retry the state read")
         );
-        let retry_at = failed_at + MIN_INTERVAL_MS;
+        // read again a minute on, and no later than a minute from now on a clock set back
+        let retry_at = failed_at + MINUTE_MS;
         assert_eq!(provider.state_retry_at(), Some(retry_at));
-        assert_eq!(provider.next_due_ms(failed_at), retry_at);
+        let back = failed_at - 60 * MINUTE_MS;
+        assert_eq!(
+            provider.next_due_ms(back),
+            back,
+            "set back: read again at once"
+        );
+        // its time come (and a fetch due by then): read again first, no turn asked for before a read succeeds
+        let late = retry_at + 10 * MINUTE_MS;
+        assert_eq!(provider.next_due_ms(late), retry_at, "read again at once");
+        assert_eq!(provider.fetch_due_ms(late), i64::MAX, "no turn before");
+        // the lock can't be opened as it is read again: a minute on (not every second)
+        let lock = home.join("codex-poll.lock");
+        let _ = fs::remove_file(&lock);
+        fs::create_dir(&lock).unwrap();
+        provider.collect_with(late, false, |_, _, _| panic!("fetched while unread"));
+        assert_eq!(provider.state_retry_at(), Some(late + MINUTE_MS));
+        assert_eq!(provider.next_due_ms(late), late + MINUTE_MS);
+        fs::remove_dir(&lock).unwrap();
 
         fs::remove_dir(&path).unwrap();
         fs::rename(saved, &path).unwrap();
@@ -1675,6 +1859,192 @@ mod tests {
         daemon.hold_fetch_until(hold);
         daemon.collect_with(tick, false, |_, _, _| panic!("fetch during hold"));
         assert_eq!(daemon.fetch_due_ms(after_reload), hold);
+    }
+
+    /// Replies to the handshake, then none (the wait for the rest runs out), on the clocks given
+    fn waits_out(
+        query: &mut Query<'_>,
+        frames: &[Value],
+        asleep: rpc::Asleep,
+        input: &mut dyn std::io::Write,
+    ) -> (Identity, Result<Observation, FetchError>) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        for frame in frames {
+            tx.send(Ok(serde_json::to_vec(frame).unwrap())).unwrap();
+        }
+        let mut rpc = rpc::Connection {
+            input,
+            replies: &rx,
+            deadline: Instant::now() + Duration::from_millis(200),
+            asleep,
+        };
+        let out = read_limits(&mut rpc, query);
+        drop(tx);
+        out
+    }
+
+    #[test]
+    fn a_sleep_while_a_request_is_got_ready_doesn_t_count_one_right_after_it_is_written_does() {
+        use crate::time::ReadFirst;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        // The turn's check before the target request is written reads this PC's clock: the computer sleeps there (while the
+        // request is got ready). Each write wakes it again (the mark is cleared)
+        static PREPARED: AtomicBool = AtomicBool::new(false);
+        fn clock() -> i64 {
+            PREPARED.store(true, Ordering::SeqCst);
+            NOW
+        }
+        struct Writes;
+        impl std::io::Write for Writes {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                PREPARED.store(false, Ordering::SeqCst);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        // asleep for ten minutes as the request was got ready, awake from its write until its wait ran out
+        fn slept_preparing(first: ReadFirst) -> Option<(Duration, Duration)> {
+            let s = Duration::from_secs;
+            Some(match first {
+                ReadFirst::Stopping if PREPARED.load(Ordering::SeqCst) => (s(600), s(1)),
+                ReadFirst::Stopping => (s(0), s(0)),
+                ReadFirst::RunningOn => (s(601), s(2)),
+            })
+        }
+        let (_root, home) = temp_home("suspended-preparing");
+        let mut provider = test_provider(&home);
+        provider.clock = Some(clock);
+        provider.collect_with(NOW, true, |_, _, q| {
+            waits_out(
+                q,
+                &[initialize(), account()],
+                rpc::Asleep::new(slept_preparing),
+                &mut Writes,
+            )
+        });
+        assert_eq!(provider.take_run(), Some(Run::Unknown), "not counted");
+    }
+
+    #[test]
+    fn a_request_cut_off_by_the_computer_s_sleep_is_an_ordinary_failure_tried_again() {
+        use crate::time::ReadFirst;
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        fn slept(first: ReadFirst) -> Option<(Duration, Duration)> {
+            Some(match first {
+                ReadFirst::Stopping => (Duration::ZERO, Duration::ZERO),
+                ReadFirst::RunningOn => (Duration::from_secs(600), Duration::from_secs(1)),
+            })
+        }
+        fn awake(first: ReadFirst) -> Option<(Duration, Duration)> {
+            Some(match first {
+                ReadFirst::Stopping => (Duration::ZERO, Duration::ZERO),
+                ReadFirst::RunningOn => (Duration::from_secs(1), Duration::from_secs(1)),
+            })
+        }
+        // awake when the wait ran out, asleep only later (as the server is shut down): read once, at the cut
+        static READS: AtomicU32 = AtomicU32::new(0);
+        fn asleep_later(first: ReadFirst) -> Option<(Duration, Duration)> {
+            if first == ReadFirst::RunningOn && READS.fetch_add(1, Ordering::SeqCst) > 0 {
+                return slept(first);
+            }
+            awake(first)
+        }
+
+        for (clocks, error, run) in [
+            (
+                slept as fn(_) -> _,
+                FetchError::Suspended,
+                Run::Ran(Outcome::Failed),
+            ),
+            (awake, FetchError::Timeout, Run::Unknown),
+            (asleep_later, FetchError::Timeout, Run::Unknown),
+        ] {
+            let (_root, home) = temp_home("suspended");
+            let mut provider = test_provider(&home);
+            let snap = provider.collect_with(NOW, true, |_, _, q| {
+                // the target request written, its reply never comes
+                waits_out(
+                    q,
+                    &[initialize(), account()],
+                    rpc::Asleep::new(clocks),
+                    &mut Vec::new(),
+                )
+            });
+            assert_eq!(provider.take_run(), Some(run), "{error:?}");
+            assert_eq!(snap.error.as_deref(), Some(error.message()));
+            assert_eq!(snap.error_code, Some(ErrorCode::FetchFailed));
+            // saved as a timeout: an earlier version reads the state back
+            let saved = load_state(&home.join(STATE_FILE)).unwrap();
+            assert_eq!(
+                (saved.failures, saved.last_error),
+                (1, Some(FetchError::Timeout))
+            );
+            assert!(!saved.account_changed);
+        }
+        assert_eq!(
+            READS.load(Ordering::SeqCst),
+            1,
+            "read once, when the wait ended"
+        );
+        // asleep before the request that ran out was written (while the server was got ready, or during the handshake), awake
+        // through its wait:
+        // its result stays unknown
+        static BEGUN: AtomicU32 = AtomicU32::new(0);
+        fn asleep_before(first: ReadFirst) -> Option<(Duration, Duration)> {
+            let s = Duration::from_secs;
+            Some(match first {
+                ReadFirst::Stopping if BEGUN.fetch_add(1, Ordering::SeqCst) == 0 => (s(0), s(0)),
+                ReadFirst::Stopping => (s(600), s(1)),
+                ReadFirst::RunningOn => (s(601), s(2)),
+            })
+        }
+        let (_root, home) = temp_home("suspended-before");
+        let mut provider = test_provider(&home);
+        provider.collect_with(NOW, true, |_, _, q| {
+            waits_out(
+                q,
+                &[initialize(), account()],
+                rpc::Asleep::new(asleep_before),
+                &mut Vec::new(),
+            )
+        });
+        assert_eq!(provider.take_run(), Some(Run::Unknown));
+        assert_eq!(
+            BEGUN.load(Ordering::SeqCst),
+            4,
+            "read right before each write"
+        );
+        // the handshake's own wait cut off: nothing was written, still not run
+        let (_root, home) = temp_home("suspended-setup");
+        let mut provider = test_provider(&home);
+        provider.collect_with(NOW, true, |_, _, q| {
+            waits_out(q, &[], rpc::Asleep::new(slept), &mut Vec::new())
+        });
+        assert_eq!(provider.take_run(), Some(Run::NotRun));
+        // the target request couldn't be written (no wait for a reply): its result stays unknown, also after a sleep
+        struct FailsAt(usize);
+        impl std::io::Write for FailsAt {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0 = self.0.saturating_sub(1);
+                if self.0 == 0 {
+                    return Err(std::io::ErrorKind::BrokenPipe.into());
+                }
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let (_root, home) = temp_home("suspended-write");
+        let mut provider = test_provider(&home);
+        let snap = provider.collect_with(NOW, true, |_, _, q| {
+            waits_out(q, &[initialize()], rpc::Asleep::new(slept), &mut FailsAt(3))
+        });
+        assert_eq!(provider.take_run(), Some(Run::Unknown));
+        assert_ne!(snap.error.as_deref(), Some(FetchError::Suspended.message()));
     }
 
     #[test]
@@ -2332,7 +2702,10 @@ mod tests {
         assert_eq!(stopped.error_code, Some(ErrorCode::AccountChanged));
         assert!(stopped.windows.is_empty());
         assert_eq!(fs::read_to_string(&state_path).unwrap(), old_state);
-        let status = CodexProvider::status_parts(&home, &CodexConfig::default()).unwrap();
+        // turned off: its old file isn't used, so nothing is said of it
+        assert!(CodexProvider::status_parts(&home, Some(false)).is_none());
+        let status = CodexProvider::status_parts(&home, None).unwrap();
+        assert_eq!(status.failures, None, "not known");
         assert!(status.last_error.contains("corrupt or invalid"));
         assert!(status.last_error.contains("--accept-account"));
         assert_eq!(status.not_scheduled, Some("waiting for manual resume"));
@@ -2407,6 +2780,114 @@ mod tests {
         });
         assert_eq!(switched.error_code, Some(ErrorCode::AccountChanged));
         assert!(switched.windows.is_empty());
+    }
+
+    #[test]
+    fn a_state_that_is_gone_starts_again_knowing_its_account_so_another_one_is_a_switch() {
+        let (_root, home) = temp_home("known-account");
+        let mut provider = test_provider(&home);
+        let identity = |user: &str, workspace: Option<&str>| Identity {
+            user_hash: Some(user.into()),
+            workspace_hash: workspace.map(Into::into),
+        };
+        provider.collect_with(NOW, true, |_, _, _| {
+            (identity("first-user", Some("first-ws")), Ok(observation()))
+        });
+        assert_eq!(
+            crate::store::known_account(&home, "codex").as_deref(),
+            Some("first-user/first-ws")
+        );
+        // the state deleted: the same account carries on, another one (user or workspace) is a switch to accept
+        for (other, switched) in [
+            (identity("first-user", Some("first-ws")), false),
+            (identity("second-user", Some("first-ws")), true),
+            (identity("first-user", Some("second-ws")), true),
+        ] {
+            fs::remove_file(home.join(STATE_FILE)).unwrap();
+            let mut again = test_provider(&home);
+            let snap =
+                again.collect_with(NOW + 1, true, |_, _, _| (other.clone(), Ok(observation())));
+            assert_eq!(
+                snap.error_code == Some(ErrorCode::AccountChanged),
+                switched,
+                "{:?}",
+                other.kept()
+            );
+            assert!(load_state(&home.join(STATE_FILE)).unwrap().account_changed == switched);
+            // a switch waiting keeps the account it knew
+            assert_eq!(
+                crate::store::known_account(&home, "codex").as_deref(),
+                Some("first-user/first-ws")
+            );
+        }
+        assert_eq!(Identity::from_kept("u").kept().as_deref(), Some("u"));
+    }
+
+    #[test]
+    fn a_cli_that_can_t_be_found_keeps_the_last_values_shown_as_old() {
+        let (_root, home) = temp_home("missing-cli");
+        let mut provider = test_provider(&home);
+        // none yet: unavailable (not an error, which would hide another PC's sign-in stop)
+        let none = provider.collect_with(NOW - 1, true, |_, _, _| {
+            (Identity::default(), Err(FetchError::MissingCli))
+        });
+        assert_eq!(
+            (none.status, none.error_code),
+            (ProviderStatus::Unavailable, Some(ErrorCode::NotInstalled))
+        );
+        provider.collect_with(NOW, true, |_, _, _| {
+            (Identity::default(), Ok(observation()))
+        });
+        let missing = provider.collect_with(NOW + 1, true, |_, _, _| {
+            (Identity::default(), Err(FetchError::MissingCli))
+        });
+        assert_eq!(missing.status, ProviderStatus::Stale);
+        assert_eq!(missing.error_code, Some(ErrorCode::NotInstalled));
+        assert!(!missing.windows.is_empty(), "the last values stay shown");
+        // signed out: none shown
+        let signed_out = provider.collect_with(NOW + 2, true, |_, _, _| {
+            (Identity::default(), Err(FetchError::SignedOut))
+        });
+        assert!(signed_out.windows.is_empty());
+        assert_eq!(signed_out.error_code, Some(ErrorCode::LoginRequired));
+    }
+
+    #[test]
+    fn forgetting_makes_nothing_on_a_pc_with_no_state_and_reads_an_unreadable_one_again_a_minute_on()
+     {
+        let (_root, home) = temp_home("forget-none");
+        let mut provider = test_provider(&home);
+        assert!(provider.forget_cached());
+        assert!(
+            !home.join("codex-poll.lock").exists(),
+            "not even the lock is made"
+        );
+        fs::create_dir_all(home.join(STATE_FILE)).unwrap();
+        provider.clock = Some(|| NOW);
+        assert!(!provider.forget_cached());
+        assert_eq!(provider.state_retry_at(), Some(NOW + MINUTE_MS));
+        assert_eq!(
+            provider.next_due_ms(NOW),
+            NOW + MINUTE_MS,
+            "nothing due before"
+        );
+        assert!(
+            provider.fetch_due_ms(NOW) >= NOW + MINUTE_MS,
+            "no fetch either"
+        );
+
+        // a value cached before epochs were kept (of none): forgotten, as one of another epoch
+        let (_root, home) = temp_home("forget-no-epoch");
+        let mut provider = test_provider(&home);
+        provider.collect_with(NOW, true, |_, _, _| {
+            (Identity::default(), Ok(observation()))
+        });
+        let path = home.join(STATE_FILE);
+        let mut state = load_state(&path).unwrap();
+        state.last_ok.as_mut().unwrap().epoch = None;
+        write_json_atomic(&path, &state).unwrap();
+        assert!(provider.forget_cached());
+        assert!(load_state(&path).unwrap().last_ok.is_none());
     }
 
     #[test]

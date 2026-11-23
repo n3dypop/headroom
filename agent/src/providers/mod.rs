@@ -238,8 +238,9 @@ pub trait Provider {
     fn last_passive(&self) -> Option<Passive> {
         None
     }
-    /// While the provider's state can't be read: when it reads it again (nothing is taken or asked for before, a manual collect
-    /// included). Default: never waits
+    /// While the provider's state can't be read (until a read of it succeeds): when it reads it again, a minute after it found it so
+    /// (nothing is taken or asked for before, a manual collect included). Read through crate::time::reread_due and rereads_later: one
+    /// further ahead was set by a clock since set back, and is due at once. Default: never waits
     fn state_retry_at(&self) -> Option<i64> {
         None
     }

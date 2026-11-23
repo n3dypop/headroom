@@ -16,11 +16,39 @@ const MAX_LINE_BYTES: u64 = 1024 * 1024;
 
 type Replies = Receiver<Result<Vec<u8>, FetchError>>;
 
+type Clocks = fn(crate::time::ReadFirst) -> Option<(Duration, Duration)>;
+
+/// Whether the computer slept during one wait for a reply: the clocks are read as the wait begins and the moment it ends in a timeout
+/// or a lost connection. A sleep before it (while the server was got ready) or after it (while the server is shut down) never counts
+#[derive(Clone, Copy)]
+pub(super) struct Asleep(Clocks);
+
+impl Asleep {
+    pub(super) fn new(clocks: Clocks) -> Self {
+        Self(clocks)
+    }
+
+    fn begin(&self) -> Option<(Duration, Duration)> {
+        (self.0)(crate::time::ReadFirst::Stopping)
+    }
+
+    fn since(&self, begun: Option<(Duration, Duration)>) -> bool {
+        crate::time::slept_during(begun, (self.0)(crate::time::ReadFirst::RunningOn))
+    }
+
+    /// No sleep is ever told (the clocks can't be read)
+    #[cfg(test)]
+    pub(super) fn never() -> Self {
+        Self(|_| None)
+    }
+}
+
 pub(super) struct AppServer {
     child: Child,
     input: Option<ChildStdin>,
     replies: Option<Replies>,
     deadline: Instant,
+    asleep: Asleep,
 }
 
 impl AppServer {
@@ -29,6 +57,7 @@ impl AppServer {
         cwd: &Path,
         before_spawn: impl FnOnce() -> Result<(), FetchError>,
     ) -> Result<Self, FetchError> {
+        let asleep = Asleep::new(crate::time::sleep_clocks);
         let bin = bin.to_str().ok_or(FetchError::Start)?;
         // On Unix, `nice` can start even if the CLI cannot be found.
         let resolved = resolve_bin(bin).ok_or(FetchError::MissingCli)?;
@@ -52,6 +81,7 @@ impl AppServer {
             child,
             replies: None,
             deadline: Instant::now() + RPC_TIMEOUT,
+            asleep,
         };
         let stdout = server.child.stdout.take().ok_or(FetchError::Start)?;
         let (tx, rx) = mpsc::sync_channel(4);
@@ -86,6 +116,7 @@ impl AppServer {
             input: self.input.as_mut().ok_or(FetchError::Disconnected)?,
             replies: self.replies.as_ref().ok_or(FetchError::Disconnected)?,
             deadline: self.deadline,
+            asleep: self.asleep,
         })
     }
 }
@@ -94,24 +125,29 @@ pub(super) struct Connection<'a> {
     pub(super) input: &'a mut dyn Write,
     pub(super) replies: &'a Replies,
     pub(super) deadline: Instant,
+    pub(super) asleep: Asleep,
 }
 
 impl Connection<'_> {
+    /// Writes one message. Returns the clocks read right before its bytes are written (after it is built and its deadline and turn
+    /// are checked): a sleep from then until the wait for its reply ends counts as cutting it off
     fn send(
         &mut self,
         message: Value,
         before_write: impl FnOnce() -> Result<(), FetchError>,
-    ) -> Result<(), FetchError> {
+    ) -> Result<Option<(Duration, Duration)>, FetchError> {
         let mut frame = serde_json::to_vec(&message).map_err(|_| FetchError::Protocol)?;
         frame.push(b'\n');
         if Instant::now() >= self.deadline {
             return Err(FetchError::Timeout);
         }
         before_write()?;
+        let begun = self.asleep.begin();
         self.input
             .write_all(&frame)
             .and_then(|_| self.input.flush())
-            .map_err(|_| FetchError::Disconnected)
+            .map_err(|_| FetchError::Disconnected)?;
+        Ok(begun)
     }
 
     pub(super) fn request(
@@ -122,18 +158,34 @@ impl Connection<'_> {
         params: Value,
     ) -> Result<Value, FetchError> {
         let target = matches!(method, "account/read" | "account/rateLimits/read");
-        self.send(json!({"id":id,"method":method,"params":params}), || {
+        let begun = self.send(json!({"id":id,"method":method,"params":params}), || {
             if target { query.before_write() } else { Ok(()) }
         })?;
-        let result = read_response(self.replies, id, method, self.deadline, || query.now());
+        let result = read_response(
+            self.replies,
+            id,
+            method,
+            self.deadline,
+            || query.now(),
+            self.asleep,
+            begun,
+        );
         if target {
             let confirmed = match &result {
                 Err(FetchError::AccessDenied) => Outcome::AccessDenied,
                 Err(FetchError::RateLimited { retry_ms }) => Outcome::RateLimited {
                     retry_ms: *retry_ms,
                 },
-                // A complete reply is known. Success requires both replies and a usable observation.
-                Ok(_) | Err(FetchError::Remote | FetchError::Unsupported) => Outcome::Failed,
+                // A complete reply is known. Success requires both replies and a usable observation. A wait cut off by the
+                // computer's sleep is an ordinary failure too, tried again (not a result left unknown, which would stop fetching
+                // until the user replaced it)
+                Ok(_)
+                | Err(
+                    FetchError::Remote
+                    | FetchError::Unsupported
+                    | FetchError::SignedOut
+                    | FetchError::Suspended,
+                ) => Outcome::Failed,
                 _ => return result,
             };
             *query.run = Some(Run::Ran(confirmed));
@@ -143,6 +195,7 @@ impl Connection<'_> {
 
     pub(super) fn notify_initialized(&mut self) -> Result<(), FetchError> {
         self.send(json!({"method":"initialized"}), || Ok(()))
+            .map(|_| ())
     }
 }
 
@@ -152,15 +205,30 @@ fn read_response(
     method: &str,
     deadline: Instant,
     now: impl Fn() -> i64,
+    asleep: Asleep,
+    begun: Option<(Duration, Duration)>,
 ) -> Result<Value, FetchError> {
+    // The wait ran out, or the server went away, while waiting: told as cut off by a sleep if the computer slept since the request
+    // was written (`begun`), decided then
+    let cut = |error| {
+        if asleep.since(begun) {
+            FetchError::Suspended
+        } else {
+            error
+        }
+    };
     loop {
-        let remaining = deadline
-            .checked_duration_since(Instant::now())
-            .ok_or(FetchError::Timeout)?;
-        let line = replies.recv_timeout(remaining).map_err(|e| match e {
-            RecvTimeoutError::Timeout => FetchError::Timeout,
-            RecvTimeoutError::Disconnected => FetchError::Disconnected,
-        })??;
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            return Err(cut(FetchError::Timeout));
+        };
+        let line = match replies.recv_timeout(remaining) {
+            Ok(Ok(line)) => line,
+            Ok(Err(FetchError::Disconnected)) | Err(RecvTimeoutError::Disconnected) => {
+                return Err(cut(FetchError::Disconnected));
+            }
+            Ok(Err(error)) => return Err(error),
+            Err(RecvTimeoutError::Timeout) => return Err(cut(FetchError::Timeout)),
+        };
         let mut message: Value = serde_json::from_slice(&line).map_err(|_| FetchError::Protocol)?;
         if message.get("method").is_some() || message["id"].as_u64() != Some(id) {
             continue;
@@ -206,6 +274,8 @@ fn upstream_error(method: &str, code: i64, error: &Value, now: i64) -> Option<Fe
             },
         };
         return match status {
+            // The sign-in was refused upstream (expired or revoked): signed out, as for every provider (sign in again)
+            401 => Some(FetchError::SignedOut),
             403 => Some(FetchError::AccessDenied),
             429 => Some(FetchError::RateLimited {
                 retry_ms: retry_ms(http, now),
@@ -222,6 +292,7 @@ fn upstream_error(method: &str, code: i64, error: &Value, now: i64) -> Option<Fe
     let (status, rest) = tail.split_once("; content-type=")?;
     rest.split_once("; body=")?;
     match status {
+        "401 Unauthorized" => Some(FetchError::SignedOut),
         "403 Forbidden" => Some(FetchError::AccessDenied),
         "429 Too Many Requests" => Some(FetchError::RateLimited { retry_ms: None }),
         _ => None,
@@ -288,6 +359,8 @@ mod tests {
             "account/rateLimits/read",
             Instant::now() + wait,
             || 0,
+            Asleep::never(),
+            None,
         )
     }
 
@@ -302,7 +375,7 @@ mod tests {
             let frame = json!({"id":3,"error":error});
             tx.send(Ok(serde_json::to_vec(&frame).unwrap())).unwrap();
             let until = Instant::now() + Duration::from_secs(1);
-            read_response(&rx, 3, method, until, || 0).unwrap_err()
+            read_response(&rx, 3, method, until, || 0, Asleep::never(), None).unwrap_err()
         };
         let method = "account/rateLimits/read";
         let error = &fixture["backend"]["error"];
@@ -323,6 +396,18 @@ mod tests {
         let text = msg.replace("429 Too Many Requests", "403 Forbidden");
         let e = json!({"code":-32603,"message":text});
         assert_eq!(classify(method, &e), FetchError::AccessDenied);
+        // a sign-in refused upstream (synthetic, of the same forms as the 403): signed out; a bare 401 or one in free text isn't
+        let text = msg.replace("429 Too Many Requests", "401 Unauthorized");
+        let e = json!({"code":-32603,"message":text});
+        assert_eq!(classify(method, &e), FetchError::SignedOut);
+        let mut e = denied.clone();
+        e["data"]["codexErrorInfo"]["httpConnectionFailed"] = json!({"httpStatusCode":401});
+        assert_eq!(classify("account/read", &e), FetchError::SignedOut);
+        assert_eq!(classify("initialize", &e), FetchError::Remote);
+        for (code, message) in [(401, "401 Unauthorized"), (-32603, "upstream said 401")] {
+            let e = json!({"code":code,"message":message});
+            assert_eq!(classify(method, &e), FetchError::Remote);
+        }
 
         let mut e = denied.clone();
         e["data"]["codexErrorInfo"]["httpConnectionFailed"] = json!({"reason":"access_denied"});
@@ -419,5 +504,56 @@ mod tests {
             limits_response(&rx, Duration::from_secs(1)),
             Err(FetchError::Disconnected)
         );
+    }
+
+    #[test]
+    fn a_wait_cut_off_while_the_computer_slept_is_told_so_and_nothing_else_is() {
+        fn asleep(first: crate::time::ReadFirst) -> Option<(Duration, Duration)> {
+            Some(match first {
+                crate::time::ReadFirst::Stopping => (Duration::ZERO, Duration::ZERO),
+                crate::time::ReadFirst::RunningOn => {
+                    (Duration::from_secs(600), Duration::from_secs(1))
+                }
+            })
+        }
+        fn awake(first: crate::time::ReadFirst) -> Option<(Duration, Duration)> {
+            Some(match first {
+                crate::time::ReadFirst::Stopping => (Duration::ZERO, Duration::ZERO),
+                crate::time::ReadFirst::RunningOn => {
+                    (Duration::from_secs(1), Duration::from_secs(1))
+                }
+            })
+        }
+        let wait = |rx: &Replies, ms: u64, slept: bool| {
+            let clocks = Asleep::new(if slept { asleep } else { awake });
+            read_response(
+                rx,
+                3,
+                "account/rateLimits/read",
+                Instant::now() + Duration::from_millis(ms),
+                || 0,
+                clocks,
+                clocks.begin(),
+            )
+        };
+        let (tx, rx) = mpsc::channel();
+        assert_eq!(wait(&rx, 10, true), Err(FetchError::Suspended));
+        assert_eq!(wait(&rx, 10, false), Err(FetchError::Timeout));
+        assert_eq!(
+            wait(&rx, 0, true),
+            Err(FetchError::Suspended),
+            "past its deadline"
+        );
+        // the server's output lost while waiting
+        tx.send(Err(FetchError::Disconnected)).unwrap();
+        assert_eq!(wait(&rx, 1_000, true), Err(FetchError::Suspended));
+        // another failure, or a reply, is what it is
+        tx.send(Err(FetchError::Protocol)).unwrap();
+        assert_eq!(wait(&rx, 1_000, true), Err(FetchError::Protocol));
+        tx.send(Ok(br#"{"id":3,"result":{}}"#.to_vec())).unwrap();
+        assert_eq!(wait(&rx, 1_000, true), Ok(json!({})));
+        drop(tx);
+        assert_eq!(wait(&rx, 1_000, true), Err(FetchError::Suspended));
+        assert_eq!(wait(&rx, 1_000, false), Err(FetchError::Disconnected));
     }
 }

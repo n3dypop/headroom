@@ -863,11 +863,8 @@ impl Round {
         // read error says nothing of the account), here, in snapshot.json and to the destination. Only an enabled one: one
         // turned off shows nothing (a tidy on start may find its old state unreadable, and no round would replace what it showed)
         if !refused {
-            let now = (self.clock)();
             for p in providers.iter() {
-                if provider_enabled(&self.cfg, p.id())
-                    && p.state_retry_at().is_some_and(|at| at > now)
-                {
+                if provider_enabled(&self.cfg, p.id()) && p.state_retry_at().is_some() {
                     let shown = ProviderSnapshot::empty(
                         crate::schema::ProviderStatus::Error,
                         STATE_UNREAD_TEXT,
@@ -892,7 +889,7 @@ impl Round {
             let now = (self.clock)();
             let unread: std::collections::BTreeSet<String> = providers
                 .iter()
-                .filter(|x| x.state_retry_at().is_some_and(|at| at > now))
+                .filter(|x| x.state_retry_at().is_some())
                 .map(|x| x.id().to_string())
                 .collect();
             p.hold_queued(
@@ -971,8 +968,9 @@ impl Round {
             ));
             return false;
         }
-        // Its state can't be read now: nothing is taken or asked for (it reads it again on its own time)
-        if p.state_retry_at().is_some_and(|at| at > now) {
+        // Its state can't be read now (until a read of it succeeds, also past the time it reads it again): nothing is taken or asked
+        // for, no turn either (the agent reads it again on its own, right away once that time has come)
+        if p.state_retry_at().is_some() {
             out.ok = false;
             out.notes.push(format!(
                 "{id}: its state file can't be read now, so nothing was done (the agent reads it again on its own)"
@@ -1019,7 +1017,7 @@ impl Round {
             }
             let taken = p.take_passive(now);
             // Its state found unreadable just now: nothing more is done, no turn asked for
-            if p.state_retry_at().is_some_and(|at| at > now) {
+            if p.state_retry_at().is_some() {
                 out.ok = false;
                 out.notes.push(format!(
                     "{id}: its state file can't be read now, so nothing was done (the agent reads it again on its own)"
@@ -1164,7 +1162,7 @@ impl Round {
         }
         // A provider whose state can't be read now is tidied once it reads it again, not on each wake
         let now = (self.clock)();
-        let waits = |p: &dyn Provider| p.state_retry_at().is_some_and(|at| at > now);
+        let waits = |p: &dyn Provider| crate::time::rereads_later(p.state_retry_at(), now);
         if usable == self.epoch {
             // Tidying that failed is tried again (a value left behind isn't used meanwhile: its epoch is gone)
             for provider in providers.iter_mut() {
@@ -2388,6 +2386,22 @@ mod tests {
             !wire.0.borrow().asks.iter().any(|k| k == "force"),
             "no turn asked for"
         );
+        // past the time it reads it again, or on a clock set back since it was found so: still nothing done and no turn asked for
+        // until a read succeeds (the agent reads it again itself first)
+        for t in [T0 + 10 * MINUTE_MS, T0 - 60 * MINUTE_MS] {
+            NOW.with(|n| n.set(t));
+            let (_, out) = r.run_request(
+                &mut list,
+                Some(&mut p),
+                &ask(Some("claude"), true, Account::Keep),
+            );
+            assert!(!out.ok);
+            assert_eq!(*calls.borrow(), 0, "nothing taken or run");
+            assert!(
+                !wire.0.borrow().asks.iter().any(|k| k == "force"),
+                "no turn asked for"
+            );
+        }
     }
 
     #[test]
@@ -2458,7 +2472,8 @@ mod tests {
             fn collect(&mut self, now: i64, _force: bool) -> ProviderSnapshot {
                 let mut f = self.0.borrow_mut();
                 if f.0 {
-                    f.1 = Some(now + 5 * MINUTE_MS);
+                    // read again a minute after it was first found so (until a read succeeds, past that time too)
+                    f.1 = f.1.or(Some(now + MINUTE_MS));
                     self.1 = Some(Run::NotRun);
                     let mut s = ProviderSnapshot::empty(ProviderStatus::Error, "paused", None);
                     s.error_code = Some(crate::schema::ErrorCode::AccountChanged);

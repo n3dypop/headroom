@@ -118,6 +118,50 @@ pub fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
+/// How far ahead a provider ever sets the time it reads again a state it couldn't read (a minute), with room for the moments between
+/// its clock reading and the caller's
+const REREAD_AHEAD_MAX: i64 = 2 * MINUTE_MS;
+
+/// When a provider reads again a state it couldn't read (`at`: set a minute after it found it so, on the wall clock then). None: no read
+/// waits. A time further ahead than one is ever set was set before the wall clock went back: due now (read again at once, never held
+/// off however often it is looked at). One that has come is due as it is (the read is made at once). Whether the state is unreadable
+/// is another question: until a read succeeds (`at` is set)
+pub fn reread_due(at: Option<i64>, now: i64) -> Option<i64> {
+    at.map(|at| {
+        if at > now.saturating_add(REREAD_AHEAD_MAX) {
+            now
+        } else {
+            at
+        }
+    })
+}
+
+/// Whether a provider waits to read its state again (nothing is taken or asked for of it before)
+pub fn rereads_later(at: Option<i64>, now: i64) -> bool {
+    reread_due(at, now).is_some_and(|due| due > now)
+}
+
+/// The least sleep that counts: the OS's two clocks (sleep_clocks) drift apart by more than this only while asleep
+const SUSPEND_MIN: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Whether the computer slept between two readings of the OS's two clocks (one that runs on while asleep, one that stops), for every
+/// provider: a fetch cut off by a sleep is an ordinary failure, tried again. A reading that is missing tells nothing: not slept (the
+/// fetch's result then stays as its provider decides without it)
+pub fn slept_during(
+    before: Option<(std::time::Duration, std::time::Duration)>,
+    after: Option<(std::time::Duration, std::time::Duration)>,
+) -> bool {
+    match (before, after) {
+        (Some((total0, awake0)), Some((total1, awake1))) => {
+            total1
+                .saturating_sub(total0)
+                .saturating_sub(awake1.saturating_sub(awake0))
+                > SUSPEND_MIN
+        }
+        _ => false,
+    }
+}
+
 /// Which of the two clocks of sleep_clocks is read first. A pause between the two reads (the process held up) then makes the time
 /// counted asleep shorter, never longer: at a span's start the one that stops while asleep goes first, at its end the one that runs on
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -210,6 +254,28 @@ pub fn read_clocks(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_state_that_couldn_t_be_read_is_read_again_within_a_minute_also_on_a_clock_set_back() {
+        let t = 1_800_000_000_000;
+        assert_eq!(reread_due(None, t), None);
+        assert!(!rereads_later(None, t));
+        assert_eq!(reread_due(Some(t + MINUTE_MS), t), Some(t + MINUTE_MS));
+        assert!(rereads_later(Some(t + MINUTE_MS), t));
+        // a moment later than the caller's clock (read a little after it): still waited for
+        assert!(rereads_later(Some(t + MINUTE_MS + 5), t));
+        // its time has come: due as it is, read at once
+        assert_eq!(reread_due(Some(t), t + 10), Some(t));
+        assert!(!rereads_later(Some(t), t + 10));
+        // set back an hour: due now, wherever it is looked at
+        let back = t - 60 * MINUTE_MS;
+        assert_eq!(reread_due(Some(t + MINUTE_MS), back), Some(back));
+        assert_eq!(
+            reread_due(Some(t + MINUTE_MS), back + 30_000),
+            Some(back + 30_000)
+        );
+        assert!(!rereads_later(Some(t + MINUTE_MS), back));
+    }
 
     #[test]
     fn a_pause_between_the_two_reads_never_counts_as_sleep() {

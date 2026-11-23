@@ -1967,7 +1967,7 @@ impl Provider for GeminiProvider {
             return i64::MAX;
         }
         // A state that couldn't be read is read again a minute on: nothing is due before
-        if let Some(at) = self.state_retry_at.filter(|&at| at > now) {
+        if let Some(at) = crate::time::reread_due(self.state_retry_at, now) {
             return at;
         }
         if self.capture_dirty {
@@ -1998,6 +1998,10 @@ impl Provider for GeminiProvider {
                 .log("gemini: skipped this round: could not lock the state file");
             if asked {
                 self.refuse_acceptance("the state file is locked");
+            }
+            // A state still unread is read again a minute on (not every second while the lock is held)
+            if self.state_retry_at.is_some() {
+                self.state_retry_at = Some(self.clock.map_or(now, |clock| clock()) + MINUTE_MS);
             }
             return self.build(now);
         };
@@ -2109,11 +2113,15 @@ impl Provider for GeminiProvider {
         self.unsaved = match write_json_atomic(&state_path, &self.state) {
             Ok(()) => {
                 // The account accepted (one switched to waits until accepted)
-                if !self.state.account_changed {
-                    crate::store::keep_account(
+                if !self.state.account_changed
+                    && !crate::store::keep_account(
                         &self.home,
                         "gemini",
                         self.state.account_hash.as_deref(),
+                    )
+                {
+                    self.log.log(
+                        "gemini: couldn't keep the account beside the state (kept at the next save)",
                     );
                 }
                 false
@@ -2136,11 +2144,12 @@ impl Provider for GeminiProvider {
     }
 
     fn fetch_due_ms(&self, now: i64) -> i64 {
-        // No turn is asked for while the state can't be read
-        match self.state_retry_at.filter(|&at| at > now) {
-            Some(at) => self.usage_due_ms(now).max(at),
-            None => self.usage_due_ms(now),
+        // No turn is asked for while the state can't be read: it is read again first (its own collect), and only a read that succeeds
+        // lets a fetch be due again
+        if self.state_retry_at.is_some() {
+            return i64::MAX;
         }
+        self.usage_due_ms(now)
     }
 
     fn hold_fetch_until(&mut self, until_ms: i64) -> bool {
@@ -2310,7 +2319,7 @@ impl Provider for GeminiProvider {
             return Some(self.held_snapshot("The Gemini state couldn't be saved"));
         }
         // While the state can't be read, it is read again on its own time, not before each send
-        if self.state_retry_at.is_some_and(|at| at > now) {
+        if crate::time::rereads_later(self.state_retry_at, now) {
             return Some(self.held_snapshot("The Gemini state can't be read now"));
         }
         let Some(saved) = read_state(&self.home.join(STATE_FILE)) else {

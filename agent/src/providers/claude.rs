@@ -23,6 +23,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime};
 
+use crate::time::slept_during;
+
 use super::{Event, Provider};
 use crate::config::{ClaudeConfig, claude_json_path};
 use crate::schema::{
@@ -1055,7 +1057,7 @@ impl Provider for ClaudeProvider {
 
     fn next_due_ms(&self, now: i64) -> i64 {
         // A state that couldn't be read is read again a minute on: nothing is due before
-        if let Some(at) = self.state_retry_at.filter(|&at| at > now) {
+        if let Some(at) = crate::time::reread_due(self.state_retry_at, now) {
             return at;
         }
         // A record written is taken at once, unless turned off (nothing is taken then)
@@ -1086,6 +1088,10 @@ impl Provider for ClaudeProvider {
         let Some(_lock) = StateLock::acquire(&self.home, LOCK_WAIT) else {
             self.log
                 .log("claude: skipped this round: could not lock the state file");
+            // A state still unread is read again a minute on (not every second while the lock is held)
+            if self.state_retry_at.is_some() {
+                self.state_retry_at = Some(self.clock.map_or(now, |clock| clock()) + MINUTE_MS);
+            }
             return self.build(now);
         };
         let state_path = self.home.join(STATE_FILE);
@@ -1281,7 +1287,14 @@ impl Provider for ClaudeProvider {
         match write_json_atomic(&state_path, &self.state) {
             // The account accepted (one switched to waits until accepted)
             Ok(()) if !self.state.account_changed => {
-                crate::store::keep_account(&self.home, "claude", self.state.account_hash.as_deref())
+                if !crate::store::keep_account(
+                    &self.home,
+                    "claude",
+                    self.state.account_hash.as_deref(),
+                ) {
+                    self.log
+                        .log("claude: couldn't keep the account beside the state (kept at the next save)");
+                }
             }
             Ok(()) => {}
             Err(e) => {
@@ -1303,11 +1316,12 @@ impl Provider for ClaudeProvider {
     }
 
     fn fetch_due_ms(&self, now: i64) -> i64 {
-        // No turn is asked for while the state can't be read
-        match self.state_retry_at.filter(|&at| at > now) {
-            Some(at) => self.usage_due_ms(now).max(at),
-            None => self.usage_due_ms(now),
+        // No turn is asked for while the state can't be read: it is read again first (its own collect), and only a read that succeeds
+        // lets a fetch be due again
+        if self.state_retry_at.is_some() {
+            return i64::MAX;
         }
+        self.usage_due_ms(now)
     }
 
     fn hold_fetch_until(&mut self, until_ms: i64) -> bool {
@@ -1698,26 +1712,6 @@ pub enum RunError {
     Timeout,
     /// Past its deadline, after the computer slept while it ran: cut off by the sleep, not hung on its own
     Suspended,
-}
-
-/// The least sleep that counts: the OS's two clocks (crate::time::sleep_clocks) drift apart by more than this only while asleep
-const SUSPEND_MIN: Duration = Duration::from_secs(5);
-
-/// Whether the computer slept between two readings of the OS's two clocks (one that runs on while asleep, one that stops). A reading
-/// that is missing tells nothing: not slept (a timeout then stays a safety stop)
-pub fn slept_during(
-    before: Option<(Duration, Duration)>,
-    after: Option<(Duration, Duration)>,
-) -> bool {
-    match (before, after) {
-        (Some((total0, awake0)), Some((total1, awake1))) => {
-            total1
-                .saturating_sub(total0)
-                .saturating_sub(awake1.saturating_sub(awake0))
-                > SUSPEND_MIN
-        }
-        _ => false,
-    }
 }
 
 /// Run a child process with a deadline. Past the deadline, kill and reap it and return.
@@ -5026,7 +5020,11 @@ Current session limit for org: 100% used
         std::fs::remove_file(&state).unwrap();
         std::fs::create_dir(&state).unwrap();
         p.collect(due, false);
-        assert_eq!(p.fetch_due_ms(due), due + MINUTE_MS);
+        assert_eq!(
+            p.fetch_due_ms(due),
+            i64::MAX,
+            "no turn until a read succeeds"
+        );
         assert_eq!(p.next_due_ms(due), due + MINUTE_MS);
         // a statusLine record that comes meanwhile wakes nothing before then
         p.on_event(&Event::ClaudeStatuslineCaptured);

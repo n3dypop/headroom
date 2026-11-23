@@ -858,7 +858,7 @@ fn status(home: &std::path::Path) -> i32 {
     }
     // Whether Codex is enabled comes from the running agent's schedule, not from config.toml (which may have changed
     // since the agent started, or be mid-edit), so only the state-based reason is taken from the provider
-    if let Some(s) = CodexProvider::status_parts(home, &config::CodexConfig::default()) {
+    if let Some(s) = CodexProvider::status_parts(home, on("codex")) {
         listed.push("codex");
         let next = planned_check(
             plan.as_ref().or(stops.as_ref()),
@@ -868,7 +868,14 @@ fn status(home: &std::path::Path) -> i32 {
         );
         println!(
             "{}",
-            provider_status_line("codex", s.failures.into(), s.last_error, &next)
+            match s.failures {
+                Some(failures) =>
+                    provider_status_line("codex", failures.into(), s.last_error, &next),
+                None => format!(
+                    "codex: unknown consecutive failures / last error {} / next check {next}",
+                    s.last_error
+                ),
+            }
         );
     }
     // The interval between active fetches each provider uses (jittered ±20 % by the schedule): the running agent's (the config it
