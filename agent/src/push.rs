@@ -1454,6 +1454,15 @@ fn shared_of(v: &serde_json::Value) -> Option<Shared> {
         rate_stage: v["rate_stage"].as_u64().filter(|s| *s <= 4)? as u32,
         rate_wait_ms: wait * 1000,
         version: v["version"].as_u64()?,
+        // The attempt pending there: null, or one of the form asked with (missing or another form makes the answer unreadable)
+        pending: match v.get("pending")? {
+            serde_json::Value::Null => None,
+            p => Some(
+                p.as_str()
+                    .filter(|p| p.len() == 16 && p.bytes().all(|b| b.is_ascii_hexdigit()))
+                    .and_then(|p| u64::from_str_radix(p, 16).ok())?,
+            ),
+        },
     })
 }
 
@@ -1487,6 +1496,10 @@ impl TurnAsker for Pusher {
         if ask.again {
             entry.insert("again".into(), json!(true));
         }
+        // A grant is only a reservation until this agent tells its start (Kind::Start, right before the query)
+        if matches!(kind, Kind::Fetch | Kind::Own | Kind::Force | Kind::Resume) {
+            entry.insert("confirm".into(), json!(true));
+        }
         let url = self.turns_endpoint();
         let v = self.post_turns(&url, json!({ provider: entry }))?;
         let a = &v[provider];
@@ -1505,14 +1518,16 @@ impl TurnAsker for Pusher {
             None => 0,
         };
         // A go is only one with no reason against it, no wait, no stop (a resume: the stop asked for still standing), on a row
-        // written since the version asked against (a grant writes it)
+        // written since the version asked against (a grant writes it). A start's go is checked as the attempt's own was: a resume's
+        // carries its stop
+        let resuming = kind == Kind::Resume || (kind == Kind::Start && ask.stop.is_some());
         if go
             && (reason.is_some()
                 || ask.base.is_some_and(|b| shared.version <= b)
                 || wait_s > 0
                 || shared.rate_wait_ms > 0
                 || matches!(kind, Kind::Peek | Kind::Release)
-                || if kind == Kind::Resume {
+                || if resuming {
                     !(shared.denied && Some(shared.denied_gen) == ask.stop)
                 } else {
                     shared.denied
@@ -1655,7 +1670,7 @@ mod tests {
             if !s.post_replies.is_empty() {
                 Ok(s.post_replies.remove(0))
             } else if s.turns_granted {
-                let state = json!({"denied": false, "denied_gen": 0, "rate_stage": 0, "rate_wait_s": 0, "version": s.posts.len()});
+                let state = json!({"denied": false, "denied_gen": 0, "rate_stage": 0, "rate_wait_s": 0, "version": s.posts.len(), "pending": null});
                 let granted: serde_json::Map<String, serde_json::Value> = asked
                     .as_object()
                     .unwrap()
@@ -2506,16 +2521,92 @@ mod tests {
     };
 
     #[test]
+    fn a_start_names_only_its_attempt_and_its_go_is_checked_as_the_attempt_s_own() {
+        let h = home("turn-start");
+        let t = FakeTransport::default();
+        let mut p = pusher(&h, &t, Ok(creds()));
+        let start = |stop| Ask {
+            kind: Kind::Start,
+            attempt: Some(ATTEMPT),
+            stop,
+            base: None,
+            replace: None,
+            again: false,
+        };
+        let state = |denied: bool| {
+            format!(
+                r#""state":{{"denied":{denied},"denied_gen":2,"rate_stage":0,"rate_wait_s":0,"version":9,"pending":null}}"#
+            )
+        };
+        let go = |s: String| {
+            (
+                200,
+                format!(r#"{{"claude":{{"go":true,"kind":"start","attempt":"{ATTEMPT}",{s}}}}}"#),
+            )
+        };
+        t.0.lock().unwrap().post_replies = vec![
+            go(state(false)),
+            // a fetch's start while a stop stands: no go
+            go(state(true)),
+            // a resume's start: only on the stop it resumes
+            go(state(true)),
+            go(state(false)),
+            (
+                200,
+                format!(
+                    r#"{{"claude":{{"go":false,"kind":"start","attempt":"{ATTEMPT}","reason":"gone",{}}}}}"#,
+                    state(false)
+                ),
+            ),
+        ];
+        assert!(p.ask("claude", start(None)).is_some_and(|a| a.go));
+        assert_eq!(p.ask("claude", start(None)), None);
+        assert!(p.ask("claude", start(Some(2))).is_some_and(|a| a.go));
+        assert_eq!(p.ask("claude", start(Some(2))), None);
+        let refused = p.ask("claude", start(None)).unwrap();
+        assert!(!refused.go && refused.reason == Some(Reason::Gone));
+        let s = t.0.lock().unwrap();
+        // only the attempt (and a resume's stop): no row version, no confirm
+        assert_eq!(
+            s.posts[0].1,
+            json!({"claude": {"kind": "start", "attempt": ATTEMPT}})
+        );
+        assert_eq!(
+            s.posts[2].1,
+            json!({"claude": {"kind": "start", "attempt": ATTEMPT, "gen": 2}})
+        );
+    }
+
+    #[test]
+    fn the_shared_state_names_the_attempt_pending_as_16_hex_digits_or_null() {
+        let state = |pending: &str| {
+            shared_of(&serde_json::from_str(&format!(
+                r#"{{"denied":false,"denied_gen":0,"rate_stage":0,"rate_wait_s":0,"version":1{pending}}}"#
+            )).unwrap())
+            .map(|s| s.pending)
+        };
+        assert_eq!(state(r#","pending":"00000000000000ab""#), Some(Some(0xab)));
+        assert_eq!(state(r#","pending":null"#), Some(None));
+        // missing (an earlier destination) or of another form: unreadable
+        for bad in [
+            "",
+            r#","pending":"+0000000000000ab""#,
+            r#","pending":"ab""#,
+            r#","pending":171"#,
+        ] {
+            assert_eq!(state(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
     fn turns_are_asked_for_one_attempt_and_only_an_answer_for_it_counts() {
         let h = home("turns");
         let t = FakeTransport::default();
         let mut p = pusher(&h, &t, Ok(creds()));
-        let state =
-            r#""state":{"denied":false,"denied_gen":2,"rate_stage":1,"rate_wait_s":0,"version":7}"#;
-        let waiting = r#""state":{"denied":false,"denied_gen":2,"rate_stage":1,"rate_wait_s":90,"version":7}"#;
+        let state = r#""state":{"denied":false,"denied_gen":2,"rate_stage":1,"rate_wait_s":0,"version":7,"pending":"00000000000000ab"}"#;
+        let waiting = r#""state":{"denied":false,"denied_gen":2,"rate_stage":1,"rate_wait_s":90,"version":7,"pending":null}"#;
         // a grant writes the row: its version moves on from the one asked against
-        let granted =
-            r#""state":{"denied":false,"denied_gen":2,"rate_stage":1,"rate_wait_s":0,"version":8}"#;
+        let granted = r#""state":{"denied":false,"denied_gen":2,"rate_stage":1,"rate_wait_s":0,"version":8,"pending":null}"#;
         let fetch = Ask {
             kind: Kind::Fetch,
             attempt: Some(ATTEMPT),
@@ -2601,6 +2692,7 @@ mod tests {
             rate_stage: 1,
             rate_wait_ms: 0,
             version: 7,
+            pending: Some(0xab),
         };
         assert_eq!(
             p.ask("claude", fetch),
@@ -2621,7 +2713,7 @@ mod tests {
         assert_eq!(s.posts[0].0, "https://x.example/v2/turns/mac");
         assert_eq!(
             s.posts[0].1,
-            json!({"claude": {"kind": "fetch", "attempt": ATTEMPT, "base": 7}})
+            json!({"claude": {"kind": "fetch", "attempt": ATTEMPT, "base": 7, "confirm": true}})
         );
         assert!(
             s.bodies.is_empty(),
@@ -2633,7 +2725,7 @@ mod tests {
             (
                 200,
                 format!(
-                    r#"{{"gemini":{{"go":true,"kind":"resume","attempt":"{ATTEMPT}","state":{{"denied":true,"denied_gen":2,"rate_stage":0,"rate_wait_s":0,"version":8}}}}}}"#
+                    r#"{{"gemini":{{"go":true,"kind":"resume","attempt":"{ATTEMPT}","state":{{"denied":true,"denied_gen":2,"rate_stage":0,"rate_wait_s":0,"version":8,"pending":null}}}}}}"#
                 ),
             ),
             (
@@ -2654,7 +2746,7 @@ mod tests {
         let s = t.0.lock().unwrap();
         assert_eq!(
             s.posts[s.posts.len() - 2].1,
-            json!({"gemini": {"kind": "resume", "attempt": ATTEMPT, "gen": 2, "base": 7, "replace": "fedcba9876543210", "again": true}})
+            json!({"gemini": {"kind": "resume", "attempt": ATTEMPT, "gen": 2, "base": 7, "replace": "fedcba9876543210", "again": true, "confirm": true}})
         );
         assert_eq!(
             s.posts[s.posts.len() - 1].1,
@@ -2674,14 +2766,14 @@ mod tests {
         let t = FakeTransport::default();
         let mut p = pusher(&h, &t, Ok(creds()));
         t.0.lock().unwrap().post_replies = vec![
-            (200, format!(r#"{{"claude":{{"ack":true,"attempt":"{ATTEMPT}","kind":"fetch","applied":true,"state":{{"denied":false,"denied_gen":0,"rate_stage":2,"rate_wait_s":21600,"version":4}}}}}}"#)),
+            (200, format!(r#"{{"claude":{{"ack":true,"attempt":"{ATTEMPT}","kind":"fetch","applied":true,"state":{{"denied":false,"denied_gen":0,"rate_stage":2,"rate_wait_s":21600,"version":4,"pending":null}}}}}}"#)),
             // an acknowledgement of another attempt, of another kind, or without whether it was applied is none
-            (200, r#"{"claude":{"ack":true,"attempt":"fedcba9876543210","kind":"fetch","applied":true,"state":{"denied":false,"denied_gen":0,"rate_stage":0,"rate_wait_s":0,"version":4}}}"#.into()),
-            (200, format!(r#"{{"claude":{{"ack":true,"attempt":"{ATTEMPT}","kind":"own","applied":true,"state":{{"denied":false,"denied_gen":0,"rate_stage":0,"rate_wait_s":0,"version":4}}}}}}"#)),
-            (200, format!(r#"{{"claude":{{"ack":true,"attempt":"{ATTEMPT}","kind":"fetch","state":{{"denied":false,"denied_gen":0,"rate_stage":0,"rate_wait_s":0,"version":4}}}}}}"#)),
+            (200, r#"{"claude":{"ack":true,"attempt":"fedcba9876543210","kind":"fetch","applied":true,"state":{"denied":false,"denied_gen":0,"rate_stage":0,"rate_wait_s":0,"version":4,"pending":null}}}"#.into()),
+            (200, format!(r#"{{"claude":{{"ack":true,"attempt":"{ATTEMPT}","kind":"own","applied":true,"state":{{"denied":false,"denied_gen":0,"rate_stage":0,"rate_wait_s":0,"version":4,"pending":null}}}}}}"#)),
+            (200, format!(r#"{{"claude":{{"ack":true,"attempt":"{ATTEMPT}","kind":"fetch","state":{{"denied":false,"denied_gen":0,"rate_stage":0,"rate_wait_s":0,"version":4,"pending":null}}}}}}"#)),
             (503, r#"{"error":"unavailable"}"#.into()),
             // not applied (replaced, or applied before): over, with no lease
-            (200, format!(r#"{{"claude":{{"ack":true,"attempt":"{ATTEMPT}","kind":"fetch","applied":false,"state":{{"denied":false,"denied_gen":0,"rate_stage":0,"rate_wait_s":0,"version":5}}}}}}"#)),
+            (200, format!(r#"{{"claude":{{"ack":true,"attempt":"{ATTEMPT}","kind":"fetch","applied":false,"state":{{"denied":false,"denied_gen":0,"rate_stage":0,"rate_wait_s":0,"version":5,"pending":null}}}}}}"#)),
         ];
         let got = p.report(
             "claude",
@@ -2702,6 +2794,7 @@ mod tests {
                     rate_stage: 2,
                     rate_wait_ms: 21_600_000,
                     version: 4,
+                    pending: None,
                 },
                 applied: true,
             })
@@ -2741,7 +2834,7 @@ mod tests {
             (
                 200,
                 format!(
-                    r#"{{"claude":{{"ack":true,"attempt":"{ATTEMPT}","kind":"fetch","applied":true,"state":{{"denied":false,"denied_gen":0,"rate_stage":{stage},"rate_wait_s":{wait_s},"version":4}}}}}}"#
+                    r#"{{"claude":{{"ack":true,"attempt":"{ATTEMPT}","kind":"fetch","applied":true,"state":{{"denied":false,"denied_gen":0,"rate_stage":{stage},"rate_wait_s":{wait_s},"version":4,"pending":null}}}}}}"#
                 ),
             )
         };
@@ -3617,7 +3710,11 @@ mod tests {
         let mut list: Vec<Box<dyn crate::providers::Provider>> =
             vec![Box::new(Tidying(tidy.clone()))];
         let cfg = crate::config::Config::default();
-        let mut round = crate::agent::Round::new(&cfg, "mac", Logger::stderr(), round_clock, &h);
+        // its own clock (another test moves the shared one)
+        fn fixed() -> i64 {
+            NOW
+        }
+        let mut round = crate::agent::Round::new(&cfg, "mac", Logger::stderr(), fixed, &h);
         // the first round sees the epoch (a change from none): tidying fails, then fails again, then works; then it stops trying
         for _ in 0..4 {
             round.run(&mut list, None);
@@ -3637,8 +3734,11 @@ mod tests {
             vec![Box::new(Caching(cache.clone(), h.to_path_buf()))];
         let mut cfg = crate::config::Config::default();
         cfg.push.url = "https://x.example/v2/snapshots/mac".into();
-        let mut round = crate::agent::Round::new(&cfg, "mac", Logger::stderr(), round_clock, &h);
-        ROUND_MS.store(NOW, std::sync::atomic::Ordering::SeqCst);
+        // its own clock (another test moves the shared one, and a go's deadline is checked on it)
+        fn fixed() -> i64 {
+            NOW
+        }
+        let mut round = crate::agent::Round::new(&cfg, "mac", Logger::stderr(), fixed, &h);
         round.run(&mut list, Some(&mut p));
         assert_eq!(
             cache.borrow().fetches,
@@ -3673,8 +3773,11 @@ mod tests {
         let cache = std::rc::Rc::new(std::cell::RefCell::new(Cache::default()));
         let mut list: Vec<Box<dyn crate::providers::Provider>> =
             vec![Box::new(Caching(cache.clone(), h.to_path_buf()))];
-        let mut round = crate::agent::Round::new(&cfg, "mac", Logger::stderr(), round_clock, &h);
-        ROUND_MS.store(NOW + MINUTE_MS, std::sync::atomic::Ordering::SeqCst);
+        // its own clock (another test moves the shared one, and a go's deadline is checked on it)
+        fn later() -> i64 {
+            NOW + MINUTE_MS
+        }
+        let mut round = crate::agent::Round::new(&cfg, "mac", Logger::stderr(), later, &h);
         round.run(&mut list, Some(&mut p));
         let bodies = t.0.lock().unwrap().bodies.clone();
         assert!(!bodies.is_empty(), "sent");
@@ -4238,8 +4341,7 @@ mod tests {
         p.record(&latest(40.0, NOW, None), true, NOW);
         p.push(&snapshot(&latest(40.0, NOW, None)), NOW);
         assert!(p.outdated());
-        let state =
-            r#""state":{"denied":false,"denied_gen":0,"rate_stage":0,"rate_wait_s":0,"version":3}"#;
+        let state = r#""state":{"denied":false,"denied_gen":0,"rate_stage":0,"rate_wait_s":0,"version":3,"pending":null}"#;
         // an answer of the earlier form (no attempt at all): still outdated
         t.0.lock().unwrap().post_replies = vec![(
             200,

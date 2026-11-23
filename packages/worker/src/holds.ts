@@ -11,17 +11,25 @@ import { PROVIDERS, type ProviderId } from "../../core/src/index.ts";
 import { EVENT_RETENTION_MS } from "../../core/src/events.ts";
 import { writableSql, type D1Like } from "./store.ts";
 
-export type TurnKind = "fetch" | "own" | "force" | "resume" | "release" | "peek";
+export type TurnKind = "fetch" | "own" | "force" | "resume" | "release" | "peek" | "start";
 export type Outcome = "ok" | "failed" | "not_run" | "rate_limited" | "access_denied";
 export type Reason = "turn" | "pending" | "rate_limited" | "access_denied" | "unavailable" | "stale_gen" | "moved" | "gone";
 
-const KINDS: readonly TurnKind[] = ["fetch", "own", "force", "resume", "release", "peek"];
+const KINDS: readonly TurnKind[] = ["fetch", "own", "force", "resume", "release", "peek", "start"];
+/** Kinds that make a reservation (a grant) */
+const RESERVING: readonly TurnKind[] = ["fetch", "own", "force", "resume"];
 const OUTCOMES: readonly Outcome[] = ["ok", "failed", "not_run", "rate_limited", "access_denied"];
 
 /** The longest lease (minutes) a successful fetch takes */
 export const LEASE_MAX_MINUTES = 90;
 /** A pending attempt older than this (ms) may be replaced by the user's explicit recovery (force, or a resume of the same stop) */
 export const PENDING_STUCK_MS = 5 * 60_000;
+/**
+ * A grant to an agent that tells its start is only a reservation until it does (right before its query): it may start within this, and
+ * past it the reservation goes to the next PC that asks (a PC asleep right after its go holds no one off). The PC uses a go for 60
+ * seconds from right before it asked
+ */
+export const RESERVE_WINDOW_MS = 2 * 60_000;
 /** The waits (minutes) of the 429 stages, the first rate limit and those after it */
 export const RATE_STAGES_MIN = [30, 60, 120, 240] as const;
 /** The longest wait (seconds) a PC may report as named by the service (366 days: a long one is kept, not cut) */
@@ -43,6 +51,8 @@ export interface TurnRequest {
   replace: string | null;
   /** Asked again (its first answer was lost): a refusal of it is kept, so a late copy of it is never granted */
   again: boolean;
+  /** The agent tells the start of the attempt granted (kind "start"): until then the grant is only a reservation */
+  confirm: boolean;
 }
 
 export interface ResultReport {
@@ -68,6 +78,9 @@ export interface HoldRow {
   pending_attempt: string | null;
   pending_kind: string | null;
   pending_since: string | null;
+  /** The pending attempt's id while it is only reserved (its agent tells its start, and hasn't yet); null once started, or for an agent
+   * that doesn't tell it. Any other value (left by an earlier Worker, which never writes it) means started */
+  pending_reserved: string | null;
   rate_stage: number;
   rate_until: string | null;
   denied: number;
@@ -85,7 +98,12 @@ export interface SharedState {
   rate_wait_s: number;
   /** The row's version (after this request's write): a PC makes its next attempt against it */
   version: number;
+  /** The attempt pending (any PC's): a PC stands an attempt a replacement was for up again only while it is still pending */
+  pending: string | null;
 }
+
+/** Whether the pending attempt is only reserved (its start not told yet) */
+const reservedOnly = (row: HoldRow) => row.pending_attempt !== null && row.pending_reserved === row.pending_attempt;
 
 /** Attempts that ended or were replaced, kept (the latest) so a late request of one is never granted */
 const RETIRED_KEPT = 8;
@@ -113,7 +131,7 @@ export interface TurnAnswer {
 
 const emptyRow = (provider: string): HoldRow => ({
   provider, version: 0, holder: null, holder_attempt: null, holder_until: null, pending_collector: null, pending_attempt: null,
-  pending_kind: null, pending_since: null, rate_stage: 0, rate_until: null, denied: 0, denied_gen: 0, denied_since: null,
+  pending_kind: null, pending_since: null, pending_reserved: null, rate_stage: 0, rate_until: null, denied: 0, denied_gen: 0, denied_since: null,
   result_attempt: null, retired: null,
 });
 
@@ -141,18 +159,21 @@ export function parseTurnRequest(body: unknown): { provider: ProviderId; req: Tu
   const attempt = v.attempt ?? null;
   if (kind === "peek" ? attempt !== null : typeof attempt !== "string" || !ATTEMPT.test(attempt)) return null;
   const gen = v.gen ?? null;
-  if (kind === "resume" ? !wholeIn(gen, 1, Number.MAX_SAFE_INTEGER) : gen !== null) return null;
-  const grantable = !["peek", "release"].includes(kind);
+  // resume: its stop; start: the stop of the resume it starts, if it starts one
+  if (kind === "resume" ? !wholeIn(gen, 1, Number.MAX_SAFE_INTEGER) : gen !== null && !(kind === "start" && wholeIn(gen, 1, Number.MAX_SAFE_INTEGER))) return null;
+  const grantable = RESERVING.includes(kind);
   const base = v.base ?? null;
   if (grantable ? !wholeIn(base, 0, Number.MAX_SAFE_INTEGER) : base !== null) return null;
   const replace = v.replace ?? null;
   if (replace !== null && (!["force", "resume"].includes(kind) || typeof replace !== "string" || !ATTEMPT.test(replace))) return null;
   const again = v.again ?? false;
   if (typeof again !== "boolean" || (again && !grantable)) return null;
-  for (const k of Object.keys(v)) if (!["kind", "attempt", "gen", "base", "replace", "again"].includes(k)) return null;
+  const confirm = v.confirm ?? false;
+  if (typeof confirm !== "boolean" || (confirm && !grantable)) return null;
+  for (const k of Object.keys(v)) if (!["kind", "attempt", "gen", "base", "replace", "again", "confirm"].includes(k)) return null;
   return {
     provider,
-    req: { kind, attempt: attempt as string | null, gen: gen as number | null, base: base as number | null, replace: replace as string | null, again },
+    req: { kind, attempt: attempt as string | null, gen: gen as number | null, base: base as number | null, replace: replace as string | null, again, confirm },
   };
 }
 
@@ -164,7 +185,7 @@ export function parseResult(body: unknown): { provider: ProviderId; rep: ResultR
   const outcome = v.outcome as Outcome;
   if (!OUTCOMES.includes(outcome) || typeof v.attempt !== "string" || !ATTEMPT.test(v.attempt)) return null;
   const kind = v.kind as TurnKind;
-  if (!KINDS.includes(kind) || ["peek", "release"].includes(kind)) return null;
+  if (!RESERVING.includes(kind)) return null;
   const retry = v.retry_s ?? null;
   if (retry !== null && !wholeIn(retry, 0, MAX_RETRY_S)) return null;
   if (!wholeIn(v.interval_s, 600, 86_400) || !wholeIn(v.minutes, 0, 1_440)) return null;
@@ -204,6 +225,7 @@ export function stateOf(row: HoldRow, now: number): SharedState {
     rate_stage: row.rate_stage,
     rate_wait_s: Math.ceil(msLeft(row.rate_until, now) / 1000),
     version: row.version,
+    pending: row.pending_attempt,
   };
 }
 
@@ -229,6 +251,18 @@ export function decideTurn(
     const mine = row.holder === collector && row.holder_attempt === req.attempt;
     return mine ? { answer: answer(false), update: { holder: null, holder_attempt: null, holder_until: null } } : { answer: answer(false) };
   }
+  // The start of a reservation (its PC is about to query): taken only from that PC for that attempt, within the window; told again
+  // once taken, the same go. Past the window, or the attempt gone (ended, or given to another PC): gone, so it isn't queried
+  if (req.kind === "start") {
+    const gone = { answer: answer(false, { reason: "gone" as Reason }) };
+    if (row.pending_attempt !== req.attempt || row.pending_collector !== collector) return gone;
+    // A resume's start names the stop it resumes, still standing; any other start none
+    if (row.pending_kind === "resume" ? !(row.denied === 1 && req.gen === row.denied_gen) : req.gen !== null) return gone;
+    if (!reservedOnly(row)) return { answer: answer(true) };
+    if (now - Date.parse(row.pending_since ?? "") >= RESERVE_WINDOW_MS) return gone;
+    // Started now: the 5 minutes before an explicit recovery may replace it count from here
+    return { answer: answer(true), update: { pending_reserved: null, pending_since: iso(now) } };
+  }
   if (!writable) return { answer: answer(false, { reason: "unavailable" }) };
   // A refusal of a request asked again is kept (its id retired), so a late copy of it is never granted
   const refuse = (reason: Reason, extra: Partial<TurnAnswer> = {}) => ({
@@ -239,7 +273,14 @@ export function decideTurn(
   // explicit recovery may replace it count again from now (the PC uses a go for 60 seconds from its arrival)
   if (row.pending_attempt === req.attempt && row.pending_collector === collector) {
     const same = row.pending_kind === req.kind && (req.kind !== "resume" || (row.denied === 1 && req.gen === row.denied_gen));
-    return same ? { answer: answer(true), update: { pending_since: iso(now) } } : { answer: answer(false, { reason: "pending" }) };
+    if (!same) return { answer: answer(false, { reason: "pending" }) };
+    // Only reserved: the same go within its window, never lengthened (one past it isn't brought back), and only to a request that
+    // tells its start (the one it was made for)
+    if (reservedOnly(row)) {
+      const live = req.confirm && now - Date.parse(row.pending_since ?? "") < RESERVE_WINDOW_MS;
+      return live ? { answer: answer(true) } : { answer: answer(false, { reason: "gone" }) };
+    }
+    return { answer: answer(true), update: { pending_since: iso(now) } };
   }
   // An attempt that ended or was replaced, asked for late: never granted again (its PC has moved on)
   if (req.attempt !== null && retiredOf(row).includes(req.attempt)) return { answer: answer(false, { reason: "pending" }) };
@@ -251,10 +292,14 @@ export function decideTurn(
   if (row.denied === 1 && req.kind !== "resume") return refuse("access_denied");
   if (req.kind === "resume" && (row.denied !== 1 || req.gen !== row.denied_gen)) return refuse("stale_gen");
   if (row.pending_attempt !== null) {
-    // Replaced only on the user's word for that attempt, once it is old enough
-    const stuck = now - Date.parse(row.pending_since ?? "") >= PENDING_STUCK_MS;
+    // A reservation never started past its window goes to this request. A resume's goes only to a resume of the same stop: while a
+    // stop stands, every other request was refused above (access_denied, stale_gen)
+    const since = Date.parse(row.pending_since ?? "");
+    const abandoned = reservedOnly(row) && now - since >= RESERVE_WINDOW_MS;
+    // A started one is replaced only on the user's word for that attempt, once it is old enough (counted from its start)
+    const stuck = now - since >= PENDING_STUCK_MS;
     const recovers = (req.kind === "force" && row.denied !== 1) || (req.kind === "resume" && row.pending_kind === "resume");
-    if (!(stuck && recovers && req.replace === row.pending_attempt)) return refuse("pending");
+    if (!abandoned && !(stuck && recovers && req.replace === row.pending_attempt)) return refuse("pending");
   }
   const rate = msLeft(row.rate_until, now);
   if (rate > 0) return refuse("rate_limited", { wait_s: Math.ceil(rate / 1000) });
@@ -265,6 +310,8 @@ export function decideTurn(
     // One replaced (left pending, recovered by the user) is retired: a late result or request of it changes nothing
     update: {
       pending_collector: collector, pending_attempt: req.attempt, pending_kind: req.kind, pending_since: iso(now),
+      // An agent that tells its start holds only a reservation until then; one that doesn't (an earlier version) starts now
+      pending_reserved: req.confirm ? req.attempt : null,
       ...(row.pending_attempt !== null ? { retired: retire(row, row.pending_attempt) } : {}),
     },
   };
@@ -281,7 +328,9 @@ export type Mark = "start" | "end" | null;
  */
 export function applyResult(row: HoldRow, collector: string, rep: ResultReport, now: number): { update: Partial<HoldRow>; mark: Mark } | null {
   if (row.pending_attempt !== rep.attempt || row.pending_collector !== collector || row.pending_kind !== rep.kind) return null;
-  const update: Partial<HoldRow> = { pending_collector: null, pending_attempt: null, pending_kind: null, pending_since: null, retired: retire(row, rep.attempt) };
+  const update: Partial<HoldRow> = {
+    pending_collector: null, pending_attempt: null, pending_kind: null, pending_since: null, pending_reserved: null, retired: retire(row, rep.attempt),
+  };
   const noLease = { holder: null, holder_attempt: null, holder_until: null };
   let mark: Mark = null;
   switch (rep.outcome) {
@@ -370,7 +419,7 @@ export async function takeTurn(
     const row = await loadHold(db, provider);
     // Whether a PC can deliver is read only where it decides: this PC's for a request that could be granted, the holder's for a fetch
     // its lease would hold off
-    const grantable = !["peek", "release"].includes(req.kind) && !(row.pending_attempt === req.attempt && row.pending_collector === collector);
+    const grantable = RESERVING.includes(req.kind) && !(row.pending_attempt === req.attempt && row.pending_collector === collector);
     const leased = req.kind === "fetch" && row.holder !== null && row.holder !== collector && msLeft(row.holder_until, at) > 0;
     const d = decideTurn(
       row,
@@ -381,8 +430,9 @@ export async function takeTurn(
       grantable && leased ? await writable(row.holder!) : true,
     );
     if (!d.update) return d.answer;
-    if (await writeHold(db, row, d.update, d.answer.go ? collector : null)) {
-      return { ...d.answer, state: { ...d.answer.state, version: row.version + 1 } };
+    if (await writeHold(db, row, d.update, d.answer.go && req.kind !== "start" ? collector : null)) {
+      // The state after this write (its version, and the attempt it left pending)
+      return { ...d.answer, state: stateOf({ ...row, ...d.update, version: row.version + 1 }, at) };
     }
   }
   return null;

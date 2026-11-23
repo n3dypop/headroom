@@ -7,6 +7,7 @@ import { AGENT_PROTOCOL, sha256Hex } from "../src/auth.ts";
 import { DAILY_BUDGET, metered, OVERHEAD_MAX, RESERVE, reserve, settle } from "../src/budget.ts";
 import {
   PENDING_STUCK_MS,
+  RESERVE_WINDOW_MS,
   applyResult,
   decideTurn,
   parseResult,
@@ -73,9 +74,9 @@ async function setup(strict = false) {
     attempt: string | null,
     at = NOW,
     gen?: number,
-    opts: { base?: number; replace?: string; again?: boolean } = {},
+    opts: { base?: number; replace?: string; again?: boolean; confirm?: boolean } = {},
   ) => {
-    const grantable = !["peek", "release"].includes(kind);
+    const grantable = !["peek", "release", "start"].includes(kind);
     const base = grantable ? (opts.base ?? (await post(pc, { kind: "peek" }, at)).state?.version ?? 0) : undefined;
     const answer = await post(pc, {
       kind, attempt,
@@ -83,8 +84,9 @@ async function setup(strict = false) {
       ...(base === undefined ? {} : { base }),
       ...(opts.replace ? { replace: opts.replace } : {}),
       ...(opts.again ? { again: true } : {}),
+      ...(opts.confirm ? { confirm: true } : {}),
     }, at);
-    if (answer.go && attempt) kinds.set(attempt, kind);
+    if (answer.go && attempt && kind !== "start") kinds.set(attempt, kind);
     return answer;
   };
   const result = async (pc: Pc, attempt: string, outcome: string, at = NOW, extra: Record<string, unknown> = {}) => {
@@ -100,18 +102,19 @@ async function setup(strict = false) {
 
 const row = (over: Partial<HoldRow> = {}): HoldRow => ({
   provider: "claude", version: 1, holder: null, holder_attempt: null, holder_until: null, pending_collector: null, pending_attempt: null,
-  pending_kind: null, pending_since: null, rate_stage: 0, rate_until: null, denied: 0, denied_gen: 0, denied_since: null,
-  result_attempt: null, retired: null, ...over,
+  pending_kind: null, pending_since: null, pending_reserved: null, rate_stage: 0, rate_until: null, denied: 0, denied_gen: 0,
+  denied_since: null, result_attempt: null, retired: null, ...over,
 });
 const req = (kind: TurnRequest["kind"], attempt: string | null = A1, gen: number | null = null, over: Partial<TurnRequest> = {}): TurnRequest =>
-  ({ kind, attempt, gen, base: ["peek", "release"].includes(kind) ? null : 1, replace: null, again: false, ...over });
+  ({ kind, attempt, gen, base: ["peek", "release", "start"].includes(kind) ? null : 1, replace: null, again: false, confirm: false, ...over });
 const t = NOW.getTime();
 const iso = (ms: number) => new Date(ms).toISOString();
 
 test("decideTurn: a stop, another pending attempt, a rate limit and another PC's lease hold in that order; own, force and resume pass a lease only", () => {
   const go = (r: HoldRow, q: TurnRequest, writable = true) => decideTurn(r, "mac", q, t, writable);
   assert.equal(go(row(), req("fetch")).answer.go, true);
-  assert.deepEqual(go(row(), req("fetch")).update, { pending_collector: "mac", pending_attempt: A1, pending_kind: "fetch", pending_since: iso(t) });
+  // from an agent that doesn't tell its start: started at the grant
+  assert.deepEqual(go(row(), req("fetch")).update, { pending_collector: "mac", pending_attempt: A1, pending_kind: "fetch", pending_since: iso(t), pending_reserved: null });
   // a resend of the attempt granted: the same go, nothing written
   const mine = row({ pending_collector: "mac", pending_attempt: A1, pending_kind: "fetch", pending_since: iso(t - 4 * MIN) });
   assert.deepEqual([go(mine, req("fetch")).answer.go, go(mine, req("fetch")).update], [true, { pending_since: iso(t) }], "the 5 minutes count again");
@@ -142,6 +145,50 @@ test("decideTurn: a stop, another pending attempt, a rate limit and another PC's
   const stuckResume = row({ denied: 1, denied_gen: 2, pending_collector: "win-desktop", pending_attempt: A2, pending_kind: "resume", pending_since: iso(t - PENDING_STUCK_MS) });
   assert.equal(go(stuckResume, req("resume", A1, 2, { replace: A2 })).answer.go, true, "a resume of the same stop replaces a resume left pending");
   assert.equal(go(stuckResume, req("force")).answer.reason, "access_denied");
+  // a reservation (an agent that tells its start): held while it may start, given to the next PC that asks once its window passed
+  const reserved = row({ pending_collector: "win-desktop", pending_attempt: A2, pending_kind: "fetch", pending_since: iso(t - RESERVE_WINDOW_MS + 1), pending_reserved: A2 });
+  for (const k of ["fetch", "own", "force"] as const) assert.equal(go(reserved, req(k)).answer.reason, "pending", `${k} within the window`);
+  const lapsed = { ...reserved, pending_since: iso(t - RESERVE_WINDOW_MS) };
+  for (const k of ["fetch", "own", "force"] as const) {
+    const d = go(lapsed, req(k, A1, null, { confirm: true }));
+    assert.equal(d.answer.go, true, k);
+    assert.deepEqual([d.update?.pending_attempt, d.update?.pending_reserved, JSON.parse(d.update?.retired ?? "[]")], [A1, A1, [A2]], k);
+  }
+  assert.equal(go({ ...lapsed, pending_collector: "mac" }, req("fetch", A1)).answer.go, true, "this PC's own lapsed reservation too (a new attempt)");
+  assert.equal(go({ ...lapsed, pending_reserved: null }, req("fetch")).answer.reason, "pending", "a started one is never given away");
+  assert.equal(go({ ...lapsed, pending_reserved: B1 }, req("fetch")).answer.reason, "pending", "one an earlier Worker granted (the mark names another attempt) reads as started");
+  // a lapsed resume's reservation goes only to a resume of the same stop
+  const resumeLapsed = row({ denied: 1, denied_gen: 2, pending_collector: "win-desktop", pending_attempt: A2, pending_kind: "resume", pending_since: iso(t - RESERVE_WINDOW_MS), pending_reserved: A2 });
+  assert.equal(go(resumeLapsed, req("resume", A1, 2)).answer.go, true);
+  assert.equal(go(resumeLapsed, req("resume", A1, 1)).answer.reason, "stale_gen");
+  assert.equal(go(resumeLapsed, req("force")).answer.reason, "access_denied");
+  // a lapsed reservation still waits for a rate limit, and a fetch for another PC's lease (own and force pass it)
+  assert.equal(go({ ...lapsed, rate_stage: 1, rate_until: iso(t + MIN) }, req("own")).answer.reason, "rate_limited");
+  const leasedLapsed = { ...lapsed, holder: "win-desktop", holder_attempt: A3, holder_until: iso(t + 5 * MIN) };
+  assert.equal(go(leasedLapsed, req("fetch")).answer.reason, "turn");
+  assert.equal(go(leasedLapsed, req("own")).answer.go, true);
+  // the grant to an agent that tells its start is only a reservation
+  assert.equal(go(row(), req("fetch", A1, null, { confirm: true })).update?.pending_reserved, A1);
+  // the start: from its PC, for its attempt, within the window; told again, the same go and nothing written
+  const mineReserved = row({ pending_collector: "mac", pending_attempt: A1, pending_kind: "fetch", pending_since: iso(t - MIN), pending_reserved: A1 });
+  const started = go(mineReserved, req("start"));
+  assert.deepEqual([started.answer.go, started.update], [true, { pending_reserved: null, pending_since: iso(t) }], "started: the 5 minutes count from here");
+  assert.deepEqual([go({ ...mineReserved, pending_reserved: null }, req("start")).answer.go, go({ ...mineReserved, pending_reserved: null }, req("start")).update], [true, undefined]);
+  // a resume's start names its stop; another's none
+  const resumeReserved = row({ denied: 1, denied_gen: 2, pending_collector: "mac", pending_attempt: A1, pending_kind: "resume", pending_since: iso(t - MIN), pending_reserved: A1 });
+  assert.equal(go(resumeReserved, req("start", A1, 2)).answer.go, true);
+  assert.equal(go(resumeReserved, req("start", A1, 1)).answer.reason, "gone", "another stop");
+  assert.equal(go(resumeReserved, req("start")).answer.reason, "gone", "no stop named");
+  assert.equal(go(mineReserved, req("start", A1, 2)).answer.reason, "gone", "a fetch's start names none");
+  assert.equal(go({ ...mineReserved, pending_since: iso(t - RESERVE_WINDOW_MS) }, req("start")).answer.reason, "gone", "past its window");
+  assert.equal(go(mineReserved, req("start", A2)).answer.reason, "gone", "another attempt");
+  assert.equal(go({ ...mineReserved, pending_collector: "win-desktop" }, req("start")).answer.reason, "gone", "another PC's");
+  assert.equal(go(row(), req("start")).answer.reason, "gone", "nothing pending");
+  assert.equal(go(mineReserved, req("start"), false).answer.go, true, "a start needs no delivery check");
+  // a reservation asked for again (its answer lost): the same go within the window, never lengthened, only with its confirm
+  assert.deepEqual([go(mineReserved, req("fetch", A1, null, { confirm: true })).answer.go, go(mineReserved, req("fetch", A1, null, { confirm: true })).update], [true, undefined]);
+  assert.equal(go({ ...mineReserved, pending_since: iso(t - RESERVE_WINDOW_MS) }, req("fetch", A1, null, { confirm: true })).answer.reason, "gone", "not brought back");
+  assert.equal(go(mineReserved, req("fetch")).answer.reason, "gone", "not to a request that doesn't tell its start");
   // a rate limit holds every kind
   const limited = row({ rate_stage: 2, rate_until: iso(t + 21_600_000) });
   for (const k of ["fetch", "own", "force"] as const) {
@@ -155,7 +202,11 @@ test("decideTurn: a stop, another pending attempt, a rate limit and another PC's
   assert.equal(decideTurn(leased, "mac", req("fetch"), t, true, false).answer.go, true);
   assert.equal(go(row({ holder: "mac", holder_attempt: A2, holder_until: iso(t + 10 * MIN) }), req("fetch")).answer.go, true, "its own lease");
   // peek and release grant nothing; a release returns only the lease the attempt took
-  assert.deepEqual(go(row(), req("peek", null)), { answer: { go: false, kind: "peek", attempt: null, state: { denied: false, denied_gen: 0, rate_stage: 0, rate_wait_s: 0, version: 1 } } });
+  assert.deepEqual(go(row(), req("peek", null)), { answer: { go: false, kind: "peek", attempt: null, state: { denied: false, denied_gen: 0, rate_stage: 0, rate_wait_s: 0, version: 1, pending: null } } });
+  // every answer shows the attempt pending (any PC's): a PC stands an attempt a replacement was for up again only while it still is
+  const others = row({ pending_collector: "win-desktop", pending_attempt: B1, pending_kind: "fetch", pending_since: iso(t - MIN) });
+  assert.equal(go(others, req("peek", null)).answer.state.pending, B1);
+  assert.equal(go(others, req("fetch")).answer.state.pending, B1);
   // made against another version of the row: moved (asked again with a new attempt); a refusal of a request asked again is kept
   assert.equal(go(row({ version: 2 }), req("fetch")).answer.reason, "moved");
   assert.equal(go(row({ version: 2 }), req("fetch")).update, undefined);
@@ -182,7 +233,7 @@ test("applyResult: only the pending attempt's result applies; a fetch's ok takes
   for (const k of ["own", "force"] as const) assert.equal(applyResult(pending(k, leased), "mac", rep("ok", { kind: k }), t)!.update.holder, undefined, k);
   // not run: only the pending attempt ends
   const notRun = applyResult(pending("fetch", { holder: "mac", holder_attempt: A2, holder_until: iso(t + 5 * MIN) }), "mac", rep("not_run"), t)!;
-  assert.deepEqual(Object.keys(notRun.update).sort(), ["pending_attempt", "pending_collector", "pending_kind", "pending_since", "retired"]);
+  assert.deepEqual(Object.keys(notRun.update).sort(), ["pending_attempt", "pending_collector", "pending_kind", "pending_reserved", "pending_since", "retired"]);
   // a failure hands this PC's lease back
   assert.equal(applyResult(pending("fetch", { holder: "mac" }), "mac", rep("failed"), t)!.update.holder, null);
   // 429: 30, 60, 120, 240 minutes, at least the interval and the wait named (6 hours stays 21,600 s), each lengthened by up to 20 %
@@ -220,6 +271,9 @@ test("requests and results are parsed strictly: one provider, a known kind, an a
   assert.ok(parseTurnRequest({ codex: { kind: "peek" } }));
   assert.ok(parseTurnRequest({ gemini: { kind: "resume", attempt: A1, gen: 1, base: 3, replace: A2, again: true } }));
   assert.ok(parseTurnRequest({ claude: { kind: "release", attempt: A1 } }));
+  assert.ok(parseTurnRequest({ claude: { kind: "fetch", attempt: A1, base: 0, confirm: true } }));
+  assert.ok(parseTurnRequest({ claude: { kind: "start", attempt: A1 } }));
+  assert.ok(parseTurnRequest({ claude: { kind: "start", attempt: A1, gen: 2 } }), "a resume's start names its stop");
   for (const bad of [
     {}, [], "x", { claude: 7 }, { other: { kind: "fetch", attempt: A1 } },
     { claude: { kind: "fetch", attempt: A1 }, codex: { kind: "fetch", attempt: A1 } },
@@ -229,6 +283,9 @@ test("requests and results are parsed strictly: one provider, a known kind, an a
     { claude: { kind: "fetch", attempt: A1 } }, { claude: { kind: "fetch", attempt: A1, base: -1 } },
     { claude: { kind: "fetch", attempt: A1, base: 0, replace: A2 } }, { claude: { kind: "peek", base: 0 } },
     { claude: { kind: "force", attempt: A1, base: 0, replace: "x" } }, { claude: { kind: "fetch", attempt: A1, base: 0, again: 1 } },
+    { claude: { kind: "fetch", attempt: A1, base: 0, confirm: 1 } }, { claude: { kind: "peek", confirm: true } },
+    { claude: { kind: "start" } }, { claude: { kind: "start", attempt: A1, base: 0 } }, { claude: { kind: "start", attempt: A1, confirm: true } },
+    { claude: { kind: "start", attempt: A1, again: true } }, { claude: { kind: "start", attempt: A1, gen: 0 } },
   ]) assert.equal(parseTurnRequest(bad), null, JSON.stringify(bad));
   assert.ok(parseResult({ claude: { attempt: A1, kind: "fetch", outcome: "ok", interval_s: 900, minutes: 18 } }));
   assert.ok(parseResult({ claude: { attempt: A1, kind: "own", outcome: "rate_limited", retry_s: 366 * 86_400, interval_s: 900, minutes: 0 } }));
@@ -239,6 +296,7 @@ test("requests and results are parsed strictly: one provider, a known kind, an a
     { claude: { attempt: A1, outcome: "ok", interval_s: 900, minutes: 18, note: "x" } },
     { claude: { attempt: A1, outcome: "ok", interval_s: 900, minutes: 18 } },
     { claude: { attempt: A1, kind: "peek", outcome: "ok", interval_s: 900, minutes: 18 } },
+    { claude: { attempt: A1, kind: "start", outcome: "ok", interval_s: 900, minutes: 18 } },
     { claude: { attempt: A1, kind: "fetch", outcome: "rate_limited", retry_s: 366 * 86_400 + 1, interval_s: 900, minutes: 0 } },
   ]) assert.equal(parseResult(bad), null, JSON.stringify(bad));
 });
@@ -250,7 +308,7 @@ test("a grant is pending until its result: another PC waits, a fetch's success t
   assert.equal((await turn("win", "fetch", A2)).reason, "pending");
   assert.equal((await turn("win", "own", A2)).reason, "pending", "also a PC's own fetch");
   const acked = (await result("mac", A1, "ok", at(0.5))).body;
-  assert.deepEqual({ ...acked, state: { ...acked.state, version: 0 } }, { ack: true, attempt: A1, kind: "fetch", applied: true, state: { denied: false, denied_gen: 0, rate_stage: 0, rate_wait_s: 0, version: 0 } });
+  assert.deepEqual({ ...acked, state: { ...acked.state, version: 0 } }, { ack: true, attempt: A1, kind: "fetch", applied: true, state: { denied: false, denied_gen: 0, rate_stage: 0, rate_wait_s: 0, version: 0, pending: null } });
   assert.ok(acked.state.version > 0, "with the row's version");
   assert.equal((await result("mac", A1, "ok", at(0.6))).body.applied, false, "a resend of it changes nothing");
   const waiting = await turn("win", "fetch", A2, at(1));
@@ -278,7 +336,7 @@ test("PC-A's 6-hour rate limit holds PC-B, also restarted and due for its own fe
   const limited = await result("mac", A1, "rate_limited", at(0.2), { retry_s: 21_600 });
   // the named 6 hours, lengthened a little by the Worker (the same for the same report)
   const waitMs = Math.round(21_600_000 * (1 + rateJitter("mac", "claude", A1)));
-  assert.deepEqual({ ...limited.body.state, version: 0 }, { denied: false, denied_gen: 0, rate_stage: 1, rate_wait_s: Math.ceil(waitMs / 1000), version: 0 });
+  assert.deepEqual({ ...limited.body.state, version: 0 }, { denied: false, denied_gen: 0, rate_stage: 1, rate_wait_s: Math.ceil(waitMs / 1000), version: 0, pending: null });
   for (const kind of ["fetch", "own", "force"]) {
     const a = await turn("win", kind, A2, at(120));
     assert.deepEqual([a.go, a.reason, a.wait_s], [false, "rate_limited", Math.ceil((waitMs - 119.8 * 60_000) / 1000)], kind);
@@ -296,7 +354,7 @@ test("an access denial stops the provider on every PC, shows on the read endpoin
   const before = (await (await call("GET", "/v2/view", READ)).json()) as Record<string, any>;
   assert.equal((await turn("mac", "fetch", A1)).go, true);
   const denied = await result("mac", A1, "access_denied", at(0.2));
-  assert.deepEqual({ ...denied.body.state, version: 0 }, { denied: true, denied_gen: 1, rate_stage: 0, rate_wait_s: 0, version: 0 });
+  assert.deepEqual({ ...denied.body.state, version: 0 }, { denied: true, denied_gen: 1, rate_stage: 0, rate_wait_s: 0, version: 0, pending: null });
   assert.equal((await result("mac", A1, "access_denied", at(0.3))).body.applied, false, "a resend: nothing more");
   // every kind is held, on every PC, also a force
   for (const [pc, kind] of [["win", "fetch"], ["win", "own"], ["mac", "force"], ["win", "force"]] as const) {
@@ -500,6 +558,29 @@ test("with no stop marked, a PC's own access denial in its value isn't shown (ol
   assert.equal(none.providers.claude, undefined);
 });
 
+test("a reservation left unstarted (its PC asleep right after its go) goes to the next PC once its window passes; a started one never does", async () => {
+  const { turn, result, at, post } = await setup();
+  // mac reserves, then sleeps before its start: win waits within the window, takes it over after
+  const reserved = await turn("mac", "fetch", A1, NOW, undefined, { confirm: true });
+  assert.deepEqual([reserved.go, reserved.state.pending], [true, A1], "a go shows the state after its write");
+  const refused = await turn("win", "own", A2, at(1), undefined, { confirm: true });
+  assert.deepEqual([refused.reason, refused.state.pending], ["pending", A1]);
+  const took = await turn("win", "own", A2, at(2), undefined, { confirm: true });
+  assert.deepEqual([took.go, took.state.pending], [true, A2], "past the window");
+  assert.equal((await post("win", { kind: "start", attempt: A2 }, at(2.1))).go, true);
+  // mac wakes: its start is gone (it doesn't query), its not_run is acknowledged and changes nothing
+  assert.equal((await post("mac", { kind: "start", attempt: A1 }, at(15))).reason, "gone");
+  const late = await result("mac", A1, "not_run", at(15.1));
+  assert.deepEqual([late.status, late.body.applied, late.body.state.pending], [200, false, A2]);
+  assert.equal((await turn("mac", "fetch", B1, at(15.2), undefined, { confirm: true })).reason, "pending", "win's started attempt still holds");
+  // win's started attempt is never given away, however long (only its result or an explicit recovery ends it)
+  assert.equal((await turn("mac", "own", B2, at(60), undefined, { confirm: true })).reason, "pending");
+  assert.equal((await result("win", A2, "ok", at(61))).body.applied, true);
+  // an earlier agent (no confirm) starts at its grant: never given away
+  assert.equal((await turn("mac", "own", B3, at(62))).go, true);
+  assert.equal((await turn("win", "own", A3, at(80), undefined, { confirm: true })).reason, "pending");
+});
+
 test("every turn path stays within one turn's D1 reservation as D1 counts it (rows scanned, indexes written), also on a new UTC day", async () => {
   const { raw, turn, result, at, post } = await setup(true);
   // rows a scan would read (none of the turn's statements may scan them)
@@ -549,6 +630,18 @@ test("every turn path stays within one turn's D1 reservation as D1 counts it (ro
   await within("grant: resume", async () =>
     assert.equal((await turn("win", "resume", "00000000000000c1", at(10.5), 1, { base })).go, true));
   await within("result: the stop ends", async () => assert.equal((await result("win", "00000000000000c1", "ok", at(11))).body.state.denied, false));
+  // a reservation and its start, and one left unstarted that another PC takes over
+  base = await version(12);
+  await within("reservation", async () => assert.equal((await turn("mac", "own", "00000000000000d1", at(12.1), undefined, { base, confirm: true })).go, true));
+  await within("start", async () => assert.equal((await post("mac", { kind: "start", attempt: "00000000000000d1" }, at(12.2))).go, true));
+  await within("start told again", async () => assert.equal((await post("mac", { kind: "start", attempt: "00000000000000d1" }, at(12.3))).go, true));
+  await within("result of a started reservation", async () => assert.equal((await result("mac", "00000000000000d1", "ok", at(12.4))).body.applied, true));
+  base = await version(13);
+  await within("reservation (lapses)", async () => assert.equal((await turn("mac", "own", "00000000000000d2", at(13.1), undefined, { base, confirm: true })).go, true));
+  base = await version(13.2);
+  await within("takeover", async () => assert.equal((await turn("win", "own", "00000000000000d3", at(13.1 + RESERVE_WINDOW_MS / MIN), undefined, { base, confirm: true })).go, true));
+  await within("late start: gone", async () => assert.equal((await post("mac", { kind: "start", attempt: "00000000000000d2" }, at(16))).reason, "gone"));
+  await within("late result: not applied", async () => assert.equal((await result("mac", "00000000000000d2", "not_run", at(16.1))).body.applied, false));
   // the next UTC day: a new budget row
   const tomorrow = new Date("2026-11-17T00:00:30.000Z");
   const before = raw.prepare("SELECT count(*) AS n FROM d1_budget").get() as { n: number };

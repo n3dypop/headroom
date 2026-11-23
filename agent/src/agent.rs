@@ -327,7 +327,7 @@ pub fn run(home: &Path) -> i32 {
                     .map(|p| p.id())
                     .filter(|id| provider_enabled(&cfg, id))
                     .collect();
-                round.coord.next_upkeep(&running, now)
+                round.coord.next_upkeep(pusher.is_some(), &running, now)
             }))
             .min()
             .unwrap_or(i64::MAX);
@@ -572,6 +572,7 @@ impl Round {
         // The fetch times are spread with this PC's own random seed (made here once; the PC's name only when none can be kept)
         let seed = crate::store::schedule_seed(home, collector, true);
         let mut coord = Coordinator::with_plan(cfg.schedule.clone(), log, home, &seed, sharing);
+        coord.set_clock(clock);
         if plan_lost
             && let Some(shown) =
                 crate::store::read_json::<crate::schema::Snapshot>(&home.join("snapshot.json"))
@@ -1762,10 +1763,16 @@ mod tests {
                     serde_json::json!({"ack": true, "attempt": attempt, "kind": v["kind"], "applied": true})
                 } else {
                     let kind = v["kind"].as_str().unwrap().to_string();
-                    l.asks.push(kind.clone());
+                    // a start is taken as the attempt it starts was granted (a resume's carries its stop); not counted as an ask
+                    if kind != "start" {
+                        l.asks.push(kind.clone());
+                    }
                     let go = match kind.as_str() {
                         "peek" | "release" => false,
                         "resume" => l.denied && v["gen"].as_u64() == Some(l.stop),
+                        "start" if v.get("gen").is_some() => {
+                            l.denied && v["gen"].as_u64() == Some(l.stop)
+                        }
                         _ => l.grant && !l.denied,
                     };
                     l.resuming |= go && kind == "resume";
@@ -1780,7 +1787,7 @@ mod tests {
                     }
                     a
                 };
-                answer["state"] = serde_json::json!({"denied": l.denied, "denied_gen": l.stop, "rate_stage": 0, "rate_wait_s": 0, "version": l.version});
+                answer["state"] = serde_json::json!({"denied": l.denied, "denied_gen": l.stop, "rate_stage": 0, "rate_wait_s": 0, "version": l.version, "pending": null});
                 out.insert(p.clone(), answer);
             }
             Ok((200, serde_json::Value::Object(out).to_string()))
@@ -2308,7 +2315,10 @@ mod tests {
             r.run(&mut list, Some(&mut p));
         }
         assert_eq!(peeks(&wire), before);
-        assert_eq!(r.coord.next_upkeep(&[], T0 + 30 * MINUTE_MS), i64::MAX);
+        assert_eq!(
+            r.coord.next_upkeep(true, &[], T0 + 30 * MINUTE_MS),
+            i64::MAX
+        );
     }
 
     #[test]

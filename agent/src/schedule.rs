@@ -230,6 +230,9 @@ pub enum Kind {
     Release,
     /// Asks only for the shared state
     Peek,
+    /// Tells the destination that the attempt granted starts now (right before its query): until then it is only a reservation, which
+    /// the destination gives to another PC once left unused past its window
+    Start,
 }
 
 impl Kind {
@@ -241,6 +244,7 @@ impl Kind {
             Kind::Resume => "resume",
             Kind::Release => "release",
             Kind::Peek => "peek",
+            Kind::Start => "start",
         }
     }
 }
@@ -343,6 +347,9 @@ pub struct Shared {
     pub rate_wait_ms: i64,
     /// The version of the destination's row for the provider (a new attempt is made against the one last seen)
     pub version: u64,
+    /// The attempt pending at the destination (any PC's, its number): an attempt a replacement was for is stood up again here only
+    /// while it is still pending there
+    pub pending: Option<u64>,
 }
 
 /// One turn request, with what was fixed when its attempt was made (asked again exactly so)
@@ -589,6 +596,9 @@ struct Slot {
     resend_at: i64,
     #[serde(skip)]
     resend_fails: u32,
+    /// The attempt the destination's last answer showed pending (none before an answer): see `Shared::pending`
+    #[serde(skip)]
+    pending_seen: Option<u64>,
 }
 
 impl Slot {
@@ -628,7 +638,16 @@ pub struct Coordinator {
     unreadable: bool,
     /// Attempts made by this process (part of each new id)
     made: u64,
+    /// The wall clock a go's deadline is checked on around its start (the agent's round sets its own)
+    clock: fn() -> i64,
 }
+
+/// The wall clock a go's deadline is checked on, unless one is set. Tests run on times of their own, so there it never passes a deadline
+/// (only the monotonic clock does) unless the test sets one
+#[cfg(not(test))]
+const DEFAULT_CLOCK: fn() -> i64 = crate::time::now_ms;
+#[cfg(test)]
+const DEFAULT_CLOCK: fn() -> i64 = || i64::MIN;
 
 impl Coordinator {
     /// A coordinator that keeps nothing across restarts
@@ -643,7 +662,13 @@ impl Coordinator {
             sharing: false,
             unreadable: false,
             made: 0,
+            clock: DEFAULT_CLOCK,
         }
+    }
+
+    /// The wall clock to check a go's deadline on (the agent's round passes its own)
+    pub fn set_clock(&mut self, clock: fn() -> i64) {
+        self.clock = clock;
     }
 
     /// The agent's (and a manual collect's) coordinator: the plan read from (and kept in) PLAN_FILE, the jitter salted with this PC's
@@ -1047,6 +1072,7 @@ impl Coordinator {
         };
         slot.rate_set_at = now;
         slot.base = Some(shared.version);
+        slot.pending_seen = shared.pending;
     }
 
     /// The stops a result starts or ends on this PC's own word (a PC that doesn't share; one that does until the destination answers)
@@ -1408,6 +1434,8 @@ impl Coordinator {
             replace: attempt.replace.as_deref(),
             again,
         };
+        // An answer without the shared state (never from the destination: its answers carry it) shows nothing pending
+        self.slot(id).pending_seen = None;
         let Some(answer) = asker.ask(id, request) else {
             if self.slot(id).hold_reason != Some(Waiting::Unconfirmed) {
                 self.log.log(&format!(
@@ -1421,6 +1449,46 @@ impl Coordinator {
             self.take_shared(id, shared, now);
         }
         if answer.go {
+            // Granted: an attempt it replaced is retired at the destination, so it is never stood up again here, however this one ends
+            let attempt = Attempt {
+                replaced: None,
+                ..attempt
+            };
+            // The go is only a reservation until the destination takes its start, sent right before the query (one left unused past
+            // its window goes to another PC: a PC asleep right after its go holds no one off). Within the go's own deadline, never
+            // lengthened by it; not taken, no answer or too late: not run (reported as such, so the reservation ends)
+            // Both deadlines from right before the request (`now` was read before it): the same ones the provider gets
+            let grant = crate::providers::Grant {
+                until_ms: now + GRANT_VALID_MS,
+                until: asked + Duration::from_millis(GRANT_VALID_MS as u64),
+            };
+            let start = Ask {
+                kind: Kind::Start,
+                attempt: Some(&aid),
+                stop: attempt.stop,
+                base: None,
+                replace: None,
+                again: false,
+            };
+            // Both deadlines before the start is told and after its answer (the provider checks them again right before its query)
+            let clock = self.clock;
+            let live = || !grant.passed(clock());
+            let started = live() && asker.ask(id, start).is_some_and(|a| a.go) && live();
+            if !started {
+                self.slot(id).attempt = Some(Attempt {
+                    state: AttemptState::Done(Reported::NotRun),
+                    ..attempt.clone()
+                });
+                if !self.save() {
+                    self.slot(id).unsaved = true;
+                }
+                self.log.log(&format!(
+                    "{id}: the destination didn't take the start of the fetch (its reservation ran out or went to another PC); not fetched"
+                ));
+                // Its not_run is reported by the upkeep (at once); no new attempt until the recheck
+                self.hold(id, recheck(now), Some(Waiting::Unconfirmed), now);
+                return Asked::No(None);
+            }
             let s = self.slot(id);
             s.attempt = Some(Attempt {
                 state: AttemptState::Started,
@@ -1433,11 +1501,8 @@ impl Coordinator {
                 return Asked::No(None);
             }
             let s = self.slot(id);
-            // Both deadlines from right before the request: `now` was read before it (a late answer never lengthens them)
-            s.granted = Some(crate::providers::Grant {
-                until_ms: now + GRANT_VALID_MS,
-                until: asked + Duration::from_millis(GRANT_VALID_MS as u64),
-            });
+            // The same deadlines the start was checked against (a late answer never lengthens them)
+            s.granted = Some(grant);
             s.granted_attempt = Some(aid.clone());
             s.hold_until = 0;
             s.hold_reason = None;
@@ -1549,10 +1614,15 @@ impl Coordinator {
         }
     }
 
-    /// The attempt a refused replacement was for is given back as it was (its result still unknown)
+    /// The attempt a replacement that never began was for is given back as it was (its result still unknown), only while the
+    /// destination's last answer shows it still pending (a replacement granted and then taken over by another PC retired it there)
     fn give_back(&mut self, id: &str, replaced: Option<Attempt>) {
         if let Some(a) = replaced
             && self.slot(id).attempt.is_none()
+            && self
+                .slot(id)
+                .pending_seen
+                .is_some_and(|p| attempt_number(&a.id) == Some(p))
         {
             self.slot(id).attempt = Some(a);
             self.save();
@@ -1567,9 +1637,16 @@ impl Coordinator {
         mut asker: Option<&mut dyn TurnAsker>,
         now: i64,
     ) -> bool {
-        // What couldn't be saved is saved first: nothing is reported or asked before it is
-        if self.slot(id).unsaved && !self.save() {
-            return false;
+        // What couldn't be saved is saved first: nothing is reported or asked before it is. A save that fails is tried again after 1, 2, 4,
+        // then every 5 minutes (not every round)
+        if self.slot(id).unsaved {
+            if now < self.slot(id).resend_at {
+                return false;
+            }
+            if !self.save() {
+                self.resend_later(id, now);
+                return false;
+            }
         }
         if let Some(Attempt {
             id: aid,
@@ -1609,13 +1686,8 @@ impl Coordinator {
                 self.acknowledged(id, &aid, kind, r, lease, ack, now);
                 // A replacement that never began (not pending at the destination): the attempt it was for stands again as it was, so
                 // the user can replace it
-                if !applied
-                    && r == Reported::NotRun
-                    && let Some(x) = back
-                    && self.slot(id).attempt.is_none()
-                {
-                    self.slot(id).attempt = Some(*x);
-                    self.save();
+                if !applied && r == Reported::NotRun {
+                    self.give_back(id, back.map(|x| *x));
                 }
             }
         }
@@ -1672,23 +1744,27 @@ impl Coordinator {
     }
 
     /// When the upkeep of any provider is next due (a result's resend, a stop's recheck): the agent wakes for it
-    /// `running`: the providers this agent runs (a stop's recheck is theirs only; a result is sent for any)
-    pub fn next_upkeep(&self, running: &[&str], now: i64) -> i64 {
-        if !self.sharing {
+    /// `running`: the providers this agent runs (a stop's recheck is theirs only; a result is sent for any). `sending`: the agent can
+    /// reach the destination (without a pusher no upkeep is done, so none wakes the agent; what waits is kept for when one is)
+    pub fn next_upkeep(&self, sending: bool, running: &[&str], now: i64) -> i64 {
+        if !self.sharing || !sending {
             return i64::MAX;
         }
         self.slots
             .iter()
             .filter_map(|(id, s)| {
-                let resend = s
+                // A save that failed, or a result not acknowledged yet, is tried again at its time, and nothing else is done for the
+                // provider before it (a stop's recheck waits for it too)
+                let done = s
                     .attempt
                     .as_ref()
-                    .is_some_and(|a| matches!(a.state, AttemptState::Done(_)))
-                    .then_some(s.resend_at);
+                    .is_some_and(|a| matches!(a.state, AttemptState::Done(_)));
+                if s.unsaved || done {
+                    return Some(s.resend_at);
+                }
                 // While stopped, as the upkeep sees it (a wait that is over needs no recheck)
-                let peek = (running.contains(&id.as_str()) && (s.denied || s.rate_until > now))
-                    .then_some(s.peeked_at + STOP_RECHECK_MIN * MINUTE_MS);
-                resend.into_iter().chain(peek).min()
+                (running.contains(&id.as_str()) && (s.denied || s.rate_until > now))
+                    .then_some(s.peeked_at + STOP_RECHECK_MIN * MINUTE_MS)
             })
             .min()
             .unwrap_or(i64::MAX)
@@ -2095,6 +2171,11 @@ mod tests {
         version: u64,
         /// Peeks asked (apart from the requests that can be granted)
         peeks: Vec<String>,
+        /// Starts told (apart from the requests that can be granted)
+        starts: Vec<String>,
+        /// The next start is refused (its reservation ran out) or its answer lost
+        start_refused: bool,
+        start_lost: bool,
         /// Attempts that ended or were replaced
         retired: Vec<String>,
         /// The next request that can be granted is answered with no budget (nothing decided)
@@ -2109,6 +2190,10 @@ mod tests {
                 rate_stage: self.rate_stage,
                 rate_wait_ms: (self.rate_until - self.now).max(0),
                 version: self.version,
+                pending: self
+                    .pending
+                    .as_ref()
+                    .and_then(|(_, a, _, _)| attempt_number(a)),
             }
         }
         fn asked(&self, pc: &str, kind: Kind) -> usize {
@@ -2142,6 +2227,20 @@ mod tests {
             }
             if kind == Kind::Peek {
                 d.peeks.push(self.name.into());
+            } else if kind == Kind::Start {
+                d.starts.push(self.name.into());
+                if std::mem::take(&mut d.start_lost) {
+                    return None;
+                }
+                if std::mem::take(&mut d.start_refused) {
+                    let shared = Some(d.shared());
+                    return Some(Answer {
+                        go: false,
+                        reason: Some(Reason::Gone),
+                        wait_ms: 0,
+                        shared,
+                    });
+                }
             } else {
                 d.asks.push((self.name.into(), kind));
             }
@@ -2328,6 +2427,79 @@ mod tests {
         }
         c.after_fetch("claude", run, s, next, 15, Some(pc), now);
         true
+    }
+
+    #[test]
+    fn a_go_is_used_only_once_the_destination_takes_its_start_and_otherwise_ends_as_not_run() {
+        let desk = RefCell::new(Desk::default());
+        let mut pc = Pc {
+            name: "mac",
+            desk: &desk,
+        };
+        let mut c = sharing();
+        let s = snap(10.0, ProviderStatus::Ok);
+        // the start is told right after the go, and the attempt counts as started only then
+        assert!(fetch(&mut c, &mut pc, T0, OK, &s, T0 + 10 * MINUTE_MS));
+        assert_eq!(desk.borrow().starts, ["mac"]);
+        // refused (the reservation ran out, or went to another PC): not fetched, ended as not run and reported so
+        let plan = plan_of(&c, "claude");
+        desk.borrow_mut().start_refused = true;
+        assert!(!fetch(&mut c, &mut pc, plan, OK, &s, plan + 10 * MINUTE_MS));
+        assert!(
+            c.slots["claude"]
+                .attempt
+                .as_ref()
+                .is_some_and(|a| a.state == AttemptState::Done(Reported::NotRun)),
+            "{:?}",
+            c.slots["claude"].attempt
+        );
+        assert!(
+            c.grant("claude").is_none(),
+            "no go is handed to the provider"
+        );
+        c.maintain("claude", 15, Some(&mut pc), plan + MINUTE_MS);
+        assert_eq!(
+            desk.borrow().reports.last(),
+            Some(&("mac".into(), Reported::NotRun))
+        );
+        // its answer lost: not fetched either (a start the destination took and whose answer was lost is ended by the report)
+        // no new attempt until the recheck (a start refused again and again would spend the destination's budget)
+        assert!(c.hold_until("claude") >= plan + 5 * MINUTE_MS);
+        let asks = desk.borrow().asked("mac", Kind::Fetch);
+        assert!(!fetch(&mut c, &mut pc, plan + 2 * MINUTE_MS, OK, &s, 0));
+        assert_eq!(desk.borrow().asked("mac", Kind::Fetch), asks);
+        desk.borrow_mut().start_lost = true;
+        let later = plan + 6 * MINUTE_MS;
+        assert!(!fetch(
+            &mut c,
+            &mut pc,
+            later,
+            OK,
+            &s,
+            later + 10 * MINUTE_MS
+        ));
+        assert!(
+            c.slots["claude"]
+                .attempt
+                .as_ref()
+                .is_some_and(|a| a.state == AttemptState::Done(Reported::NotRun))
+        );
+        assert_eq!(desk.borrow().starts.len(), 3);
+        // past the go's deadline on the wall clock: no start is told, nothing fetched
+        fn far() -> i64 {
+            i64::MAX / 2
+        }
+        c.set_clock(far);
+        let later = later + 6 * MINUTE_MS;
+        assert!(!fetch(
+            &mut c,
+            &mut pc,
+            later,
+            OK,
+            &s,
+            later + 10 * MINUTE_MS
+        ));
+        assert_eq!(desk.borrow().starts.len(), 3, "no start told");
     }
 
     #[test]
@@ -2716,6 +2888,55 @@ mod tests {
                 assert!(took_over <= lease_end + 21 * MINUTE_MS);
             }
         }
+    }
+
+    #[test]
+    fn a_replacement_granted_whose_start_is_refused_doesn_t_bring_the_replaced_attempt_back() {
+        let h = crate::test_util::TempHome::new("schedule-replace-start");
+        let desk = RefCell::new(Desk::default());
+        let mut pc = Pc {
+            name: "mac",
+            desk: &desk,
+        };
+        let s = snap(10.0, ProviderStatus::Ok);
+        let make =
+            || Coordinator::with_plan(ScheduleConfig::default(), Logger::stderr(), &h, "mac", true);
+        let mut c = make();
+        desk.borrow_mut().now = T0;
+        assert!(c.before_fetch(
+            "claude",
+            15,
+            Some(&s),
+            None,
+            None,
+            Mode::Auto,
+            Some(&mut pc),
+            T0
+        ));
+        // the run stops before its result is checked: the attempt's result is unknown
+        drop(c);
+        let mut again = make();
+        let t = T0 + 201 * MINUTE_MS;
+        desk.borrow_mut().now = t;
+        let unknown = attempt_number(&desk.borrow().pending.as_ref().unwrap().1);
+        // the user's force replacing it is granted (the destination retires the old one), but its start is refused
+        desk.borrow_mut().start_refused = true;
+        assert!(!again.before_fetch(
+            "claude",
+            15,
+            Some(&s),
+            None,
+            None,
+            Mode::Force { replace: unknown },
+            Some(&mut pc),
+            t
+        ));
+        let a = again.slots["claude"].attempt.clone().unwrap();
+        assert_eq!(a.state, AttemptState::Done(Reported::NotRun));
+        assert!(
+            a.replaced.is_none(),
+            "the replaced attempt is gone at the destination: never stood up again here"
+        );
     }
 
     #[test]
@@ -3723,8 +3944,15 @@ mod tests {
         c.maintain("claude", 15, Some(&mut pc), T0 + MINUTE_MS);
         assert!(desk.borrow().reports.is_empty(), "still not saved");
         assert!(c.denied("claude").is_some(), "its stop stands meanwhile");
-        // the file can be written again: saved first, then reported once, with no fetch
+        // the file can be written again: saved first, then reported once, with no fetch; a failed save is tried again only after a
+        // minute (not every round)
         std::fs::remove_dir(h.join(PLAN_FILE)).unwrap();
+        c.maintain("claude", 15, Some(&mut pc), T0 + 90_000);
+        assert!(
+            desk.borrow().reports.is_empty(),
+            "not tried again within the minute"
+        );
+        assert!(!h.join(PLAN_FILE).exists());
         c.maintain("claude", 15, Some(&mut pc), T0 + 2 * MINUTE_MS);
         assert_eq!(
             desk.borrow().reports,
@@ -3756,20 +3984,24 @@ mod tests {
         ));
         desk.borrow_mut().down = true;
         c.after_fetch("claude", OK, &s, 0, 15, Some(&mut pc), T0);
-        assert_eq!(c.next_upkeep(&["claude"], T0), T0 + MINUTE_MS);
+        assert_eq!(c.next_upkeep(true, &["claude"], T0), T0 + MINUTE_MS);
         let mut at = T0 + MINUTE_MS;
         for wait in [2, 4, 5, 5] {
             c.maintain("claude", 15, Some(&mut pc), at - 1_000);
-            assert_eq!(c.next_upkeep(&["claude"], T0), at, "not before its time");
+            assert_eq!(
+                c.next_upkeep(true, &["claude"], T0),
+                at,
+                "not before its time"
+            );
             c.maintain("claude", 15, Some(&mut pc), at);
             at += wait * MINUTE_MS;
-            assert_eq!(c.next_upkeep(&["claude"], T0), at);
+            assert_eq!(c.next_upkeep(true, &["claude"], T0), at);
         }
         // reached again: sent, and nothing is due any more
         desk.borrow_mut().down = false;
         c.maintain("claude", 15, Some(&mut pc), at);
         assert_eq!(desk.borrow().reports, [("mac".to_string(), Reported::Ok)]);
-        assert_eq!(c.next_upkeep(&["claude"], T0), i64::MAX);
+        assert_eq!(c.next_upkeep(true, &["claude"], T0), i64::MAX);
     }
 
     #[test]
@@ -4120,19 +4352,39 @@ mod tests {
         // a provider turned off, stopped: no recheck is done for it, so none wakes the agent
         c.slot("gemini").denied = true;
         c.slot("gemini").peeked_at = T0;
-        assert_eq!(c.next_upkeep(&["claude"], T0), i64::MAX);
+        assert_eq!(c.next_upkeep(true, &["claude"], T0), i64::MAX);
         assert_eq!(
-            c.next_upkeep(&["claude", "gemini"], T0),
+            c.next_upkeep(true, &["claude", "gemini"], T0),
             T0 + STOP_RECHECK_MIN * MINUTE_MS
         );
         // a wait that is over (a 429's, of a provider turned off but built): no recheck, so no wake
         c.slot("codex").rate_until = T0 - MINUTE_MS;
         c.slot("codex").peeked_at = T0 - 60 * MINUTE_MS;
-        assert_eq!(c.next_upkeep(&["codex"], T0), i64::MAX);
+        assert_eq!(c.next_upkeep(true, &["codex"], T0), i64::MAX);
         c.slot("codex").rate_until = T0 + 30 * MINUTE_MS;
         assert_eq!(
-            c.next_upkeep(&["codex"], T0),
+            c.next_upkeep(true, &["codex"], T0),
             T0 - 60 * MINUTE_MS + STOP_RECHECK_MIN * MINUTE_MS
+        );
+        // a save that failed: nothing is done before it is tried again, so its recheck (past) wakes nothing until then
+        c.slot("codex").unsaved = true;
+        c.slot("codex").resend_at = T0 + 2 * MINUTE_MS;
+        assert_eq!(c.next_upkeep(true, &["codex"], T0), T0 + 2 * MINUTE_MS);
+        // saved, but its result's report failed: nothing is done before it is sent again either
+        c.slot("codex").unsaved = false;
+        c.slot("codex").attempt = Some(Attempt::new(
+            "00000000000000c1".into(),
+            Kind::Fetch,
+            AttemptState::Done(Reported::RateLimited { retry_ms: None }),
+            T0,
+        ));
+        assert_eq!(c.next_upkeep(true, &["codex"], T0), T0 + 2 * MINUTE_MS);
+        // with nothing to send it (the push settings can't be used): no upkeep is done, so none wakes the agent
+        c.slot("codex").resend_at = 0;
+        assert_eq!(c.next_upkeep(false, &["codex"], T0), i64::MAX);
+        assert!(
+            c.slots["codex"].attempt.is_some(),
+            "kept for when it can be sent"
         );
     }
     /// A destination whose acknowledgement shows the state given
@@ -4181,6 +4433,7 @@ mod tests {
             rate_stage: 0,
             rate_wait_ms: 0,
             version: 9,
+            pending: None,
         };
         assert_eq!(resumed(ended), (false, 1), "acknowledged");
         // the first report, as the fetch ended: the same check
@@ -4327,6 +4580,78 @@ mod tests {
             Some(&mut pc),
             T0 + 13 * MINUTE_MS
         ));
+        // granted (the attempt it was for retired there) with its answer lost, then taken over by another PC: the attempt it was for
+        // is never stood up again here, neither when it is asked again nor when a later round ends it
+        for ask_again in [true, false] {
+            let desk = setup();
+            desk.borrow_mut().unavailable_next = false;
+            desk.borrow_mut().lose_next = true;
+            let mut pc = Pc {
+                name: "mac",
+                desk: &desk,
+            };
+            let mut c = unknown_x(&desk);
+            assert!(!c.before_fetch(
+                "codex",
+                15,
+                Some(&s),
+                None,
+                None,
+                force,
+                Some(&mut pc),
+                T0 + 10 * MINUTE_MS
+            ));
+            {
+                let mut d = desk.borrow_mut();
+                let (_, mine, _, _) = d.pending.take().unwrap();
+                assert_ne!(mine, "00000000000000ab", "the replacement was granted");
+                d.retired.push(mine);
+                d.pending = Some((
+                    "win".into(),
+                    "00000000000000cd".into(),
+                    Kind::Fetch,
+                    T0 + 12 * MINUTE_MS,
+                ));
+                d.version += 1;
+            }
+            if ask_again {
+                assert!(!c.before_fetch(
+                    "codex",
+                    15,
+                    Some(&s),
+                    None,
+                    None,
+                    force,
+                    Some(&mut pc),
+                    T0 + 13 * MINUTE_MS
+                ));
+            } else {
+                assert!(!c.before_fetch(
+                    "codex",
+                    15,
+                    Some(&s),
+                    None,
+                    None,
+                    Mode::Auto,
+                    Some(&mut pc),
+                    T0 + 13 * MINUTE_MS
+                ));
+                c.maintain("codex", 15, Some(&mut pc), T0 + 14 * MINUTE_MS);
+                assert!(
+                    desk.borrow()
+                        .reports
+                        .iter()
+                        .any(|(_, r)| *r == Reported::NotRun)
+                );
+            }
+            assert!(
+                !c.slots["codex"]
+                    .attempt
+                    .as_ref()
+                    .is_some_and(|a| a.id == "00000000000000ab"),
+                "asked again: {ask_again}"
+            );
+        }
     }
 
     #[test]
