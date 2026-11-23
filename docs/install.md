@@ -296,7 +296,7 @@ From the same folder:
 `install` does four things:
 1. Copies `headroom` and `headroomw` to the `bin` folder under `~/.headroom` (or `HEADROOM_HOME`). It prints the location as `Executables:`.
 2. Registers the agent to start at login:
-   - Windows: a per-user `Run` registry entry for the windowless `headroomw.exe`.
+   - Windows: a shortcut `Headroom.lnk` in your Startup folder for the windowless `headroomw.exe`. It shows in Settings › Apps › Startup, where it can be turned off (then it doesn't start at sign-in). The `Run` registry entry that earlier versions used is removed.
    - macOS: a LaunchAgent. Its `PATH` includes the folders where `claude` and `codex` were found.
 3. Starts the agent.
 4. Prints the installed path and a ready-made statusLine setting.
@@ -452,6 +452,7 @@ If the widget can't schedule notifications on your iPhone, use a Shortcuts autom
 - **Claude safety stop:** fetching stopped because the agent could not confirm that `/usage` used no quota.
   - Possible causes: `/usage` did not finish in time, its result did not show the expected local-only output, or it may have been sent to the model.
   - After a safety stop, the agent does not run `/usage` again on its own.
+  - A `/usage` that didn't finish because the computer slept while it ran is not a safety stop (for Gemini too): the agent hands its turn to the other PCs and tries again at the next check. `headroom status` shows it as the last error.
   - Before retrying: read the reason in `headroom status`, and check `claude --version` (a newer CLI may have changed `/usage`).
   - Retry once with `headroom collect --provider claude --force`, and check that `headroom status` shows a normal result.
 - **Claude `last error unsupported_cli`:** the `claude` the agent found is older than 2.1.325, or its version could not be read, so the agent does not run `/usage`. Update the CLI (see 2.1; with Homebrew, use `claude-code@latest`), then run `headroom stop` and `headroom start`.

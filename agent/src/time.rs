@@ -118,9 +118,153 @@ pub fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
+/// Which of the two clocks of sleep_clocks is read first. A pause between the two reads (the process held up) then makes the time
+/// counted asleep shorter, never longer: at a span's start the one that stops while asleep goes first, at its end the one that runs on
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReadFirst {
+    /// At a span's start
+    Stopping,
+    /// At a span's end
+    RunningOn,
+}
+
+/// Time since an arbitrary point by two of the OS's clocks: (one that runs on while the computer sleeps, one that stops while it
+/// sleeps), read in the order given. Their difference over a span is the time the computer slept in it; a clock set by hand or a busy
+/// CPU moves neither apart (both count the same raw ticks while awake). None where they can't be read
+pub fn sleep_clocks(first: ReadFirst) -> Option<(std::time::Duration, std::time::Duration)> {
+    use std::time::Duration;
+    #[cfg(windows)]
+    let (running_on, stopping) = {
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GetTickCount64() -> u64;
+            fn QueryUnbiasedInterruptTime(time: *mut u64) -> i32;
+        }
+        // The tick count runs on while asleep (milliseconds); the unbiased interrupt time stops (100 ns units)
+        // SAFETY: GetTickCount64 takes nothing
+        let running_on = || Some(Duration::from_millis(unsafe { GetTickCount64() }));
+        let stopping = || {
+            let mut t = 0u64;
+            // SAFETY: QueryUnbiasedInterruptTime only writes the u64 it is given
+            (unsafe { QueryUnbiasedInterruptTime(&mut t) } != 0)
+                .then(|| Duration::from_nanos(t.saturating_mul(100)))
+        };
+        (running_on, stopping)
+    };
+    #[cfg(any(
+        target_os = "macos",
+        all(target_os = "linux", target_pointer_width = "64")
+    ))]
+    let (running_on, stopping) = {
+        #[repr(C)]
+        struct Timespec {
+            sec: i64,
+            nsec: i64,
+        }
+        unsafe extern "C" {
+            fn clock_gettime(clock: i32, tp: *mut Timespec) -> i32;
+        }
+        // macOS: CLOCK_MONOTONIC_RAW (mach_continuous_time) runs on while asleep, CLOCK_UPTIME_RAW (mach_absolute_time) stops; neither
+        // follows the wall clock. Linux: CLOCK_BOOTTIME and CLOCK_MONOTONIC
+        let (runs_on, stops) = if cfg!(target_os = "macos") {
+            (4, 8)
+        } else {
+            (7, 1)
+        };
+        let read = move |clock: i32| {
+            let mut t = Timespec { sec: 0, nsec: 0 };
+            // SAFETY: clock_gettime only writes the timespec it is given (64-bit fields on these 64-bit targets)
+            let ok = unsafe { clock_gettime(clock, &mut t) } == 0;
+            (ok && t.sec >= 0 && (0..1_000_000_000).contains(&t.nsec))
+                .then(|| Duration::new(t.sec as u64, t.nsec as u32))
+        };
+        (move || read(runs_on), move || read(stops))
+    };
+    #[cfg(not(any(
+        windows,
+        target_os = "macos",
+        all(target_os = "linux", target_pointer_width = "64")
+    )))]
+    let (running_on, stopping) = (|| None::<Duration>, || None::<Duration>);
+    read_clocks(first, running_on, stopping)
+}
+
+/// Reads the two clocks in the order given: (running on, stopping)
+pub fn read_clocks(
+    first: ReadFirst,
+    mut running_on: impl FnMut() -> Option<std::time::Duration>,
+    mut stopping: impl FnMut() -> Option<std::time::Duration>,
+) -> Option<(std::time::Duration, std::time::Duration)> {
+    match first {
+        ReadFirst::Stopping => {
+            let s = stopping()?;
+            Some((running_on()?, s))
+        }
+        ReadFirst::RunningOn => {
+            let r = running_on()?;
+            Some((r, stopping()?))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_pause_between_the_two_reads_never_counts_as_sleep() {
+        use std::cell::Cell;
+        use std::time::Duration;
+        // awake all along (both clocks the same), the process held up 75 s after each first read
+        let now = Cell::new(Duration::ZERO);
+        let read = |first| {
+            let n = Cell::new(0);
+            let tick = || {
+                let t = now.get();
+                n.set(n.get() + 1);
+                if n.get() == 1 {
+                    now.set(t + Duration::from_secs(75));
+                }
+                Some(t)
+            };
+            read_clocks(first, tick, tick)
+        };
+        let before = read(ReadFirst::Stopping).unwrap();
+        now.set(now.get() + Duration::from_secs(60));
+        let after = read(ReadFirst::RunningOn).unwrap();
+        let slept = (after.0 - before.0).saturating_sub(after.1 - before.1);
+        assert_eq!(slept, Duration::ZERO, "{before:?} {after:?}");
+        // the other order would count the pause as 150 s asleep
+        now.set(Duration::ZERO);
+        let before = read(ReadFirst::RunningOn).unwrap();
+        now.set(now.get() + Duration::from_secs(60));
+        let after = read(ReadFirst::Stopping).unwrap();
+        assert!((after.0 - before.0).saturating_sub(after.1 - before.1) > Duration::from_secs(5));
+    }
+
+    #[cfg(any(
+        windows,
+        target_os = "macos",
+        all(target_os = "linux", target_pointer_width = "64")
+    ))]
+    #[test]
+    fn the_two_clocks_are_read_and_run_together_while_awake() {
+        let (a0, b0) = sleep_clocks(ReadFirst::Stopping).expect("both clocks readable here");
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let (a1, b1) = sleep_clocks(ReadFirst::RunningOn).unwrap();
+        let (ran_on, stopped) = (a1 - a0, b1 - b0);
+        assert!(
+            ran_on >= std::time::Duration::from_millis(150),
+            "{ran_on:?}"
+        );
+        assert!(
+            stopped >= std::time::Duration::from_millis(150),
+            "{stopped:?}"
+        );
+        // awake: the gap between them stays well under a second (the tick count moves in steps of about 16 ms)
+        let gap = ran_on.abs_diff(stopped);
+        assert!(gap < std::time::Duration::from_millis(500), "{gap:?}");
+    }
 
     #[test]
     fn civil_days_roundtrip() {

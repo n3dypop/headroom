@@ -11,7 +11,7 @@
 // From here down to "Widget rendering below" everything is a pure function that doesn't use the Scriptable API (tested with Node).
 // Startup is at the end (main runs after all constants are defined)
 
-const HEADROOM_VERSION = 99;
+const HEADROOM_VERSION = 100;
 /** View version this script can read (VIEW_VERSION in packages/core) */
 const VIEW_VERSION = 1;
 /** Settings are stored as JSON in a single Keychain item (so the server and credentials are always read as a pair) */
@@ -83,7 +83,7 @@ function widgetSize(family, screen) {
  * reset: reset (↻ and timer) / marks: confidence marks (approx., est.) / plan: plan / pace: consumption rate (the plan and the rate are
  * in the details only: three providers side by side leave no room for them) /
  * forecastTime: if it will likely run out, replace the reset time in the time row with the run-out time (⚠) / scoped: always show per-model and per-group limits / trend: 7-day weekly trend /
- * freshness: value freshness dot (with elapsed time when old)
+ * freshness: value freshness dot (no age beside it; the details page shows the age)
  */
 const SIZE_CONTENT = {
   small: { reset: false, marks: false, plan: false, pace: false, forecastTime: false, scoped: false, trend: false, freshness: true },
@@ -486,19 +486,15 @@ function recentSettledAt(w) {
 
 /**
  * Short mark (lock screen). ↻ for a value whose reset time has passed since its fetch (shown as 0% used until a newer value comes; left out
- * where a time row says "↻ Reset"), or the age the home screen shows next to its gray dot (32m, 2h; over 20 minutes).
- * The lock screen has no colors, so the dot itself isn't drawn: fresh values, values of unknown age (gray dot alone) and values at the limit
- * (red dot alone) get no mark, as at home. Approximate values get no mark either
+ * where a time row says "↻ Reset"). No age: the lock screen has no colors for the dot, and the details page shows the age
  */
 function shortMark(w, timeRow = false) {
-  if (w.value_status === "reset_estimated") return timeRow ? "" : RESET_MARK;
-  if ((w.value_status === "stale" || w.value_status === "old") && !w.provider_blocked) return formatDuration(w.age_minutes);
-  return "";
+  return w.value_status === "reset_estimated" && !timeRow ? RESET_MARK : "";
 }
 
-/** A limit as shown on the lock screen: its display-time values and whether its provider is at its limit (for the staleness mark) */
+/** A limit as shown on the lock screen: its display-time values */
 function lockWindow(view, provider, w, now) {
-  return { ...atDisplayTime(w, now), provider_blocked: view?.[provider]?.blocked === true };
+  return atDisplayTime(w, now);
 }
 
 /**
@@ -764,12 +760,11 @@ function freshnessOf(view, provider, now, ids = null) {
     const t = Date.parse(p?.windows?.[id]?.fetched_at ?? "");
     if (Number.isFinite(t) && (oldest === null || t < oldest)) oldest = t;
   }
-  // At the limit the red dot says enough (values are expected to stop updating), so no age is shown
+  // The dot alone: no age beside it (the details page shows it)
   if (p?.blocked === true && !limitLifted(p, list, now)) return { level: "limit", text: "" };
   if (oldest === null) return { level: "unknown", text: "" };
   const ms = Math.max(0, now.getTime() - oldest);
-  if (ms <= FRESH_MAX_MINUTES * 60000) return { level: "fresh", text: "" };
-  return { level: ms <= CAUTION_MAX_MINUTES * 60000 ? "stale" : "old", text: formatDuration(Math.floor(ms / 60000)) };
+  return { level: ms <= FRESH_MAX_MINUTES * 60000 ? "fresh" : ms <= CAUTION_MAX_MINUTES * 60000 ? "stale" : "old", text: "" };
 }
 
 /**
@@ -2241,7 +2236,7 @@ function detailHtml(input) {
   const sections = providers.map((id) => {
     const p = view?.[id] ?? null;
     const fresh = p ? freshnessOf(view, id, now) : { level: "unknown", text: "" };
-    // The age of the values beside the dot, always (the widget shows it only when old; here it stands in for each limit's own)
+    // The age of the values beside the dot, always (only here: the widget shows the dot alone; it stands in for each limit's own)
     const age = p ? providerAge(p, now) : null;
     const ageText = age === null ? "" : age < 1 ? "now" : formatDuration(age);
     // Which PC fetched them, before the age ("macbook · 3m"). A long name is cut short; the age always shows
@@ -4353,7 +4348,7 @@ function addSmallText(stack, text, size, color, shrink = 0.8) {
 }
 
 /** Color of the freshness dot */
-// Green only when fresh, gray otherwise (staleness is conveyed by the elapsed time next to it; one way of showing it)
+// Green only when fresh, gray otherwise, red at the limit (the dot alone on the widget; the details page adds the age)
 const FRESH_COLORS = { fresh: "#34C759", stale: "#8E8E93", old: "#8E8E93", unknown: "#8E8E93", limit: "#FF3B30" };
 
 /** Freshness dot (round image) */
@@ -4373,7 +4368,7 @@ function symbolImage(name) {
   }
 }
 
-/** Group header: icon, provider name (in the provider color), plan and freshness dot (with elapsed time when old) */
+/** Group header: icon, provider name (in the provider color), plan and freshness dot (no age beside it; ⚠ for previous values) */
 /**
  * Circular progress on the lock screen (like ChatGPT's built-in lock screen widget).
  * The remaining amount of the shown limit (the number and ring agree; 5h and weekly side by side get separate rings). Faded for old values. null if there is no limit (track only)
@@ -4728,7 +4723,8 @@ function addHeader(stack, group, opts) {
   name.lineLimit = 1;
   const f = opts.content.freshness ? group.freshness : null;
   const extras = [group.plan && opts.content.plan ? group.plan : null, opts.demo ? "Demo" : null].filter(Boolean);
-  // The staleness text beside the dot. A demo keeps its mark longer than this text (the dot stays): a narrow column of three still says Demo
+  // The text beside the dot: only ⚠ when previous values are shown (no age). A demo keeps its mark longer than this text (the dot stays): a
+  // narrow column of three still says Demo
   let freshText = f?.text ?? "";
   if (opts.width) {
     const fixed = () => slot + 5 + textWidth(group.name, s.name, true) + 2 + (f ? 6 + (freshText ? textWidth(freshText, s.headerSmall) + 3 : 0) : 0) + 4;
@@ -4737,7 +4733,7 @@ function addHeader(stack, group, opts) {
       if (extras.length === 1 && extras[0] === "Demo" && freshText) freshText = "";
       else extras.shift();
     }
-    // Still too wide (a narrow column of three): the staleness text loses its last part ("1h 30m" → "1h"), then goes
+    // Still too wide (a narrow column of three): the text beside the dot goes
     while (freshText && over()) {
       const parts = freshText.split(" ");
       freshText = parts.length > 1 ? parts.slice(0, -1).join(" ") : "";

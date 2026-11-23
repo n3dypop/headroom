@@ -6,7 +6,8 @@
 //!   in the middle of `/usage` means zero quota use cannot be confirmed and the provider goes into a safety stop, so the process is never
 //!   killed. A stop it couldn't wait out stays (the agent stops when its fetch ends); an agent started later never takes it.
 //! - `start`: reports a start only once the agent's session is up.
-//! - Windows uses the registry `HKCU\...\Run` (windowless `headroomw.exe agent`); Mac uses a LaunchAgent.
+//! - Windows uses a shortcut in the user's Startup folder (windowless `headroomw.exe agent`; earlier versions' `HKCU\...\Run` entry is
+//!   removed); Mac uses a LaunchAgent.
 
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
@@ -22,6 +23,7 @@ pub const LOCK_FILE: &str = "agent.lock";
 pub const STOP_WAIT: Duration = Duration::from_secs(120);
 /// How long `start` waits for the agent's session to come up
 const START_WAIT: Duration = Duration::from_secs(30);
+/// Where earlier versions registered the agent on Windows (removed on install and uninstall)
 pub const RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
 pub const RUN_VALUE: &str = "Headroom";
 pub const LAUNCH_LABEL: &str = "com.headroom.agent";
@@ -427,57 +429,184 @@ pub fn uninstall(home: &Path) -> Result<Vec<String>, String> {
     ])
 }
 
-// ---------------- Windows: HKCU Run ----------------
+// ---------------- Windows: a shortcut in the Startup folder ----------------
 
-/// Value written to Run: `"<headroomw.exe>" agent`
-pub fn run_value(program: &Path) -> String {
-    format!("\"{}\" agent", program.display())
+/// The shortcut's name in the user's Startup folder
+#[cfg(windows)]
+pub const SHORTCUT_NAME: &str = "Headroom.lnk";
+
+/// The user's Startup folder as Windows itself has it (FOLDERID_Startup: also where it was moved elsewhere). None if Windows can't say
+#[cfg(windows)]
+pub fn startup_folder() -> Option<PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    #[repr(C)]
+    struct Guid {
+        data1: u32,
+        data2: u16,
+        data3: u16,
+        data4: [u8; 8],
+    }
+    #[link(name = "shell32")]
+    unsafe extern "system" {
+        fn SHGetKnownFolderPath(
+            id: *const Guid,
+            flags: u32,
+            token: isize,
+            path: *mut *mut u16,
+        ) -> i32;
+    }
+    #[link(name = "ole32")]
+    unsafe extern "system" {
+        fn CoTaskMemFree(memory: *mut core::ffi::c_void);
+    }
+    // FOLDERID_Startup {B97D20BB-F46A-4C97-BA10-5E3608430854}
+    const STARTUP: Guid = Guid {
+        data1: 0xB97D_20BB,
+        data2: 0xF46A,
+        data3: 0x4C97,
+        data4: [0xBA, 0x10, 0x5E, 0x36, 0x08, 0x43, 0x08, 0x54],
+    };
+    // The path also while the folder is missing or can't be reached (a moved folder on a share that is away): registering creates it,
+    // and unregistering can tell a shortcut that isn't there from one it can't reach
+    const KF_FLAG_DONT_VERIFY: u32 = 0x0000_4000;
+    let mut path: *mut u16 = std::ptr::null_mut();
+    // SAFETY: the GUID has the Win32 layout; on success the function hands over a NUL-terminated wide string it allocated, read up to
+    // its NUL and then freed with CoTaskMemFree as documented (also on failure, where it may be null)
+    unsafe {
+        let ok = SHGetKnownFolderPath(&STARTUP, KF_FLAG_DONT_VERIFY, 0, &mut path) >= 0
+            && !path.is_null();
+        let folder = ok.then(|| {
+            let len = (0..).take_while(|&i| *path.add(i) != 0).count();
+            PathBuf::from(std::ffi::OsString::from_wide(std::slice::from_raw_parts(
+                path, len,
+            )))
+        });
+        CoTaskMemFree(path.cast());
+        folder.filter(|f| f.is_absolute())
+    }
+}
+
+/// Saves a shortcut with Windows' own WScript.Shell. Its paths come from the environment, never written into the script, so no
+/// quoting is needed. It starts `<headroomw.exe> agent` minimized (headroomw has no window anyway)
+#[cfg(windows)]
+pub const SHORTCUT_SCRIPT: &str = "$s = (New-Object -ComObject WScript.Shell).CreateShortcut($env:HEADROOM_SHORTCUT); \
+     $s.TargetPath = $env:HEADROOM_TARGET; $s.Arguments = 'agent'; $s.WorkingDirectory = $env:HEADROOM_TARGET_DIR; \
+     $s.WindowStyle = 7; $s.Description = 'Headroom agent'; $s.Save()";
+
+/// The PowerShell run that saves the shortcut at `shortcut` to start `target` (Windows PowerShell from the system folder, not one
+/// found on PATH)
+#[cfg(windows)]
+pub fn shortcut_command(shortcut: &Path, target: &Path) -> Command {
+    let system = std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into());
+    let mut c =
+        Command::new(PathBuf::from(system).join(r"System32\WindowsPowerShell\v1.0\powershell.exe"));
+    c.args(["-NoProfile", "-NonInteractive", "-Command", SHORTCUT_SCRIPT])
+        .env("HEADROOM_SHORTCUT", shortcut)
+        .env("HEADROOM_TARGET", target)
+        .env("HEADROOM_TARGET_DIR", target.parent().unwrap_or(target))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    c
+}
+
+/// Saves the shortcut; true once it is there
+#[cfg(windows)]
+pub fn save_shortcut(shortcut: &Path, target: &Path) -> bool {
+    use std::os::windows::process::CommandExt;
+    let _ = std::fs::remove_file(shortcut);
+    shortcut_command(shortcut, target)
+        .creation_flags(0x0800_0000)
+        .status()
+        .is_ok_and(|s| s.success())
+        && shortcut.is_file()
+}
+
+#[cfg(windows)]
+fn shortcut_path() -> Result<PathBuf, String> {
+    startup_folder()
+        .map(|f| f.join(SHORTCUT_NAME))
+        .ok_or_else(|| "Cannot find the Startup folder (Windows didn't say where it is)".into())
 }
 
 #[cfg(windows)]
 fn registration_label() -> String {
-    format!(r"{RUN_KEY}\{RUN_VALUE}")
+    shortcut_path().map_or_else(|e| e, |p| p.display().to_string())
 }
 
+/// The registry entry earlier versions started the agent from (HKCU Run). Windows can leave it unstarted at sign-in, so the Startup
+/// folder replaced it: it is removed on install and uninstall
 #[cfg(windows)]
-fn reg(args: &[&str]) -> bool {
+fn remove_run_entry() -> bool {
     use std::os::windows::process::CommandExt;
-    Command::new("reg")
-        .args(args)
-        .creation_flags(0x0800_0000)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
+    let reg = |args: &[&str]| {
+        Command::new("reg")
+            .args(args)
+            .creation_flags(0x0800_0000)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    };
+    !reg(&["query", RUN_KEY, "/v", RUN_VALUE]) || reg(&["delete", RUN_KEY, "/v", RUN_VALUE, "/f"])
 }
 
 #[cfg(windows)]
 fn register(home: &Path, _cfg: &Config) -> Result<(), String> {
-    let value = run_value(&installed_agent(home));
-    if reg(&[
-        "add", RUN_KEY, "/v", RUN_VALUE, "/t", "REG_SZ", "/d", &value, "/f",
-    ]) {
-        Ok(())
-    } else {
-        Err("Cannot register autostart (reg add failed)".into())
+    let shortcut = shortcut_path()?;
+    if let Some(folder) = shortcut.parent() {
+        let _ = std::fs::create_dir_all(folder);
     }
+    if !save_shortcut(&shortcut, &installed_agent(home)) {
+        return Err(format!(
+            "Cannot register autostart (couldn't save {})",
+            shortcut.display()
+        ));
+    }
+    // A leftover entry would start a second agent at sign-in (it ends at once, the lock being held), so it goes; failing that is harmless
+    let _ = remove_run_entry();
+    Ok(())
 }
 
 #[cfg(windows)]
 fn unregister() -> Result<(), String> {
-    if !reg(&["query", RUN_KEY, "/v", RUN_VALUE])
-        || reg(&["delete", RUN_KEY, "/v", RUN_VALUE, "/f"])
-    {
-        Ok(())
-    } else {
-        Err("Cannot remove the autostart registration (reg delete failed)".into())
+    let shortcut = shortcut_path()?;
+    if !shortcut_removed(&shortcut) {
+        return Err(format!(
+            "Cannot remove the autostart registration ({} couldn't be removed or reached)",
+            shortcut.display()
+        ));
+    }
+    if !remove_run_entry() {
+        return Err(
+            "Cannot remove the earlier autostart registration (the Run registry entry)".into(),
+        );
+    }
+    Ok(())
+}
+
+/// Whether no shortcut is left at `shortcut`: none there, or removed now. Not when it can't be removed, nor when its drive or share
+/// can't be reached (Windows reads a path on a drive that is away as missing too: the shortcut may come back with it). A folder that
+/// is missing on a drive that is there holds nothing
+#[cfg(windows)]
+pub fn shortcut_removed(shortcut: &Path) -> bool {
+    match std::fs::symlink_metadata(shortcut) {
+        Ok(_) => std::fs::remove_file(shortcut).is_ok(),
+        // The nearest folder above it that is there must be reached through: not a link (a junction) left pointing at a drive that
+        // is away, and not a drive or share that is away (none of it is there)
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => shortcut
+            .ancestors()
+            .skip(1)
+            .find(|a| std::fs::symlink_metadata(a).is_ok())
+            .is_some_and(Path::is_dir),
+        Err(_) => false,
     }
 }
 
 #[cfg(windows)]
 pub fn registered() -> bool {
-    reg(&["query", RUN_KEY, "/v", RUN_VALUE])
+    shortcut_path().is_ok_and(|p| p.is_file())
 }
 
 // ---------------- Mac: LaunchAgent ----------------
@@ -789,10 +918,142 @@ mod tests {
         let _ = std::fs::remove_dir_all(h);
     }
 
+    #[cfg(windows)]
     #[test]
-    fn run_value_quotes_the_path() {
-        let v = run_value(Path::new(r"C:\Users\a b\.headroom\bin\headroomw.exe"));
-        assert_eq!(v, r#""C:\Users\a b\.headroom\bin\headroomw.exe" agent"#);
+    fn the_startup_folder_is_the_one_windows_reports() {
+        let folder = startup_folder().expect("Windows names the Startup folder");
+        let told = Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "[Environment]::GetFolderPath('Startup')",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(
+            folder,
+            PathBuf::from(String::from_utf8_lossy(&told.stdout).trim())
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_startup_shortcut_starts_the_windowless_agent_with_its_paths_given_apart_from_the_script()
+    {
+        let target = Path::new(r"C:\Users\a b\.headroom\bin\headroomw.exe");
+        let shortcut = Path::new(r"C:\Users\a b\AppData\Roaming\Startup\Headroom.lnk");
+        let c = shortcut_command(shortcut, target);
+        assert!(
+            c.get_program()
+                .to_string_lossy()
+                .ends_with(r"System32\WindowsPowerShell\v1.0\powershell.exe"),
+            "Windows PowerShell from the system folder"
+        );
+        let args: Vec<_> = c
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            ["-NoProfile", "-NonInteractive", "-Command", SHORTCUT_SCRIPT]
+        );
+        // the paths only in the environment (a space or a quote in them can't break the script)
+        assert!(!SHORTCUT_SCRIPT.contains(r"C:\"));
+        let env: std::collections::BTreeMap<_, _> = c
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        assert_eq!(
+            env["HEADROOM_SHORTCUT"].as_deref(),
+            Some(shortcut.to_str().unwrap())
+        );
+        assert_eq!(
+            env["HEADROOM_TARGET"].as_deref(),
+            Some(target.to_str().unwrap())
+        );
+        assert_eq!(
+            env["HEADROOM_TARGET_DIR"].as_deref(),
+            Some(r"C:\Users\a b\.headroom\bin")
+        );
+        assert!(
+            SHORTCUT_SCRIPT.contains("$s.Arguments = 'agent'")
+                && SHORTCUT_SCRIPT.contains("$s.Save()")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_startup_shortcut_is_saved_where_asked_also_in_a_folder_with_spaces() {
+        // a temporary folder, never the user's Startup folder
+        let dir = std::env::temp_dir().join(format!("headroom shortcut {}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let shortcut = dir.join(SHORTCUT_NAME);
+        let target = dir.join("headroomw.exe");
+        std::fs::write(&target, b"").unwrap();
+        assert!(save_shortcut(&shortcut, &target));
+        let bytes = std::fs::read(&shortcut).unwrap();
+        // a shell link's header: its size (76) and its class ID
+        assert_eq!(&bytes[..4], &[0x4C, 0, 0, 0]);
+        assert_eq!(&bytes[4..8], &[0x01, 0x14, 0x02, 0x00]);
+        // it starts the agent: read back by Windows itself
+        let read = Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "$s = (New-Object -ComObject WScript.Shell).CreateShortcut($env:HEADROOM_SHORTCUT); $s.TargetPath + '|' + $s.Arguments",
+            ])
+            .env("HEADROOM_SHORTCUT", &shortcut)
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&read.stdout).trim(),
+            format!("{}|agent", target.display())
+        );
+        // saved again over the earlier one
+        assert!(save_shortcut(&shortcut, &target));
+        // removed: then none is left; none in a folder that is there is removed too
+        assert!(shortcut_removed(&shortcut));
+        assert!(!shortcut.exists());
+        assert!(shortcut_removed(&shortcut));
+        // a folder that isn't there on a drive that is: nothing in it, so nothing left
+        assert!(shortcut_removed(&dir.join("gone").join(SHORTCUT_NAME)));
+        // on a drive that is away: not known to be removed
+        let away = ('D'..='Z')
+            .map(|d| format!(r"{d}:\"))
+            .find(|root| !Path::new(root).exists())
+            .expect("a drive letter not in use");
+        assert!(!shortcut_removed(
+            &Path::new(&away).join(r"Startup\Headroom.lnk")
+        ));
+        assert!(!shortcut_removed(Path::new(
+            r"\\headroom-no-such-host.invalid\share\Startup\Headroom.lnk"
+        )));
+        // through a junction whose target is away (a drive taken out): not known to be removed
+        let target = dir.join("external");
+        std::fs::create_dir_all(target.join("Startup")).unwrap();
+        let junction = dir.join("linked");
+        let made = Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&junction)
+            .arg(&target)
+            .stdout(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(made.success());
+        let through = junction.join("Startup").join(SHORTCUT_NAME);
+        assert!(shortcut_removed(&through), "reached: nothing there");
+        std::fs::remove_dir_all(&target).unwrap();
+        assert!(!shortcut_removed(&through), "its target away");
+        let _ = std::fs::remove_dir(&junction);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

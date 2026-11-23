@@ -863,7 +863,7 @@ test("Large stacks full-width groups top to bottom (no confidence row); small pa
   const large = await runWidget({ family: "large", now: new Date("2026-11-16T13:30:00.000Z") });
   const l = texts(large.widget.node);
   assert.ok(!l.some((t) => t.includes("Recent:") || t.includes("Forecast:")), l.join(" | "));
-  assert.ok(l.includes("32m"), `when old, the header dot shows the time since the oldest fetch among the shown limits:${l.join(" | ")}`);
+  assert.ok(!l.includes("32m"), `when old, the header dot shows no age (the details page does):${l.join(" | ")}`);
   assert.equal(large.widget.node.children.some((c: Node) => c.kind === "stack" && c.children.filter((x) => x.kind === "stack").length === 2 && texts(c).includes("Claude") && texts(c).includes("Codex")), false, "not two side-by-side columns");
   const small = await runWidget({ family: "small" });
   const all = texts(small.widget.node);
@@ -1233,7 +1233,7 @@ test("Forecast in the bar: the amount likely used before reset is lighter, the s
 test("Freshness dot, short reset and marks", () => {
   const view = lib.sanitizeView(sampleView());
   assert.deepEqual(plain(lib.freshnessOf(view, "claude", NOW)), { level: "fresh", text: "" });
-  assert.deepEqual(plain(lib.freshnessOf(view, "claude", new Date("2026-11-16T13:30:00.000Z"))), { level: "stale", text: "32m" }, "from the oldest fetch among overall limits (12:58)");
+  assert.deepEqual(plain(lib.freshnessOf(view, "claude", new Date("2026-11-16T13:30:00.000Z"))), { level: "stale", text: "" }, "from the oldest fetch among overall limits (12:58), with no age");
   assert.equal(lib.freshnessOf(view, "claude", new Date("2026-11-16T15:30:00.000Z")).level, "old");
   assert.equal(lib.resetShort({ resets_at: "2026-11-16T15:00:00.000Z", reset_passed: false }, NOW).kind, "timer");
   assert.match(lib.resetShort({ resets_at: "2026-11-20T07:00:00.000Z", reset_passed: false }, NOW).text, /^Fri \d{2}:\d{2}$/);
@@ -1290,7 +1290,7 @@ test("Even small puts ↻ before limits that are reset (estimated), and the head
   // Claude alone keeps its rows, its 5h reset among them
   const run = await runWidget({ family: "small", parameter: "claude", response: { status: 200, body: view }, now: new Date("2026-11-16T16:01:00.000Z") });
   assert.ok(texts(run.widget.node).includes("↻ 100%"), texts(run.widget.node).join(" | "));
-  assert.deepEqual(plain(lib.freshnessOf(lib.sanitizeView(view), "claude", new Date("2026-11-16T16:01:00.000Z"))), { level: "stale", text: "26m" });
+  assert.deepEqual(plain(lib.freshnessOf(lib.sanitizeView(view), "claude", new Date("2026-11-16T16:01:00.000Z"))), { level: "stale", text: "" });
 });
 
 test("The forecast uses Cron's rate and the remaining amount at draw time, from draw time until reset; not drawn after the run-out time passes", () => {
@@ -1366,7 +1366,8 @@ test("When a limit is named, the freshness dot uses the fetch times of the shown
   const view = sampleView();
   view.claude!.windows.seven_day!.fetched_at = "2026-11-16T12:30:00.000Z";
   const run = await runWidget({ family: "small", parameter: "claude, wk", response: { status: 200, body: view } });
-  assert.ok(texts(run.widget.node).includes("30m"), texts(run.widget.node).join(" | "));
+  assert.ok(!texts(run.widget.node).includes("30m"), `the dot alone, no age: ${texts(run.widget.node).join(" | ")}`);
+  assert.equal(lib.freshnessOf(lib.sanitizeView(view), "claude", NOW, ["seven_day"]).level, "stale");
 });
 
 test("The large height estimate includes the trend's minimum height, and groups without rows get no trend", async () => {
@@ -1655,7 +1656,7 @@ test("Large/medium: limit names and time rows use the same font size across the 
 test("Demo: draws every state with made-up values only (no network, no saving; Demo in the header and on the lock screen)", async () => {
   const now = new Date("2026-11-16T13:05:00.000Z");
   const expect: Record<string, RegExp> = {
-    normal: /Fable wk/, runout: /Wk limit/, no5h: /Not available|5h limit/, stale: /^30m$|30m ago/,
+    normal: /Fable wk/, runout: /Wk limit/, no5h: /Not available|5h limit/, stale: /Wk limit/,
     reset: /Reset \(est\.\)|^0%$/, offline: /Can't update/, error: /Sign in required/, nochart: /No weekly data yet/,
     three: /^Argon wk$/, unsupported: /^Not set up$/, reached: /^0%$/, firstuse: /On first use/, attention: /Paused|Sign in required/,
   };
@@ -1740,7 +1741,7 @@ test("Lock screen: circular progress around the icon. The rectangle shows the on
   // The test script has no PNG embedded, so the ring holds the initial (the icon if there is a PNG)
   assert.ok(rings[0]!.props.data || (rings[0]!.props.drawnTexts as string[]).includes("X"), "the icon is inside the ring");
   const r = texts(rect.widget.node);
-  assert.ok(r.includes("Wk limit") && !r.some((x) => x.includes("Codex")) && r.includes("71%") && r.includes("31m"), r.join(" | "));
+  assert.ok(r.includes("Wk limit") && !r.some((x) => x.includes("Codex")) && r.includes("71%") && !r.includes("31m"), r.join(" | "));
   assert.ok(images(rect.widget.node).some((n) => n.props.symbol === lib.TIME_SYMBOLS.reset), "reset time");
   const inline = await runWidget({ family: "accessoryInline", parameter: "codex" });
   // the weekday and time in the device's time zone (the test machine's)
@@ -1750,7 +1751,7 @@ test("Lock screen: circular progress around the icon. The rectangle shows the on
   const circular = await runWidget({ family: "accessoryCircular", now: later });
   const ring = images(circular.widget.node).find((n) => n.props.ring);
   assert.equal((ring?.props.drawnTexts as string[]).at(-1), "wk", "the limit's name is inside the ring (below the icon)");
-  assert.deepEqual(texts(circular.widget.node), ["71% 31m"], "what is left under it");
+  assert.deepEqual(texts(circular.widget.node), ["71%"], "what is left under it, with no age");
   // The ring is the shown limit's remaining (matches the number)
   const now = new Date("2026-11-16T13:05:00.000Z");
   const view = lib.demoResult("runout", now).view;
@@ -1764,12 +1765,11 @@ test("Lock screen: circular progress around the icon. The rectangle shows the on
   assert.ok(images(warn.widget.node).some((n) => n.props.symbol === lib.TIME_SYMBOLS.warn), texts(warn.widget.node).join(" | "));
 });
 
-test("Lock screen marks stack reset estimate, staleness and approximation (also with the previous-value ⚠)", async () => {
-  // The same as the text next to the home screen's dot: the age past 15 minutes, nothing when fresh, of unknown age or at the limit
-  assert.equal(lib.shortMark({ value_status: "old", age_minutes: 130, recent_quality: "approx" }), "2h 10m", "approximations get no mark");
-  assert.equal(lib.shortMark({ value_status: "stale", age_minutes: 20, recent_quality: "approx" }), "20m");
-  assert.equal(lib.shortMark({ value_status: "stale", age_minutes: 20, provider_blocked: true }), "", "at the limit, no age (the red dot alone at home)");
-  assert.equal(lib.shortMark({ value_status: null }), "", "unknown age (the gray dot alone at home)");
+test("Lock screen marks: the reset estimate, never the age (also with the previous-value ⚠)", async () => {
+  // No age, old or not (the details page shows it)
+  assert.equal(lib.shortMark({ value_status: "old", age_minutes: 130, recent_quality: "approx" }), "");
+  assert.equal(lib.shortMark({ value_status: "stale", age_minutes: 20 }), "");
+  assert.equal(lib.shortMark({ value_status: null }), "");
   assert.equal(lib.shortMark({ value_status: "fresh", age_minutes: 3 }), "");
   assert.equal(lib.shortMark({ value_status: "reset_estimated", recent_quality: "unknown" }), "↻");
   assert.equal(lib.shortMark({ value_status: "reset_estimated" }, true), "", "left to the time row (↻ Reset) where there is one");
@@ -1943,7 +1943,7 @@ test("Lock screen ⚠ times also trigger a redraw; ②'s heading is the limit al
   assert.equal((drawn["Wk limit"] as any)?.size, lib.LOCK_TEXT.head, JSON.stringify(drawn));
   const left = texts(short.widget.node).find((x) => /^\d+(\.\d)?%$/.test(x))!;
   assert.equal((drawn[left] as any)?.size, lib.LOCK_TEXT.pct, JSON.stringify(drawn));
-  assert.ok(texts(short.widget.node).some((x) => /^\d+m$/.test(x)), "the staleness mark is next to the remaining value");
+  assert.ok(!texts(short.widget.node).some((x) => /^\d+m$/.test(x)), "no age next to the remaining value");
 });
 
 test("Why a limit is missing (No 5h vs a failed fetch), each provider named, and short marks for two side by side", async () => {
@@ -1965,11 +1965,11 @@ test("Why a limit is missing (No 5h vs a failed fetch), each provider named, and
   assert.ok(/^Claude 5h 30%/.test(texts(least.widget.node)[0]!), `nothing named: the one with the least left: ${texts(least.widget.node)[0]}`);
   const rect = await runWidget({ family: "accessoryRectangular", parameter: "claude, 5h", response: body(error), now });
   assert.ok(texts(rect.widget.node).includes("Claude: Sign in required"), texts(rect.widget.node).join(" | "));
-  // Staleness marks are short when two are side by side
+  // Two side by side: the limit's name with no age, also when old
   const late = new Date("2026-11-16T13:30:00.000Z");
   const pair = await runWidget({ family: "accessoryRectangular", parameter: "claude, codex, wk", now: late });
   const labels = texts(pair.widget.node);
-  assert.ok(labels.some((x) => /^Wk limit \d+m$/.test(x)), labels.join(" | "));
+  assert.ok(labels.includes("Wk limit") && !labels.some((x) => /\d+m$/.test(x)), labels.join(" | "));
   for (const x of labels.filter((x) => /Wk|wk/.test(x))) assert.ok(lib.textWidth(x, 9) * 0.8 <= 76, x);
 });
 

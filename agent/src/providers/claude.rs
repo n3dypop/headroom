@@ -97,6 +97,8 @@ pub enum Diag {
     /// The service denies this account, shown by a run whose zero use can't be confirmed: both stops (the shared one and the
     /// safety stop)
     AccessDeniedUnverified,
+    /// `/usage` didn't finish because the computer slept while it ran: an ordinary failure, tried again at the next check
+    Suspended,
 }
 
 impl Diag {
@@ -104,6 +106,9 @@ impl Diag {
         match self {
             Diag::CliNotFound => {
                 "claude CLI not found (set claude.claude_bin in config.toml, or PATH)"
+            }
+            Diag::Suspended => {
+                "/usage was cut off because the computer slept while it ran; tries again at the next check"
             }
             Diag::CliStartFailed => "Cannot start the claude CLI",
             Diag::UnsupportedCli => {
@@ -404,7 +409,7 @@ impl ClaudeCli for RealCli {
         let out = run_with_timeout(cmd, AUTH_TIMEOUT).map_err(|e| match e {
             RunError::NotFound => Diag::CliNotFound,
             RunError::StartFailed => Diag::CliStartFailed,
-            RunError::Timeout => Diag::AuthTimeout,
+            RunError::Timeout | RunError::Suspended => Diag::AuthTimeout,
         })?;
         parse_version(&out.stdout)
             .map(|(a, b, c)| format!("{a}.{b}.{c}"))
@@ -417,7 +422,7 @@ impl ClaudeCli for RealCli {
         let out = run_with_timeout(cmd, AUTH_TIMEOUT).map_err(|e| match e {
             RunError::NotFound => Diag::CliNotFound,
             RunError::StartFailed => Diag::CliStartFailed,
-            RunError::Timeout => Diag::AuthTimeout,
+            RunError::Timeout | RunError::Suspended => Diag::AuthTimeout,
         })?;
         match serde_json::from_str::<Value>(out.stdout.trim()) {
             Ok(v) => Ok(parse_auth_status(&v, out.success)),
@@ -1691,6 +1696,28 @@ pub enum RunError {
     NotFound,
     StartFailed,
     Timeout,
+    /// Past its deadline, after the computer slept while it ran: cut off by the sleep, not hung on its own
+    Suspended,
+}
+
+/// The least sleep that counts: the OS's two clocks (crate::time::sleep_clocks) drift apart by more than this only while asleep
+const SUSPEND_MIN: Duration = Duration::from_secs(5);
+
+/// Whether the computer slept between two readings of the OS's two clocks (one that runs on while asleep, one that stops). A reading
+/// that is missing tells nothing: not slept (a timeout then stays a safety stop)
+pub fn slept_during(
+    before: Option<(Duration, Duration)>,
+    after: Option<(Duration, Duration)>,
+) -> bool {
+    match (before, after) {
+        (Some((total0, awake0)), Some((total1, awake1))) => {
+            total1
+                .saturating_sub(total0)
+                .saturating_sub(awake1.saturating_sub(awake0))
+                > SUSPEND_MIN
+        }
+        _ => false,
+    }
 }
 
 /// Run a child process with a deadline. Past the deadline, kill and reap it and return.
@@ -1733,10 +1760,22 @@ struct PipeText {
 }
 
 fn run_child(
-    mut cmd: Command,
+    cmd: Command,
     timeout: Duration,
     keep_stderr: bool,
 ) -> Result<(RunOutput, bool), RunError> {
+    run_child_with(cmd, timeout, keep_stderr, crate::time::sleep_clocks)
+}
+
+/// run_child with the clocks that tell a sleep (`clocks`: crate::time::sleep_clocks, or a stand-in in tests)
+fn run_child_with(
+    mut cmd: Command,
+    timeout: Duration,
+    keep_stderr: bool,
+    clocks: fn(crate::time::ReadFirst) -> Option<(Duration, Duration)>,
+) -> Result<(RunOutput, bool), RunError> {
+    // Read before the child starts, so a sleep at any point of the run counts
+    let before = clocks(crate::time::ReadFirst::Stopping);
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(if keep_stderr {
@@ -1808,9 +1847,16 @@ fn run_child(
             }
             Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(50)),
             _ => {
+                // Read once the timeout is decided, so a sleep up to that point counts (Windows' Instant runs on while asleep,
+                // macOS's stops: either way the two clocks tell)
+                let slept = slept_during(before, clocks(crate::time::ReadFirst::RunningOn));
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err(RunError::Timeout);
+                return Err(if slept {
+                    RunError::Suspended
+                } else {
+                    RunError::Timeout
+                });
             }
         }
     }
@@ -1885,6 +1931,9 @@ pub fn classify_usage_output(r: Result<CmdOutput, RunError>) -> Result<String, U
         Err(RunError::NotFound) => Err(UsageError::Retry(Diag::CliNotFound)),
         Err(RunError::StartFailed) => Err(UsageError::Retry(Diag::CliStartFailed)),
         Err(RunError::Timeout) => Err(UsageError::Stop(Diag::UsageTimeout)),
+        // Cut off by the computer's sleep: tried again like any failure, without a safety stop (the user's choice: a laptop sleeping
+        // in the middle of a fetch needs no resume by hand)
+        Err(RunError::Suspended) => Err(UsageError::Retry(Diag::Suspended)),
         // A denial of the account shown by output that can't confirm zero use: both stops
         Ok(out) => match serde_json::from_str::<Value>(out.stdout.trim()) {
             Ok(v) => match check_usage_result(&v) {
@@ -3832,6 +3881,52 @@ Current session limit for org: 100% used
     }
 
     #[test]
+    fn a_run_cut_off_by_the_computer_s_sleep_is_an_ordinary_failure_tried_again() {
+        // the OS's two clocks (one runs on while asleep, one stops) drift apart only while asleep
+        let s = Duration::from_secs;
+        let at = |total: u64, awake: u64| Some((s(total), s(awake)));
+        assert!(
+            !slept_during(at(100, 100), at(130, 130)),
+            "awake (also busy, or with the wall clock set)"
+        );
+        assert!(
+            !slept_during(at(100, 100), at(134, 130)),
+            "a few seconds' drift"
+        );
+        assert!(
+            slept_during(at(100, 100), at(100 + 84 * 60, 130)),
+            "asleep for 84 minutes"
+        );
+        assert!(
+            !slept_during(None, at(9_000, 130)),
+            "a reading missing: not slept (a timeout stays a safety stop)"
+        );
+        assert!(!slept_during(at(100, 100), None));
+        // past the deadline after a sleep: tried again, no safety stop; without one, still a safety stop
+        assert_eq!(
+            classify_usage_output(Err(RunError::Suspended)),
+            Err(UsageError::Retry(Diag::Suspended))
+        );
+        assert_eq!(
+            classify_usage_run(Err(RunError::Suspended)),
+            Err(UsageError::Retry(Diag::Suspended))
+        );
+        let (mut p, fake, h) = provider("suspended", vec![Err(UsageError::Retry(Diag::Suspended))]);
+        let snap = p.collect(NOW, false);
+        assert!(!p.state.guard_tripped, "no safety stop");
+        assert_eq!(snap.error.as_deref(), Some(Diag::Suspended.message()));
+        assert_eq!(
+            p.take_run(),
+            Some(crate::providers::Run::Ran(
+                crate::providers::Outcome::Failed
+            )),
+            "the attempt ends as failed: the shared turn is handed back, other PCs fetch on"
+        );
+        assert_eq!(fake.calls(), 1);
+        let _ = std::fs::remove_dir_all(h);
+    }
+
+    #[test]
     fn stopped_provider_does_not_resume_on_its_own() {
         let (mut p, fake, h) = provider("stop", vec![Err(UsageError::Stop(Diag::UsageTimeout))]);
         let snap = p.collect(NOW, false);
@@ -4119,6 +4214,44 @@ Current session limit for org: 100% used
             started.elapsed() < Duration::from_secs(8),
             "{:?}",
             started.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_child_past_its_deadline_after_a_sleep_is_told_apart_from_one_that_hung() {
+        let hanging = || {
+            let mut c = if cfg!(windows) {
+                let mut c = Command::new("powershell");
+                c.args(["-NoProfile", "-Command", "Start-Sleep -Seconds 30"]);
+                c
+            } else {
+                let mut c = Command::new("sleep");
+                c.arg("30");
+                c
+            };
+            c.env("HEADROOM_TEST", "1");
+            c
+        };
+        // stand-in clocks: read before the child starts, then when the timeout is decided
+        static SLEPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        fn slept_10_minutes(_: crate::time::ReadFirst) -> Option<(Duration, Duration)> {
+            let n = SLEPT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Some((Duration::from_secs(600 * n), Duration::ZERO))
+        }
+        fn awake(_: crate::time::ReadFirst) -> Option<(Duration, Duration)> {
+            Some((Duration::from_secs(1), Duration::from_secs(1)))
+        }
+        fn unreadable(_: crate::time::ReadFirst) -> Option<(Duration, Duration)> {
+            None
+        }
+        let run =
+            |clocks| run_child_with(hanging(), Duration::from_secs(1), true, clocks).map(|_| ());
+        assert_eq!(run(slept_10_minutes), Err(RunError::Suspended));
+        assert_eq!(run(awake), Err(RunError::Timeout));
+        assert_eq!(
+            run(unreadable),
+            Err(RunError::Timeout),
+            "unknown: stays a safety stop"
         );
     }
 

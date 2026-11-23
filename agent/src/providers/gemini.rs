@@ -104,11 +104,16 @@ pub enum Diag {
     AccessDeniedUnverified,
     /// The service rate limited the request (a 429, RESOURCE_EXHAUSTED), shown by a run that confirmed zero use: every PC waits
     RateLimited,
+    /// `/usage` didn't finish because the computer slept while it ran: an ordinary failure, tried again at the next check
+    Suspended,
 }
 
 impl Diag {
     pub fn message(self) -> &'static str {
         match self {
+            Diag::Suspended => {
+                "/usage was cut off because the computer slept while it ran; tries again at the next check"
+            }
             Diag::CliNotFound => {
                 "The Antigravity CLI (agy) was not found. Install it, or set [gemini] gemini_bin in config.toml"
             }
@@ -721,7 +726,7 @@ pub fn version_from_output(r: Result<RunOutput, RunError>) -> Result<String, Dia
     let out = r.map_err(|e| match e {
         RunError::NotFound => Diag::CliNotFound,
         RunError::StartFailed => Diag::CliStartFailed,
-        RunError::Timeout => Diag::VersionTimeout,
+        RunError::Timeout | RunError::Suspended => Diag::VersionTimeout,
     })?;
     if out.code != Some(0) || !out.complete {
         return Err(Diag::UnrecognizedOutput);
@@ -814,6 +819,9 @@ pub fn classify_usage_output(r: Result<RunOutput, RunError>) -> Result<Value, Us
         Err(RunError::NotFound) => Err(UsageError::Retry(Diag::CliNotFound)),
         Err(RunError::StartFailed) => Err(UsageError::Retry(Diag::CliStartFailed)),
         Err(RunError::Timeout) => Err(UsageError::Stop(Diag::UsageTimeout)),
+        // Cut off by the computer's sleep: tried again like any failure, without a safety stop (the user's choice: a laptop sleeping
+        // in the middle of a fetch needs no resume by hand)
+        Err(RunError::Suspended) => Err(UsageError::Retry(Diag::Suspended)),
         // Output not read whole (cut at its size limit, not UTF-8, still held open when the run ended): what it said can't be seen
         Ok(out) if !out.complete => Err(UsageError::Stop(Diag::Unverifiable)),
         Ok(out) => {
@@ -3027,6 +3035,12 @@ mod tests {
             classify_usage_output(Err(RunError::Timeout)),
             Err(UsageError::Stop(Diag::UsageTimeout))
         ));
+        // cut off by the computer's sleep: an ordinary failure, tried again (no safety stop)
+        assert!(matches!(
+            classify_usage_output(Err(RunError::Suspended)),
+            Err(UsageError::Retry(Diag::Suspended))
+        ));
+        assert_eq!(Diag::Suspended.error_code(), ErrorCode::FetchFailed);
         assert!(matches!(
             classify_usage_output(Err(RunError::NotFound)),
             Err(UsageError::Retry(Diag::CliNotFound))
