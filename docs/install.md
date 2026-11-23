@@ -175,7 +175,7 @@ Packages are published on the [Releases page](https://github.com/n3dypop/headroo
 gh attestation verify <file> --repo n3dypop/headroom --signer-workflow n3dypop/headroom/.github/workflows/release.yml --source-ref refs/tags/v<version>
 ```
 
-In the steps below, set `V` to the version you install (for example `0.2.2`).
+In the steps below, set `V` to the version you install (for example `0.2.3`).
 
 Always download and extract into a new, empty folder. An older package you keep for rollback must not be overwritten, even one with the same version.
 
