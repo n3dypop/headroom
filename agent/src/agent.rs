@@ -24,6 +24,11 @@ use crate::time::{MINUTE_MS, now_ms};
 /// Wake at least this often even with nothing scheduled (guards against clock changes and resume from sleep)
 const MAX_SLEEP_MS: i64 = 5 * MINUTE_MS;
 const MIN_SLEEP_MS: i64 = 1_000;
+/// A wait at least this long lets the agent hand its unused memory back first (idle_trim): also the waits just under a minute between
+/// the parts of a long queue being sent
+const TRIM_WAIT_MS: i64 = 30_000;
+/// At most once in this long (statusLine events wake the agent often while Claude Code is in use)
+const TRIM_EVERY_MS: i64 = 60_000;
 
 pub fn make_providers(home: &Path, cfg: &Config, log: &Logger) -> Vec<Box<dyn Provider>> {
     // Each provider keeps only the floor between its fetches: the common schedule plans the interval with its jitter (schedule.rs)
@@ -172,6 +177,8 @@ pub fn run(home: &Path) -> i32 {
     crate::install::drop_other_stops(home, &session);
     requests::tidy(home, now_ms(), &log);
     let mut tidied_at = Instant::now();
+    // When the agent last handed its unused memory back (never yet)
+    let mut trimmed_at: Option<Instant> = None;
     // A request's result that couldn't be written yet (written first, before another request is taken)
     let mut unsaved: Option<RequestOutcome> = None;
 
@@ -327,6 +334,10 @@ pub fn run(home: &Path) -> i32 {
         // More requests waiting (or a result to write): the next round comes at once
         let next = if more || unsaved.is_some() { now } else { next };
         let wait = next.saturating_sub(now).clamp(MIN_SLEEP_MS, MAX_SLEEP_MS);
+        if should_trim(wait, trimmed_at.map(|t| t.elapsed())) {
+            idle_trim();
+            trimmed_at = Some(Instant::now());
+        }
         match rx.recv_timeout(Duration::from_millis(wait as u64)) {
             Ok(Event::StopRequested) => {}
             Ok(ev) => {
@@ -340,6 +351,32 @@ pub fn run(home: &Path) -> i32 {
                 std::thread::sleep(Duration::from_millis(wait as u64))
             }
         }
+    }
+}
+
+/// Whether to hand unused memory back before a wait of `wait_ms`: a long one, and not done within TRIM_EVERY_MS
+fn should_trim(wait_ms: i64, since_last: Option<Duration>) -> bool {
+    wait_ms >= TRIM_WAIT_MS
+        && since_last.is_none_or(|d| d >= Duration::from_millis(TRIM_EVERY_MS as u64))
+}
+
+/// Hands the pages the agent isn't using back to the OS before it waits (Windows: its working set is emptied; what it needs again is
+/// read back as it is used). Elsewhere nothing: true where it was done
+fn idle_trim() -> bool {
+    #[cfg(windows)]
+    {
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GetCurrentProcess() -> isize;
+            fn SetProcessWorkingSetSize(process: isize, minimum: usize, maximum: usize) -> i32;
+        }
+        // SAFETY: the current process's pseudo-handle; (SIZE_T)-1 for both sizes removes as many pages as possible from its working
+        // set, as documented, and changes nothing else
+        unsafe { SetProcessWorkingSetSize(GetCurrentProcess(), usize::MAX, usize::MAX) != 0 }
+    }
+    #[cfg(not(windows))]
+    {
+        false
     }
 }
 
@@ -1218,6 +1255,77 @@ mod tests {
     use std::rc::Rc;
 
     const T0: i64 = 1_800_000_000_000;
+
+    #[test]
+    fn unused_memory_is_handed_back_before_a_long_wait_at_most_once_a_minute() {
+        let s = Duration::from_secs;
+        assert!(
+            should_trim(TRIM_WAIT_MS, None),
+            "a long wait, never trimmed yet"
+        );
+        assert!(should_trim(MAX_SLEEP_MS, Some(s(60))));
+        // a long queue sent in parts: the next part is due a minute after the last one began, so the wait is just under a minute
+        assert!(
+            should_trim(59_750, Some(s(60))),
+            "between the parts of a queue being sent"
+        );
+        assert!(!should_trim(5_000, None), "a few seconds");
+        assert!(
+            !should_trim(TRIM_WAIT_MS - 1, None),
+            "a short wait (a burst of events)"
+        );
+        assert!(
+            !should_trim(MAX_SLEEP_MS, Some(s(59))),
+            "trimmed within the minute"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn handing_memory_back_empties_the_working_set_on_windows() {
+        #[repr(C)]
+        #[derive(Default)]
+        struct Counters {
+            cb: u32,
+            page_faults: u32,
+            peak_working_set: usize,
+            working_set: usize,
+            quota_peak_paged: usize,
+            quota_paged: usize,
+            quota_peak_non_paged: usize,
+            quota_non_paged: usize,
+            pagefile: usize,
+            peak_pagefile: usize,
+        }
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GetCurrentProcess() -> isize;
+            fn K32GetProcessMemoryInfo(process: isize, counters: *mut Counters, size: u32) -> i32;
+        }
+        let working_set = || {
+            let mut c = Counters {
+                cb: std::mem::size_of::<Counters>() as u32,
+                ..Default::default()
+            };
+            // SAFETY: the struct has the layout of PROCESS_MEMORY_COUNTERS with its size set, and the function only writes to it
+            assert_ne!(
+                unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb) },
+                0
+            );
+            c.working_set
+        };
+        // touch some memory so there is something to hand back
+        let block = vec![1u8; 32 * 1024 * 1024];
+        assert_eq!(
+            block.iter().map(|&b| b as usize).sum::<usize>(),
+            block.len()
+        );
+        let before = working_set();
+        assert!(idle_trim());
+        let after = working_set();
+        assert!(after < before / 2, "{before} -> {after}");
+        drop(block);
+    }
 
     thread_local! {
         static NOW: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
