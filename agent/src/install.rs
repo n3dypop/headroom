@@ -1013,9 +1013,14 @@ mod tests {
             .env("HEADROOM_SHORTCUT", &shortcut)
             .output()
             .unwrap();
+        let told = String::from_utf8_lossy(&read.stdout).trim().to_string();
+        let (path, args) = told.rsplit_once('|').expect("path|arguments");
+        assert_eq!(args, "agent");
+        // the same file (Windows may write it with the long names of a folder given by its short name, as RUNNER~1)
         assert_eq!(
-            String::from_utf8_lossy(&read.stdout).trim(),
-            format!("{}|agent", target.display())
+            std::fs::canonicalize(path).unwrap(),
+            std::fs::canonicalize(&target).unwrap(),
+            "{told}"
         );
         // saved again over the earlier one
         assert!(save_shortcut(&shortcut, &target));
