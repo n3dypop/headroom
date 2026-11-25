@@ -193,9 +193,18 @@ class Node {
   }
 }
 
+/** Whether the stand-in stacks have addRefreshButton (Scriptable 1.8 or newer), per run */
+let refreshButtons = false;
+/** A Scriptable 1.8 whose stack action fails (the refresh control must not stay as words that can't be tapped) */
+let actionThrows = false;
+
 function makeStack(kind: string): any {
   const node = new Node(kind);
+  const refresh = refreshButtons
+    ? { addRefreshButton(title: string) { node.children.push(new Node("refresh", { title })); }, setAction(title: string, o: { id: string }) { if (actionThrows) throw new Error("no action"); node.props.action = { title, id: o.id }; } }
+    : {};
   return {
+    ...refresh,
     node,
     layoutHorizontally() { node.props.dir = "h"; }, layoutVertically() { node.props.dir = "v"; },
     centerAlignContent() { node.props.align = "center"; }, topAlignContent() { node.props.align = "top"; }, bottomAlignContent() { node.props.align = "bottom"; },
@@ -300,6 +309,8 @@ interface RunOptions {
   demo?: string;
   /** Device screen width (Device.screenSize; omit for no Device) */
   screen?: number;
+  /** Device.systemVersion (gives a Device without a screen size when no screen is given) */
+  systemVersion?: string;
   /** Image.fromData returns null (broken image) */
   badImage?: boolean;
   /** Response per URL (return undefined to use response) */
@@ -331,6 +342,8 @@ interface Notifier {
 const newNotifier = (): Notifier => ({ pending: new Map(), delivered: new Map(), log: [] });
 
 async function runWidget(opts: RunOptions) {
+  refreshButtons = Boolean((opts as any).refreshButtons);
+  actionThrows = Boolean((opts as any).actionThrows);
   const keychain = new Map(Object.entries(opts.keychain ?? { "headroom.url": "https://headroom.example.com", "headroom.token": "read-token-xyz" }));
   const sheets = Array.isArray(opts.app?.menu) ? [...opts.app!.menu] : [];
   const shownSizes: string[] = [];
@@ -471,9 +484,9 @@ async function runWidget(opts: RunOptions) {
     DrawContext: class {
       size: unknown; opaque = true; respectScreenScale = false; fills: unknown[] = []; strokes = 0; widths: number[] = [];
       addPath() {} setFillColor(c: unknown) { this.fills.push(c); } fillPath() {}
-      setStrokeColor() {} setLineWidth(w: number) { this.widths.push(w); } strokePath() { this.strokes++; } fillEllipse() {}
+      setStrokeColor() {} setLineWidth(w: number) { this.widths.push(w); } strokePath() { this.strokes++; } strokeRect() { this.strokes++; } fillEllipse() {}
       strokeEllipse() { this.ellipses++; } ellipses = 0; drawn: any[] = []; iconRects: any[] = []; drawImageInRect(img: any, rect: any) { this.drawn.push(img); this.iconRects.push(rect); }
-      texts: string[] = []; setFont() {} setTextColor() {} setTextAlignedCenter() {} drawTextInRect(text: string) { this.texts.push(text); }
+      texts: string[] = []; setFont() {} setTextColor() {} setTextAlignedCenter() {} drawTextInRect(text: string) { this.texts.push(text); } drawText(text: string) { this.texts.push(text); }
       getImage() { return { fills: this.fills, strokes: this.strokes, size: this.size, widths: this.widths, ellipses: this.ellipses, icon: this.drawn[0], iconRect: this.iconRects[0], texts: this.texts }; }
     },
     Size: class { w: number; h: number; constructor(w: number, h: number) { this.w = w; this.h = h; } },
@@ -486,7 +499,10 @@ async function runWidget(opts: RunOptions) {
       return (size?: number) => ({ name, size });
     } }),
     SFSymbol: { named: (name: string) => ({ image: { symbol: name } }) },
-    ...(opts.screen ? { Device: { screenSize: () => ({ width: opts.screen, height: ({ 430: 932, 393: 852, 390: 844, 375: 812, 320: 568 } as Record<number, number>)[opts.screen!] ?? 900 }) } } : {}),
+    ...(opts.screen || opts.systemVersion ? { Device: {
+      ...(opts.screen ? { screenSize: () => ({ width: opts.screen, height: ({ 430: 932, 393: 852, 390: 844, 375: 812, 320: 568 } as Record<number, number>)[opts.screen!] ?? 900 }) } : {}),
+      systemVersion: () => opts.systemVersion ?? "26.0",
+    } } : {}),
     Data: { fromBase64String: (s: string) => ({ base64: s }) },
     Image: { fromData: (d: { base64: string }) => (opts.badImage ? null : { data: d.base64 }) },
     Alert: class {
@@ -1163,7 +1179,7 @@ test("Medium: column width is half the inner width and bars match it (not shifte
   assert.ok(bars.length >= 4 && bars.every((b) => (b.props.size as any).w === colWidth), JSON.stringify(bars.map((b) => b.props.size)));
 });
 
-test("Small: content is centered (even padding) with a fixed gap between Claude and Codex. Large shows the missing 5h limit in the same form as other limits", async () => {
+test("Small: content is centered (even padding) with a gap between Claude and Codex. Large shows the missing 5h limit in the same form as other limits", async () => {
   const small = await runWidget({ family: "small" });
   const kids = small.widget.node.children;
   assert.deepEqual(kids.map((c: Node) => (c.kind === "spacer" ? `spacer:${c.props.length ?? "flex"}` : c.kind)), ["spacer:flex", "stack", "spacer:2", "spacer:flex"], "centered vertically with flexible spacers (visual center lifted 2pt)");
@@ -1171,7 +1187,8 @@ test("Small: content is centered (even padding) with a fixed gap between Claude 
   assert.deepEqual(page.children.map((c: Node) => (c.kind === "spacer" ? `spacer:${c.props.length ?? "flex"}` : c.kind)), ["spacer:flex", "stack", "spacer:flex"], "centered horizontally too");
   const body = page.children[1]!;
   assert.equal((body.props.size as any).w, 158 - 2 * lib.PADDING.small, "inner width (the 390 row when the screen width is unknown)");
-  const gapIndex = body.children.findIndex((c: Node) => c.kind === "spacer" && c.props.length === 10);
+  // the gap between them: the usual 10 plus a share of the room left (inside the padding)
+  const gapIndex = body.children.findIndex((c: Node) => c.kind === "spacer" && (c.props.length as number) >= 10 && (c.props.length as number) <= 10 + lib.SMALL_SPREAD_MAX);
   assert.ok(gapIndex > 0 && texts({ kind: "x", children: body.children.slice(0, gapIndex), props: {} } as Node).includes("Codex"));
   assert.ok(texts({ kind: "x", children: body.children.slice(gapIndex), props: {} } as Node).includes("Claude"));
   const large = await runWidget({ family: "large" });
@@ -2997,13 +3014,13 @@ test("Most (large): by the limit named, the provider using most of it with all i
   assert.equal(order[0], lib.PROVIDER_NAMES[lib.layoutGroups(view, "large", "most, 5h", now).groups[0].provider], "the first drawn first");
 });
 
-test("Widget rows: the overall limits first (5h, then weekly), then the provider's own per-model ones, whatever the view's order", () => {
+test("Widget rows: the overall limits first (5h, then weekly), then the provider's own per-model ones, then other makers' models, whatever the view's order", () => {
   const now = new Date("2026-11-19T12:00:00");
   const demo = lib.demoResult("three", now).view;
   const g = demo.gemini;
   const view = { ...demo, gemini: { ...g, window_ids: ["partner_seven_day", "seven_day_argon", "seven_day", "partner_five_hour", "five_hour"], main_window_ids: ["seven_day", "five_hour"] } };
   const rows = plain(lib.groupsOf(view, "gemini", now, { allScoped: true })[0].rows.map((r: any) => r.window.id));
-  assert.deepEqual(rows, ["five_hour", "seven_day", "seven_day_argon"]);
+  assert.deepEqual(rows, ["five_hour", "seven_day", "seven_day_argon", "partner_five_hour", "partner_seven_day"]);
 });
 
 test("Legend dots keep the provider's color also without a trend this week (details and the large widget)", async () => {
@@ -5276,14 +5293,68 @@ test("the parameter names one to three providers in its order; empty shows Codex
   assert.deepEqual(plain(lib.groupsOf(two, "codex, claude", NOW).map((g: any) => g.provider)), ["codex", "claude"]);
 });
 
-test("a limit shown in the details only never appears on the widget, the lock screen or in reminders", () => {
+test("the header dot: another maker's model at 100% (Gemini's C+G) never keeps the provider at its limit", () => {
+  const now = new Date("2026-11-20T12:00:00.000Z");
+  const at = "2026-11-20T11:55:00.000Z";
+  const w = (id: string, used: number, resets: string, extra: any = {}) => ({ id, label: id, kind: id.includes("five") ? "session" : "weekly", scope: null, used_percent: used, resets_at: resets, fetched_at: at, ...extra });
+  const gemini = {
+    status: "ok", plan: "pro", blocked: true, error_code: null, main_window_ids: ["five_hour", "seven_day"], window_ids: ["five_hour", "seven_day", "partner_seven_day"],
+    windows: {
+      five_hour: w("five_hour", 100, "2026-11-20T11:58:00.000Z"),
+      seven_day: w("seven_day", 40, "2026-11-25T00:00:00.000Z"),
+      partner_seven_day: w("partner_seven_day", 100, "2026-11-24T00:00:00.000Z", { scope: "Claude and GPT", detail_only: true }),
+    },
+  };
+  const view = { gemini };
+  // its own 5h limit has reset since: lifted, whatever C+G shows
+  assert.notEqual(lib.freshnessOf(view, "gemini", now, ["five_hour", "seven_day", "partner_seven_day"]).level, "limit");
+  assert.equal(lib.freshnessOf(view, "gemini", now, ["five_hour", "seven_day"]).level, lib.freshnessOf(view, "gemini", now, ["five_hour", "seven_day", "partner_seven_day"]).level);
+  // its own limit still at 100% ahead: at its limit
+  const held = { gemini: { ...gemini, windows: { ...gemini.windows, seven_day: w("seven_day", 100, "2026-11-25T00:00:00.000Z") } } };
+  assert.equal(lib.freshnessOf(held, "gemini", now, ["five_hour", "seven_day", "partner_seven_day"]).level, "limit");
+});
+
+test("other makers' models a provider offers (Gemini's Claude and GPT): last on the home screen widget where rows leave room, never on the lock screen or in reminders", () => {
   const view = threeView();
   for (const allScoped of [false, true]) {
     const [gemini] = lib.groupsOf(view, "gemini", NOW, { allScoped });
     const ids = gemini.rows.map((r: any) => r.window.id);
-    assert.ok(!ids.includes("partner_five_hour"), `${allScoped}: ${ids}`);
+    assert.equal(ids[ids.length - 1], "partner_five_hour", `${allScoped}: ${ids}`);
     assert.ok(ids.includes("seven_day_argon"), "Gemini's own model limit at 100%, as Fable");
+    // not when the parameter names limits
+    assert.ok(!lib.groupsOf(view, "gemini, wk", NOW, { allScoped })[0].rows.some((r: any) => r.window?.id?.startsWith("partner_")));
   }
+  // dropped first for room: after the provider's own limits, the weekly one before the 5h one
+  const both = { ...view, gemini: { ...view.gemini, window_ids: [...view.gemini.window_ids, "partner_seven_day"], windows: { ...view.gemini.windows, partner_seven_day: { ...view.gemini.windows.partner_five_hour, id: "partner_seven_day" } } } };
+  const rows = lib.groupsOf(both, "gemini", NOW, { allScoped: true })[0].rows;
+  const kept = (n: number) => plain(lib.visibleRows(rows, n).map((r: any) => r.window.id));
+  assert.deepEqual(kept(5), ["five_hour", "seven_day", "seven_day_argon", "partner_five_hour", "partner_seven_day"]);
+  assert.deepEqual(kept(4), ["five_hour", "seven_day", "seven_day_argon", "partner_seven_day"], "the weekly one when only one fits");
+  assert.deepEqual(kept(3), ["five_hour", "seven_day", "seven_day_argon"], "never in place of the provider's own");
+  assert.ok(lib.rowRank({ kind: "window", window: { scope: "Argon", detail_only: false, id: "seven_day_argon" } }) < lib.rowRank(rows[4]));
+  // across providers, too: the rows dropped for height are these first (three columns of three on the large widget)
+  const large = lib.layoutGroups(both, "large", "", NOW, { screen: { width: 390, height: 844 } });
+  const gem = large.groups.find((g: any) => g.provider === "gemini");
+  assert.deepEqual(plain(gem.rows.map((r: any) => r.window.id)), ["five_hour", "seven_day", "seven_day_argon"]);
+  // most: other makers' models only when it names no limit (5h, wk name the provider's own)
+  for (const [p, has] of [["gemini, most, 5h", false], ["gemini, claude, most, wk", false], ["gemini, most", true]] as const) {
+    const g = lib.layoutGroups(both, "large", p, NOW, { screen: { width: 430, height: 932 } }).groups.find((x: any) => x.provider === "gemini");
+    assert.equal(g.rows.some((r: any) => r.window?.detail_only), has, p);
+  }
+  const alone = lib.layoutGroups(both, "large", "gemini", NOW, { screen: { width: 390, height: 844 } });
+  assert.ok(alone.groups[0].rows.some((r: any) => r.window.id === "partner_seven_day"), "Gemini alone: there is room");
+  // without Argon (its own model limit gone): Claude/GPT wk takes the third row of the large widget's three columns
+  const noArgon = { ...both, gemini: { ...both.gemini, window_ids: both.gemini.window_ids.filter((id: string) => id !== "seven_day_argon") } };
+  const third = lib.layoutGroups(noArgon, "large", "", NOW, { screen: { width: 390, height: 844 } }).groups.find((g: any) => g.provider === "gemini");
+  assert.deepEqual(plain(third.rows.map((r: any) => r.window.id)), ["five_hour", "seven_day", "partner_seven_day"]);
+  // a short name on the widgets (a column has room for about "Argon wk"); the details keep Claude/GPT
+  assert.equal(lib.rowLabel(third.rows[2].window), "C+G wk");
+  assert.equal(lib.rowLabel({ ...third.rows[2].window, id: "partner_five_hour" }), "C+G 5h");
+  assert.equal(lib.limitLabel(third.rows[2].window), "Claude/GPT weekly");
+  const sc = lib.SCALES.large;
+  const room = Math.floor((lib.widgetSize("large", { width: 375, height: 667 }).width - 2 * lib.PADDING.large - 20) / 3) - lib.textWidth("100%", sc.pct, true) - 4;
+  assert.ok(lib.textWidth("C+G wk", sc.label) <= room, `fits beside 100% in a 375pt iPhone column (narrower ones shrink the text, as for Argon wk) (${room})`);
+  assert.ok(lib.textWidth("C+G wk", sc.label) <= lib.textWidth("Argon wk", sc.label));
   for (const p of ["", "5h", "gemini, wk"]) assert.ok(!lib.selectWindows(view, p, NOW).some((x: any) => x.window.id.startsWith("partner_")), p);
   assert.ok(!lib.lockPicks(view, "gemini", NOW).some((x: any) => x.window?.id === "partner_five_hour"));
   assert.ok(!lib.reminderPlan(view, NOW).some((r: any) => r.window_id === "partner_five_hour"));
@@ -5302,7 +5373,7 @@ test("medium and large draw three columns of one width; a demo says Demo once at
   const medium = texts((await runWidget({ family: "medium", demo: "three", now: NOW })).widget.node);
   for (const name of ["Codex", "Claude", "Gemini"]) assert.ok(medium.includes(name), medium.join(" | "));
   assert.equal(medium.filter((t) => /\bDemo\b/.test(t)).length, 1, medium.join(" | "));
-  assert.ok(!medium.some((t) => t.includes("Claude/GPT")), "the details-only limit isn't drawn");
+  assert.ok(!medium.some((t) => t.includes("Claude/GPT")), "two rows a column: Gemini's own first, no room for Claude and GPT");
   const large = texts((await runWidget({ family: "large", demo: "three", now: NOW })).widget.node);
   assert.ok(large.includes("Argon wk") && large.includes("Weekly usage"), large.join(" | "));
   assert.equal(large.filter((t) => t === "Gemini").length, 2, "its column and the chart's legend");
@@ -5458,6 +5529,125 @@ test("Appearance: Auto follows the iPhone (dynamic colors), Light and Dark are f
   assert.ok(!removed.keychain.has(lib.KEYCHAIN_APPEARANCE) && !removed.keychain.has("headroom.url"), [...removed.keychain.keys()].join(" | "));
 });
 
+test("Layout guides (Settings › Display): drawn as the Home Screen widget's background, the layout as without them; off by default", async () => {
+  const signedIn = { "headroom.url": "https://headroom.example.com", "headroom.token": "read-token-xyz" };
+  const on = { ...signedIn, [lib.KEYCHAIN_GUIDES]: "on" };
+  const response = { status: 200, body: demoBody("normal", new Date()) };
+  const strip = (node: any): any => ({ kind: node.kind, props: node.props, children: node.children.map(strip) });
+  for (const [family, screen, size] of [["small", 390, "158×158 pad 13"], ["medium", 390, "338×158 pad 14"], ["large", 390, "338×354 pad 16"], ["large", 430, "364×382 pad 16"]] as const) {
+    const plainRun = await runWidget({ family, screen, response } as any);
+    const guided = await runWidget({ family, screen, response, keychain: on } as any);
+    const image = (guided.widget as any).backgroundImage;
+    assert.ok(image, `${family} ${screen}`);
+    // the edge, the padding's edge and the two middle lines (rectangles) and the rounded corners (a path)
+    assert.equal(image.strokes, 5);
+    assert.deepEqual(plain(image.texts), [`v${lib.HEADROOM_VERSION} · ${size}`]);
+    assert.equal((plainRun.widget as any).backgroundImage, undefined);
+    // nothing else changes: the same tree, the same background color under the guides
+    assert.deepEqual(plain(strip(guided.widget.node)), plain(strip(plainRun.widget.node)), `${family} ${screen}`);
+  }
+  // not on the lock screen
+  const lock = await runWidget({ family: "accessoryRectangular", screen: 390, response, keychain: on } as any);
+  assert.equal((lock.widget as any).backgroundImage, undefined);
+  // turned on and off in Settings › Display (after the appearance and the icons); off leaves no item
+  const index = 1 + lib.PROVIDER_ORDER.filter((p: string) => lib.ALT_ICONS[p]).length;
+  const turnedOn = await runWidget({ family: "medium", keychain: signedIn, app: { menu: [3, 1, index] } });
+  assert.equal(turnedOn.keychain.get(lib.KEYCHAIN_GUIDES), "on", turnedOn.actionLabels.join(" | "));
+  assert.ok(turnedOn.actionLabels.includes("Layout guides: Off"), turnedOn.actionLabels.join(" | "));
+  const turnedOff = await runWidget({ family: "medium", keychain: on, app: { menu: [3, 1, index] } });
+  assert.equal(turnedOff.keychain.has(lib.KEYCHAIN_GUIDES), false);
+  assert.ok(turnedOff.actionLabels.includes("Layout guides: On"));
+  // Remove all settings removes it too
+  const removed = await runWidget({ family: "medium", keychain: on, app: { menu: [3, 2, 1] } });
+  assert.equal(removed.keychain.has(lib.KEYCHAIN_GUIDES), false);
+  // one that can't be read keeps neither the server nor the token (display preferences are removed apart)
+  const unreadable = await runWidget({ family: "medium", keychain: on, keychainGetFailsFor: lib.KEYCHAIN_GUIDES, app: { menu: [3, 2, 1] } } as any);
+  assert.deepEqual([...unreadable.keychain.keys()], [], [...unreadable.keychain.keys()].join(" | "));
+  // an unfinished removal (a connection item that can't be read, the retry declined) keeps the display preferences with it
+  const legacy = { "headroom.url": "https://headroom.example.com", "headroom.token": "read-token-xyz", "headroom.access_id": "id", [lib.KEYCHAIN_GUIDES]: "on", [lib.KEYCHAIN_APPEARANCE]: "dark" };
+  const kept = await runWidget({ family: "medium", keychain: legacy, keychainGetFailsFor: "headroom.access_id", app: { menu: [3, 2, 1] }, answers: [0, -1] } as any);
+  assert.ok(kept.alertTitles.includes("Not fully removed"), kept.alertTitles.join(" | "));
+  assert.equal(kept.keychain.get(lib.KEYCHAIN_GUIDES), "on");
+  assert.equal(kept.keychain.get(lib.KEYCHAIN_APPEARANCE), "dark");
+  // a retry that succeeds after another run saved settings of its own (and display preferences) meanwhile: those are kept
+  {
+    const k = new Map<string, string>();
+    saveAs(k, JSON.stringify({ url: "https://headroom.example.com", token: "t", id: "1111111111111111" }), JSON.stringify({ times: false }));
+    k.set(lib.KEYCHAIN_GUIDES, "on");
+    let failing = true;
+    let questions = 0;
+    const run = await runWidget({ family: "medium", app: { menu: [3, 2, 1] }, keychain: Object.fromEntries(k),
+      keychainRemove: (key: string) => { if (failing && key.startsWith("headroom.notify.")) throw new Error("keychain"); },
+      beforeConfirm: (kc: Map<string, string>) => {
+        if (++questions !== 2) return;
+        // at the retry question: another run saves new settings and an appearance; the fault goes away
+        saveAs(kc, JSON.stringify({ url: "https://headroom.example.com", token: "t2", id: "2222222222222222" }));
+        kc.set(lib.KEYCHAIN_APPEARANCE, "dark");
+        failing = false;
+      } } as any);
+    assert.ok(run.alertTitles.includes("Not fully removed"));
+    assert.ok(!run.keychain.has("headroom.notify.1111111111111111"), "the removed settings' items are gone");
+    assert.equal(JSON.parse(run.keychain.get("headroom.config.2222222222222222")!).token, "t2", "the new settings stay");
+    assert.equal(run.keychain.get(lib.KEYCHAIN_APPEARANCE), "dark", "their display preferences stay");
+    assert.equal(run.keychain.get(lib.KEYCHAIN_GUIDES), "on");
+  }
+  // the settings can't be read once the connection is gone: the display preferences are kept and the removal is unfinished; the retry
+  // removes them
+  {
+    const k = new Map<string, string>();
+    saveAs(k, JSON.stringify({ url: "https://headroom.example.com", token: "t", id: "1111111111111111" }));
+    k.set(lib.KEYCHAIN_GUIDES, "on");
+    let armed = false;
+    let failures = 0;
+    const run = await runWidget({ family: "medium", app: { menu: [3, 2, 1] }, keychain: Object.fromEntries(k),
+      keychainRemove: (key: string) => { if (key.startsWith("headroom.config.")) armed = true; },
+      keychainGetFailsWhen: (key: string) => armed && key === lib.KEYCHAIN_CURRENT && failures++ === 0 } as any);
+    assert.ok(run.alertTitles.includes("Not fully removed"), run.alertTitles.join(" | "));
+    assert.equal(failures > 0, true);
+    // everything but the pointer to the current settings (it names none now: kept, as on every removal)
+    assert.deepEqual([...run.keychain.keys()].filter((key) => key !== lib.KEYCHAIN_CURRENT), [], [...run.keychain.keys()].join(" | "));
+  }
+  // with Transparent: the guides are drawn (Scriptable's transparent style would replace the image), the widget as Auto
+  const transparent = { ...on, [lib.KEYCHAIN_APPEARANCE]: "transparent" };
+  const both = await runWidget({ family: "medium", screen: 390, response, keychain: transparent, systemVersion: "27.2", refreshButtons: true } as any);
+  assert.equal((both.widget as any).backgroundStyle, undefined);
+  assert.ok((both.widget as any).backgroundImage);
+  const bg = both.widget.node.props.background as any;
+  assert.deepEqual([bg.hex, bg.dark, bg.dynamic], [lib.WIDGET_BG.light, lib.WIDGET_BG.dark, true]);
+  const alone = await runWidget({ family: "medium", screen: 390, response, keychain: { ...signedIn, [lib.KEYCHAIN_APPEARANCE]: "transparent" }, systemVersion: "27.2", refreshButtons: true } as any);
+  assert.equal((alone.widget as any).backgroundStyle, "transparent", "without the guides, Transparent as before");
+});
+
+test("Appearance: Transparent shows the wallpaper behind Home Screen widgets on iOS 27.2 or newer, and draws as Auto before", async () => {
+  const signedIn = { "headroom.url": "https://headroom.example.com", "headroom.token": "read-token-xyz" };
+  const keychain = { ...signedIn, [lib.KEYCHAIN_APPEARANCE]: "transparent" };
+  const colors = (node: any): any[] => [...(node.kind === "text" && node.props.color ? [node.props.color] : []), ...node.children.flatMap(colors)];
+  for (const version of ["27.2", "27.2.1", "28.0"]) {
+    const run = await runWidget({ family: "medium", keychain, systemVersion: version, refreshButtons: true } as any);
+    assert.equal((run.widget as any).backgroundStyle, "transparent", version);
+    assert.equal(run.widget.node.props.background, undefined, "no background color over the wallpaper");
+  }
+  // texts as Auto (the wallpaper may be light or dark)
+  const auto = await runWidget({ family: "medium", keychain: signedIn, systemVersion: "27.2", refreshButtons: true } as any);
+  const shown = await runWidget({ family: "medium", keychain, systemVersion: "27.2", refreshButtons: true } as any);
+  assert.deepEqual(colors(shown.widget.node), colors(auto.widget.node));
+  // before iOS 27.2, with no version to read, or on a Scriptable before 1.8 (iOS 27.2 or not): as Auto, its background drawn
+  for (const [version, newer] of [["27.1", true], ["26.4", true], [undefined, true], ["27.2", false], ["28.0", false]] as const) {
+    const run = await runWidget({ family: "medium", keychain, ...(version ? { systemVersion: version } : {}), refreshButtons: newer } as any);
+    assert.equal((run.widget as any).backgroundStyle, undefined, `${version} ${newer}`);
+    const bg = run.widget.node.props.background as any;
+    assert.deepEqual([bg.hex, bg.dark, bg.dynamic], [lib.WIDGET_BG.light, lib.WIDGET_BG.dark, true], `${version} ${newer}`);
+  }
+  // the lock screen keeps its own transparent background
+  const lock = await runWidget({ family: "accessoryRectangular", keychain, systemVersion: "27.2", refreshButtons: true } as any);
+  assert.equal((lock.widget as any).backgroundStyle, undefined);
+  // Settings › Display › Appearance offers it, and saves it for the whole iPhone
+  const chosen = await runWidget({ family: "medium", app: { menu: [3, 1, 0, 3] } });
+  assert.ok(chosen.actionLabels.includes("Transparent (iOS 27.2 or newer)"), chosen.actionLabels.join(" | "));
+  assert.equal(chosen.keychain.get(lib.KEYCHAIN_APPEARANCE), "transparent");
+  assert.ok(chosen.actionLabels.includes("Appearance: Transparent"), "the menu shows the new choice");
+});
+
 test("Appearance on the pages: Light drops the dark colors, Dark keeps only them", async () => {
   const css = ":root{color-scheme:light dark;--text:#1c1c1e}\n@media (prefers-color-scheme:dark){:root{--text:#f2f2f7}}\nbody{}";
   const signedIn = { "headroom.url": "https://headroom.example.com", "headroom.token": "read-token-xyz" };
@@ -5567,6 +5757,230 @@ test("a limit named still shows a provider named without values and why one has 
   // a limit the provider has: no "Not available" row
   const no5h = lib.demoResult("no5h", NOW).view;
   assert.ok(!lib.groupsOf(no5h, "codex, wk", NOW)[0].rows.some((r: any) => r.kind === "missing"));
+});
+
+test("the large chart is drawn at its own size (iOS never shrinks it off the padding's edges), closer to the rows, never lower than before", async () => {
+  const all = (node: any): any[] => [node, ...node.children.flatMap(all)];
+  for (const screen of [320, 390, 430]) {
+    const run = await runWidget({ family: "large", screen, demo: "three" });
+    // the chart: the image after the legend row (Weekly usage), as wide as that row and the day labels' row
+    const legend = all(run.widget.node).find((n: any) => n.children.some((c: any) => c.kind === "text" && c.props.text === "Weekly usage"));
+    const parent = all(run.widget.node).find((n: any) => n.children.includes(legend));
+    // Weekly usage at the provider names' size and weight; its row's height is counted in the chart's chrome
+    const heading = legend.children.find((c: any) => c.kind === "text" && c.props.text === "Weekly usage");
+    assert.deepEqual(plain(heading.props.font), { name: "semiboldSystemFont", size: lib.SCALES.large.name });
+    assert.equal(lib.trendChrome(lib.SCALES.large), lib.TREND_GAP + lib.SCALES.large.name * 1.25 + 4 + 3 + lib.SCALES.large.small * 1.25);
+    // the heading row fits across with three providers, on the smallest iPhone
+    const sc = lib.SCALES.large;
+    const across = lib.textWidth("Weekly usage", sc.name, true) + ["Claude", "Codex", "Gemini"].reduce((w: number, n: string, i: number) => w + (i ? 10 : 0) + 11 + lib.textWidth(n, sc.small), 0);
+    assert.ok(across <= lib.widgetSize("large", { width: 320, height: 568 }).width - 2 * lib.PADDING.large, String(across));
+    const chart = parent.children.find((c: any) => c.kind === "image");
+    assert.ok(chart, String(screen));
+    assert.equal(chart.props.resizable, false, "not shrunk by iOS");
+    assert.equal(chart.props.imageSize.w, legend.props.size.w, "on the padding's edges, as wide as the legend");
+    const view = lib.demoResult("three", new Date()).view;
+    const layout = lib.layoutGroups(view, "large", "", new Date(), { demo: true, screen: { width: screen, height: ({ 430: 932, 390: 844, 320: 568 } as Record<number, number>)[screen] } });
+    assert.ok(Math.abs(chart.props.imageSize.h - layout.trendHeight) <= 2, `${chart.props.imageSize.h} vs ${layout.trendHeight}`);
+    const labels = parent.children.find((c: any) => c !== legend && c.kind === "stack" && c.children.length === 7);
+    assert.equal(labels.props.size.w, chart.props.imageSize.w);
+  }
+  assert.equal(lib.TREND_GAP, 8);
+  // never lower than before, and never past the room left (it isn't shrunk): the floor is the old room with the old gap
+  const now = new Date("2026-11-16T13:05:00.000Z");
+  // one row (the case that overflowed): the chart as tall as the room lets it, the lift and the refresh control giving way first
+  {
+    const screen = { width: 390, height: 844 };
+    const l = lib.layoutGroups(lib.demoResult("normal", now).view, "large", "claude,wk", now, { screen, refresh: true });
+    const room = l.size.height - 2 * l.pad - 2;
+    const columns = lib.groupHeight(l.scale, l.groups[0].rows.length);
+    assert.ok(columns + lib.trendChrome(l.scale) + l.trendHeight + l.refreshInside + l.lift <= room, `${columns} ${l.trendHeight} ${l.refreshInside} ${l.lift} > ${room}`);
+    const before = Math.floor(room - columns * 1.1 - lib.trendChrome(l.scale) - 10);
+    assert.ok(l.trendHeight >= before, `${l.trendHeight} < ${before}`);
+  }
+  for (const screen of [{ width: 320, height: 568 }, { width: 375, height: 812 }, { width: 390, height: 844 }, { width: 430, height: 932 }]) {
+    for (const name of ["three", "normal", "no5h", "firstuse"]) {
+      for (const refresh of [false, true]) {
+        const l = lib.layoutGroups(lib.demoResult(name, now).view, "large", "", now, { screen, refresh });
+        if (!(l.trendHeight > lib.TREND_MIN_HEIGHT)) continue;
+        const room = l.size.height - 2 * l.pad - (l.showNote ? 4 + l.scale.small * 1.25 : 0) - 2;
+        const columns = Math.max(...l.groups.map((g: any) => lib.groupHeight(l.scale, g.rows.length, g.rows.length > 0 ? 0 : l.scale.label * 1.25)));
+        assert.ok(columns + lib.trendChrome(l.scale) + l.trendHeight + l.refreshInside + (l.lift) <= room + 1, `${name} ${JSON.stringify(screen)} ${refresh}`);
+      }
+    }
+  }
+});
+
+test("the refresh control: small Refresh and its symbol at the bottom right of the content, centered on the padding's edge; the rows as without it", async () => {
+  const now = new Date();
+  const all = (node: any): any[] => [node, ...node.children.flatMap(all)];
+  const strip = (node: any): any => ({ kind: node.kind, props: { ...node.props, padding: undefined }, children: node.children.map(strip) });
+  for (const [family, screen, name] of [["small", 390, "normal"], ["small", 320, "three"], ["medium", 390, "normal"], ["medium", 430, "three"], ["large", 390, "three"], ["large", 320, "normal"], ["extraLarge", 390, "normal"]] as const) {
+    const response = { status: 200, body: demoBody(name, now) };
+    const without = await runWidget({ family, screen, response } as any);
+    const run = await runWidget({ family, screen, response, refreshButtons: true } as any);
+    const where = `${family} ${screen} ${name}`;
+    const pad = lib.PADDING[family];
+    // its middle on the padding's edge, REFRESH_GAP under the content, where the rows leave room for it; else lower, down to its top on
+    // the edge (the three stacked in the smallest small)
+    const tight = family === "small" && name === "three" && screen === 320;
+    const [top, left, bottom, right] = plain(run.widget.node.props.padding);
+    assert.deepEqual([top, left, right], [pad, pad, pad], where);
+    assert.ok(tight ? bottom < pad - lib.REFRESH_ROW / 2 && bottom >= pad - lib.REFRESH_ROW : bottom === pad - lib.REFRESH_ROW / 2, `${where}: ${bottom}`);
+    assert.deepEqual(plain(without.widget.node.props.padding), [pad, pad, pad, pad], where);
+    const kids = run.widget.node.children;
+    const row = kids[kids.length - 1];
+    assert.equal(row.props.size.h, lib.REFRESH_ROW, where);
+    if (!tight && lib.REFRESH_GAP > 0) assert.deepEqual([kids[kids.length - 2].kind, kids[kids.length - 2].props.length], ["spacer", lib.REFRESH_GAP], where);
+    // across: a frame of the content's width, centered as the content is, the control at its right (never past the content's edge)
+    const frame = row.children.find((c: any) => c.kind === "stack");
+    const heights: Record<number, number> = { 430: 932, 390: 844, 320: 568 };
+    assert.equal(frame.props.size.w, lib.widgetSize(family, { width: screen, height: heights[screen] }).width - 2 * pad, where);
+    assert.deepEqual(row.children.map((c: any) => c.kind), ["spacer", "stack", "spacer"], where);
+    assert.equal(frame.children[0].kind, "spacer");
+    // its right edge on the content's: the control ends the frame, as the providers end the large chart's legend row (of the same width)
+    assert.equal(frame.children[frame.children.length - 1].props.action?.id, "refresh", where);
+    if (family === "large") {
+      const legend = all(run.widget.node).find((n: any) => n.children.some((c: any) => c.kind === "text" && c.props.text === "Weekly usage"));
+      if (legend) assert.equal(frame.props.size.w, legend.props.size.w, where);
+    }
+    const above = kids.slice(0, tight || lib.REFRESH_GAP === 0 ? -1 : -2);
+    // the same rows and texts above it; medium (no chart, no spreading) is drawn exactly as without it
+    const words = (nodes: any[]) => nodes.flatMap(all).filter((n: any) => n.kind === "text").map((n: any) => n.props.text);
+    assert.deepEqual(plain(words(above)), plain(words(without.widget.node.children)), where);
+    if (family === "medium") assert.deepEqual(plain(above.map(strip)), plain(without.widget.node.children.map(strip)), where);
+    // at the right: Refresh, then the symbol, small, in the gray; tapping it redraws
+    const control = all(row).find((n: any) => n.props.action);
+    assert.deepEqual(plain(control.props.action), { title: lib.REFRESH_TITLE, id: "refresh" }, where);
+    const [text, image] = control.children.filter((c: any) => c.kind !== "spacer");
+    assert.equal(text.props.text, "Refresh");
+    assert.equal(text.props.font.size, lib.REFRESH_FONT);
+    assert.equal(image.props.symbol, lib.REFRESH_SYMBOL);
+    assert.equal(lib.REFRESH_SYMBOL, "arrow.triangle.2.circlepath");
+  }
+  // a fetch that failed with nothing saved: the message in the middle, Refresh at the bottom to try again (not on the lock screen)
+  const failed = await runWidget({ family: "medium", response: { status: 503, body: "Service Unavailable" }, refreshButtons: true } as any);
+  const fk = failed.widget.node.children;
+  assert.deepEqual(fk.map((c: any) => (c.kind === "spacer" ? "flex" : c.kind)), ["flex", "text", "flex", "stack"]);
+  assert.ok(all(fk[3]).some((n: any) => n.props.action?.id === "refresh"));
+  assert.deepEqual(plain(failed.widget.node.props.padding), [14, 14, 14 - lib.REFRESH_ROW / 2, 14]);
+  const failedLock = await runWidget({ family: "accessoryRectangular", response: { status: 503, body: "Service Unavailable" }, refreshButtons: true } as any);
+  assert.ok(!all(failedLock.widget.node).some((n: any) => n.props.action));
+  // a stack action that fails: no words that can't be tapped, the row left empty (the layout as with it)
+  const broken = await runWidget({ family: "medium", screen: 390, response: { status: 200, body: demoBody("normal", now) }, refreshButtons: true, actionThrows: true } as any);
+  const last = broken.widget.node.children[broken.widget.node.children.length - 1];
+  assert.equal(last.props.size.h, lib.REFRESH_ROW);
+  assert.ok(!all(last).some((n: any) => n.kind === "text" || n.kind === "image"), "no Refresh drawn");
+  // not on a Scriptable without stack actions, nor in the demo, nor on the lock screen
+  const response = { status: 200, body: demoBody("normal", now) };
+  for (const run of [
+    await runWidget({ family: "medium", response } as any),
+    await runWidget({ family: "medium", demo: "normal", refreshButtons: true } as any),
+    await runWidget({ family: "accessoryRectangular", response, refreshButtons: true } as any),
+  ]) {
+    assert.ok(!all(run.widget.node).some((n: any) => n.props.action), "no refresh control");
+  }
+});
+
+test("large's lift comes only out of the room its rows leave: no row is dropped for it", () => {
+  const now = new Date("2026-11-16T13:05:00.000Z");
+  // A provider with more limits (its weekly copied with scopes): the rows need nearly all the height
+  const scoped = (name: string) => {
+    const view = plain(lib.demoResult(name, now).view);
+    for (const p of ["claude", "codex", "gemini"]) {
+      const pv = view[p];
+      if (!pv?.windows?.seven_day) continue;
+      for (const scope of ["Fable", "Sonnet", "Argon"]) {
+        const id = `seven_day_${scope.toLowerCase()}`;
+        pv.windows[id] = { ...pv.windows.seven_day, id, scope };
+      }
+      pv.window_ids = Object.keys(pv.windows);
+    }
+    return lib.sanitizeView(view);
+  };
+  // a tight case: four rows and the chart's least, with less room left for the refresh control (no row dropped for it)
+  const tight = lib.layoutGroups(scoped("normal"), "large", "claude", now, { screen: { width: 375, height: 812 }, refresh: true });
+  assert.equal(tight.groups[0].rows.length, 4);
+  assert.ok(tight.refreshInside >= 0 && tight.refreshInside <= lib.REFRESH_ROW / 2 + lib.REFRESH_GAP, String(tight.refreshInside));
+  assert.equal(tight.lift, 0, "no lift with the refresh control: the chart reaches down to it");
+  const lifted = lib.layoutGroups(scoped("normal"), "large", "claude", now, { screen: { width: 375, height: 812 } });
+  assert.equal(lifted.groups[0].rows.length, 4, "the same rows without it");
+  assert.ok(tight.trendHeight >= lib.TREND_MIN_HEIGHT && tight.trendHeight < lib.TREND_MIN_HEIGHT + 10, String(tight.trendHeight));
+  // everywhere: the rows, the chart (at its least) and the lift fit in the inside of the padding
+  for (const screen of [{ width: 320, height: 568 }, { width: 375, height: 812 }, { width: 390, height: 844 }, { width: 430, height: 932 }]) {
+    for (const name of ["normal", "firstuse", "attention", "three"]) {
+      for (const parameter of ["", "claude", "codex", "gemini", "claude,gemini,most"]) {
+        for (const [cached, refresh] of [[false, false], [true, false], [false, true], [true, true]]) {
+          const l = lib.layoutGroups(scoped(name), "large", parameter, now, { screen, cached, refresh });
+          const plainRows = lib.layoutGroups(scoped(name), "large", parameter, now, { screen, cached }).groups.map((g: any) => g.rows.length);
+          assert.deepEqual(plain(l.groups.map((g: any) => g.rows.length)), plain(plainRows), "the same rows with the refresh control");
+          const room = l.size.height - 2 * l.pad - (l.showNote ? 4 + l.scale.small * 1.25 : 0) - 2;
+          const columns = Math.max(0, ...l.groups.map((g: any) => lib.groupHeight(l.scale, g.rows.length, g.rows.length > 0 ? 0 : l.scale.label * 1.25)));
+          const chart = l.trendHeight > 0 ? lib.trendChrome(l.scale) + lib.TREND_MIN_HEIGHT : 0;
+          const where = `${name} ${parameter} ${JSON.stringify(screen)} ${cached} ${refresh}`;
+          assert.ok(l.lift >= 0 && l.lift <= lib.LARGE_LIFT, where);
+          assert.ok(l.refreshInside >= 0 && l.refreshInside <= (refresh ? lib.REFRESH_ROW / 2 + lib.REFRESH_GAP : 0), where);
+          if (refresh) assert.equal(l.lift, 0, where);
+          if (!l.most) assert.ok(columns + chart + l.lift + l.refreshInside <= room + 1e-9, `${where}: ${columns} + ${chart} + ${l.lift} + ${l.refreshInside} > ${room}`);
+        }
+      }
+    }
+  }
+});
+
+test("large sits a little above the middle with its chart taller than before; small spreads its providers inside the padding", async () => {
+  const now = new Date("2026-11-16T13:05:00.000Z");
+  for (const screen of [{ width: 320, height: 568 }, { width: 375, height: 667 }, { width: 390, height: 844 }, { width: 430, height: 932 }]) {
+    for (const name of ["three", "normal", "no5h"]) {
+      const view = lib.demoResult(name, now).view;
+      // large: the chart takes the room left beside CHART_ROWS_MARGIN (it was 10%), with no upper bound, never lower than before
+      const l = lib.layoutGroups(view, "large", "", now, { screen });
+      if (l.trendHeight > 0) {
+        const columns = Math.max(...l.groups.map((g: any) => lib.groupHeight(l.scale, g.rows.length)));
+        const available = l.size.height - 2 * l.pad - l.lift - 2 - (l.showNote ? 4 + l.scale.small * 1.25 : 0);
+        const before = Math.max(lib.TREND_MIN_HEIGHT, Math.min(320, Math.floor(available + l.lift - columns * 1.1 - lib.trendChrome(l.scale))));
+        assert.equal(l.trendHeight, Math.max(before, Math.floor(available - columns * (1 + lib.CHART_ROWS_MARGIN) - lib.trendChrome(l.scale))));
+        assert.ok(l.trendHeight >= before, `${name} ${JSON.stringify(screen)}: ${l.trendHeight} < ${before}`);
+      }
+      assert.equal(l.lift, lib.LARGE_LIFT);
+      // small: more space between the providers, all still inside the padding
+      const s = lib.layoutGroups(view, "small", "", now, { screen });
+      if (s.groups.length >= 2) {
+        const usual = s.groups.length >= 3 ? 6 : 10;
+        assert.ok(s.between >= usual && s.between <= usual + lib.SMALL_SPREAD_MAX, `${name} ${JSON.stringify(screen)}: ${s.between}`);
+        const used = s.groups.reduce((sum: number, g: any) => sum + lib.groupHeight(s.scale, g.rows.length, g.rows.length > 0 ? 0 : s.scale.label * 1.25), 0) + s.between * (s.groups.length - 1);
+        assert.ok(used <= s.size.height - 2 * s.pad - s.lift - 2, `${name} ${JSON.stringify(screen)}: ${used}`);
+      }
+      // two providers with room to spare: the most more space
+      if (name === "normal" && screen.width >= 390) assert.equal(s.between, 10 + lib.SMALL_SPREAD_MAX, JSON.stringify(screen));
+      // medium: as it was (no spreading, centered)
+      const m = lib.layoutGroups(view, "medium", "", now, { screen });
+      assert.equal(m.lift, 0);
+    }
+  }
+  // drawn: large centered with the extra space under it, small as before (2)
+  const large = await runWidget({ family: "large", screen: 390, demo: "three" });
+  const kinds = (node: any) => node.children.map((c: any) => (c.kind === "spacer" ? `spacer:${c.props.length ?? "flex"}` : c.kind));
+  assert.deepEqual(kinds(large.widget.node), ["spacer:flex", "stack", `spacer:${lib.LARGE_LIFT}`, "spacer:flex"]);
+});
+
+test("the details page says a provider's error and what to do, also while values from before are shown", () => {
+  const now = new Date("2026-11-16T13:05:00.000Z");
+  const view = lib.demoResult("three", now).view;
+  // Gemini's fetch failed (its values from before still shown), Codex saw another account (no values)
+  const failing = { ...view, gemini: { ...view.gemini, status: "stale", error_code: "fetch_failed" }, codex: { ...view.codex, status: "unavailable", error_code: "account_changed", windows: {}, window_ids: [], main_window_ids: [] } };
+  const page = lib.detailHtml({ view: failing, events: null, trends: {}, now });
+  const section = (name: string) => page.split("<section>").find((x: string) => x.includes(`>${name}</h2>`)) ?? "";
+  assert.ok(section("Gemini").includes(lib.esc(lib.ERROR_NAMES.fetch_failed)) && section("Gemini").includes("headroom status"), "said beside the values from before");
+  assert.ok(section("Gemini").includes('class="limit'), "its values still shown");
+  assert.ok(section("Codex").includes(lib.esc(lib.DETAIL_ERROR_NAMES.account_changed)) && section("Codex").includes("--provider codex --accept-account"));
+  // the heading doesn't state a cause the code can't tell
+  assert.ok(!section("Codex").includes(lib.esc(lib.ERROR_NAMES.account_changed)));
+  // no more than the code tells: see the PC's status before accepting (an acceptance starts a new history)
+  assert.ok(section("Codex").includes("headroom status") && section("Codex").includes("new history"));
+  assert.ok(!section("Claude").includes(lib.esc(lib.ERROR_NAMES.fetch_failed)), "nothing for one without an error");
+  for (const code of Object.keys(lib.ERROR_NAMES)) assert.ok(lib.errorHint(code, "claude").length > 10, code);
+  // the hint is escaped on the page
+  assert.ok(!page.includes("<provider>"));
 });
 
 test("three stacked in small fit the smallest phones with a row each", () => {

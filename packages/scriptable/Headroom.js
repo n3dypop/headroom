@@ -11,7 +11,7 @@
 // From here down to "Widget rendering below" everything is a pure function that doesn't use the Scriptable API (tested with Node).
 // Startup is at the end (main runs after all constants are defined)
 
-const HEADROOM_VERSION = 101;
+const HEADROOM_VERSION = 124;
 /** View version this script can read (VIEW_VERSION in packages/core) */
 const VIEW_VERSION = 1;
 /** Settings are stored as JSON in a single Keychain item (so the server and credentials are always read as a pair) */
@@ -188,17 +188,70 @@ function iconBox(aspect, box) {
   return { w, h: w / ar };
 }
 
-/** Keychain item holding the appearance chosen in Settings ("light" or "dark"; none: Auto, as the iPhone is set). One for the whole iPhone */
+/**
+ * Keychain item holding the appearance chosen in Settings ("light", "dark" or "transparent"; none: Auto, as the iPhone is set). One for
+ * the whole iPhone
+ */
 const KEYCHAIN_APPEARANCE = "headroom.appearance";
+/** Layout guides on the Home Screen widgets (Settings › Display): "on" when shown, no item when off */
+const KEYCHAIN_GUIDES = "headroom.guides";
+
+/** Whether the layout guides are on (off also when the setting can't be read) */
+function readGuides() {
+  try {
+    return Keychain.contains(KEYCHAIN_GUIDES) && Keychain.get(KEYCHAIN_GUIDES) === "on";
+  } catch (_) {
+    return false;
+  }
+}
+
+/**
+ * The layout guides, drawn as a Home Screen widget's background (they take no room: the layout is as without them), to check what is
+ * cut off on a device: the widget's edge (red) and its rounded corners (orange, a 22pt radius: an estimate), the padding's edge that the
+ * content is laid out inside (teal), the middle (faint teal), and this build with the size and padding it laid out for (red, under the
+ * padding's edge). null where it can't be drawn (the widget as without guides)
+ */
+function guidesImage(family, pad) {
+  try {
+    const { width, height } = widgetSize(family, screenSize());
+    const ctx = new DrawContext();
+    ctx.size = new Size(width, height);
+    ctx.opaque = false;
+    ctx.respectScreenScale = true;
+    ctx.setLineWidth(1);
+    ctx.setStrokeColor(new Color(GUIDE_COLORS.edge));
+    ctx.strokeRect(new Rect(0.5, 0.5, width - 1, height - 1));
+    const corner = new Path();
+    corner.addRoundedRect(new Rect(1, 1, width - 2, height - 2), 22, 22);
+    ctx.addPath(corner);
+    ctx.setStrokeColor(new Color(GUIDE_COLORS.corner));
+    ctx.strokePath();
+    ctx.setStrokeColor(new Color(GUIDE_COLORS.padding));
+    ctx.strokeRect(new Rect(pad + 0.5, pad + 0.5, width - 2 * pad - 1, height - 2 * pad - 1));
+    ctx.setStrokeColor(new Color(GUIDE_COLORS.padding, 0.35));
+    ctx.strokeRect(new Rect(width / 2, pad, 0.5, height - 2 * pad));
+    ctx.strokeRect(new Rect(pad, height / 2, width - 2 * pad, 0.5));
+    ctx.setFont(Font.systemFont(7));
+    ctx.setTextColor(new Color(GUIDE_COLORS.edge));
+    ctx.drawText(`v${HEADROOM_VERSION} · ${width}×${height} pad ${pad}`, new Point(pad + 2, height - pad + 2));
+    return ctx.getImage();
+  } catch (_) {
+    return null;
+  }
+}
+const GUIDE_COLORS = { edge: "#ff2d55", corner: "#ff9500", padding: "#00c7be" };
 /** The appearance this run read (undefined: not read yet; a change in Settings clears it) */
 let appearanceChoice;
-const APPEARANCE_NAMES = { auto: "Auto", light: "Light", dark: "Dark" };
+const APPEARANCE_NAMES = { auto: "Auto", light: "Light", dark: "Dark", transparent: "Transparent" };
 
-/** The appearance chosen in Settings: "auto" (also when it can't be read), "light" or "dark" */
+/**
+ * The appearance chosen in Settings: "auto" (also when it can't be read), "light", "dark" or "transparent" (the Home Screen widget's
+ * background shows the wallpaper; its texts, the lock screen's and the pages follow the iPhone as Auto)
+ */
 function readAppearance() {
   try {
     const v = Keychain.contains(KEYCHAIN_APPEARANCE) ? Keychain.get(KEYCHAIN_APPEARANCE) : null;
-    return v === "light" || v === "dark" ? v : "auto";
+    return v === "light" || v === "dark" || v === "transparent" ? v : "auto";
   } catch (_) {
     return "auto";
   }
@@ -220,6 +273,20 @@ function themed(light, dark) {
 
 /** Home screen widget background (the lock screen's stays transparent) */
 const WIDGET_BG = { light: "#ffffff", dark: "#1c1c1e" };
+
+/**
+ * Whether this widget can show its Home Screen background as transparent: Scriptable's backgroundStyle "transparent" (Scriptable 1.8 or
+ * newer, which also has the refresh button) on iOS or iPadOS 27.2 or newer. Where it can't, a Transparent choice draws as Auto
+ */
+function transparentShown(widget) {
+  if (typeof widget?.addRefreshButton !== "function") return false;
+  try {
+    const [major, minor] = String(Device.systemVersion()).split(".").map(Number);
+    return major > 27 || (major === 27 && (minor || 0) >= 2);
+  } catch (_) {
+    return false;
+  }
+}
 
 /** A page's colors for the appearance: as the iPhone (both, by prefers-color-scheme) for Auto, else light or dark alone */
 function pageAppearance(css) {
@@ -312,6 +379,11 @@ const SCOPE_NAMES = { "Codex extra": "Extra", codex_other: "Other", "Claude and 
 function scopeName(scope) {
   if (!scope) return null;
   return SCOPE_NAMES[scope] ?? (/^[A-Za-z0-9][A-Za-z0-9._-]{0,23}$/.test(scope) ? scope : "Other");
+}
+/** Shorter names on the widgets, where a column has room for about "Argon wk" (the details keep SCOPE_NAMES: Claude/GPT weekly) */
+const WIDGET_SCOPE_NAMES = { "Claude and GPT": "C+G" };
+function widgetScopeName(scope) {
+  return scope ? WIDGET_SCOPE_NAMES[scope] ?? scopeName(scope) : null;
 }
 const PROVIDER_STATUSES = ["ok", "stale", "error", "unavailable"];
 const str = (v, max = 80) => (typeof v === "string" ? v.slice(0, max) : null);
@@ -602,6 +674,14 @@ function groupsOf(view, parameter, now, options = {}) {
         }
       }
     }
+    // Other makers' models a provider offers (Gemini's Claude and GPT, marked detail_only by the server): last, where the rows leave room
+    // (their weekly limit before their 5h one: rowRank), never in place of the provider's own; not when the parameter names limits (also
+    // most's, given apart: otherMakers false)
+    if (q.limits.length === 0 && options.otherMakers !== false && listed.includes(provider) && p) {
+      for (const id of p.window_ids) {
+        if (p.windows[id].detail_only && !rows.some((r) => r.window.id === id)) rows.push({ kind: "window", window: atDisplayTime(p.windows[id], now) });
+      }
+    }
     // As in the details: the overall limits, then the provider's own per-model ones; in each, the shorter window first (5h, weekly)
     sortRows(rows);
     const canTellMissing = listed.includes(provider) && p && (p.status === "ok" || p.status === "stale");
@@ -626,9 +706,12 @@ function groupsOf(view, parameter, now, options = {}) {
   return groups;
 }
 
-/** Rows of one provider in place: the overall limits first, then the per-model and per-group ones; in each, 5h, then weekly, then others */
+/**
+ * Rows of one provider in place: the overall limits first, then its own per-model and per-group ones, then other makers' models it
+ * offers (Gemini's Claude and GPT); in each, 5h, then weekly, then others
+ */
 function sortRows(rows) {
-  const group = (r) => (r.window.scope === null ? 0 : 1);
+  const group = (r) => (r.window.scope === null ? 0 : r.window.detail_only ? 2 : 1);
   const length = (r) => (r.window.id.includes("five_hour") ? 0 : r.window.id.includes("seven_day") ? 1 : 2);
   const order = rows.map((r, i) => ({ r, i })).sort((a, b) => group(a.r) - group(b.r) || length(a.r) - length(b.r) || a.i - b.i);
   rows.splice(0, rows.length, ...order.map((x) => x.r));
@@ -773,7 +856,8 @@ function freshnessOf(view, provider, now, ids = null) {
  * so the limit that was hit can't be told from the values; the flag only says the provider was at a limit when fetched)
  */
 function limitLifted(p, ids, now) {
-  const windows = ids.map((id) => p?.windows?.[id]).filter(Boolean);
+  // Other makers' models a provider offers (detail_only) never hold its limit: the server's blocked is its own limits'
+  const windows = ids.map((id) => p?.windows?.[id]).filter((w) => w && !w.detail_only);
   const overall = (p?.main_window_ids ?? []).map((id) => p?.windows?.[id]).filter(Boolean);
   const passed = (w) => {
     const reset = Date.parse(w.resets_at ?? "");
@@ -902,9 +986,9 @@ function limitLabel(w) {
   return scope ? `${scope} ${windowName(w).toLowerCase()}` : `${windowName(w)} limit`;
 }
 
-/** Row heading on the widget (not the details): the length is short (Wk limit, Fable wk, Argon wk) so it isn't cut off in a column */
+/** Row heading on the widget (not the details): the length is short (Wk limit, Fable wk, Argon wk, C+G wk) so it isn't cut off in a column */
 function rowLabel(w) {
-  const scope = scopeName(w.scope);
+  const scope = widgetScopeName(w.scope);
   const name = windowName(w);
   const short = name === "Weekly" ? "Wk" : name === "Monthly" ? "Mo" : name;
   return scope ? `${scope} ${short.toLowerCase()}` : `${short} limit`;
@@ -1210,6 +1294,32 @@ const CYCLE_TOLERANCE_MS = 10 * 60000;
 /** What the details screen says to do about an access denial */
 const DENIED_HINT = "The service denied access, so fetching stopped on every PC. Check the account, then on a PC run the command headroom status shows (headroom collect --provider <name> --resume-access <stop>)";
 const ALERT_ERRORS = ["login_required", "safety_stop", "access_denied"];
+/**
+ * What to do about a provider's error, on the details page (its cause is on the PC that fetched it: headroom status there tells more).
+ * The server sends a fixed text per error code, never the PC's own, so this is what can be said
+ */
+/**
+ * A provider's error as the details page heads it: no more than its code tells (account_changed also comes from a state a PC couldn't
+ * read, login_required from an account it couldn't tell). The widget's own short labels stay ERROR_NAMES
+ */
+const DETAIL_ERROR_NAMES = { account_changed: "Paused: check the account", login_required: "Check the sign-in" };
+
+function errorHint(code, provider) {
+  switch (code) {
+    case "access_denied":
+      return DENIED_HINT;
+    case "account_changed":
+      return `A PC paused fetching: it saw another account, or couldn't read what it knew of this one. Run headroom status on that PC to see which, before accepting anything there (headroom collect --provider ${provider} --accept-account starts a new history).`;
+    case "login_required":
+      return "A PC needs the CLI signed in, or couldn't tell its account. Run headroom status on that PC to see which.";
+    case "not_installed":
+      return "The CLI isn't found on the PC that fetches it.";
+    case "safety_stop":
+      return "A PC paused fetching for safety. Run headroom status there to see why.";
+    default:
+      return "The last fetch failed, so the values shown (if any) are from before. Run headroom status on the PC to see why.";
+  }
+}
 /**
  * Monochrome symbols shared by the notifications and the details screen (characters without a color emoji form, or with the text
  * variation selector U+FE0E, so iOS draws them in the text color)
@@ -2252,8 +2362,10 @@ function detailHtml(input) {
       const hint = missingText(id) === NOT_SET_UP ? `<p class="na-note">${esc(NOT_SET_UP_HINT)}</p>` : "";
       return `<section>${head}<p class="message">${esc(SYMBOLS.unknown)} ${esc(missingText(id))}</p>${hint}</section>`;
     }
-    const message = p.window_ids.length === 0 ? `<p class="message">${esc(SYMBOLS.runout)} ${esc(ERROR_NAMES[p.error_code] ?? "No limits to show")}</p>` +
-      (p.error_code === "access_denied" ? `<p class="na-note">${esc(DENIED_HINT)}</p>` : "") : "";
+    // A provider in error: what it is and what to do, also while values from before are shown under it
+    const message = p.error_code
+      ? `<p class="message">${esc(SYMBOLS.runout)} ${esc(DETAIL_ERROR_NAMES[p.error_code] ?? ERROR_NAMES[p.error_code])}</p><p class="na-note">${esc(errorHint(p.error_code, id))}</p>`
+      : p.window_ids.length === 0 ? `<p class="message">${esc(SYMBOLS.runout)} No limits to show</p>` : "";
     const missing = missingFiveHour(p)
       ? `<div class="limit na"><div class="top"><span class="name">5h limit</span><b>—</b></div><div class="bar"></div>` +
         `<p class="na-note">${esc(TIME_MARKS.none)} ${esc(NOT_AVAILABLE)}</p></div>`
@@ -2777,7 +2889,10 @@ function successorSwitches(p, previousGen) {
 function removeSettingsOf(cfg) {
   // Each group's settings before its switches: settings a failure leaves behind keep their switches (alone, they would read as both on)
   const own = cfg?.keyed ? [configKey(configId(cfg)), notifyKey(cfg)] : [];
-  const shared = [KEYCHAIN_CONFIG, ...Object.values(KEYCHAIN_LEGACY), KEYCHAIN_NOTIFY, KEYCHAIN_ICONS, KEYCHAIN_APPEARANCE];
+  const shared = [KEYCHAIN_CONFIG, ...Object.values(KEYCHAIN_LEGACY), KEYCHAIN_NOTIFY];
+  // Display preferences (icons, appearance, guides) hold no connection: never read first (one that can't be read doesn't keep the server
+  // and token), and removed last, only once every connection item is gone (an unfinished removal, to be tried again, keeps them)
+  const display = [KEYCHAIN_ICONS, KEYCHAIN_APPEARANCE, KEYCHAIN_GUIDES];
   // The items shared with earlier versions are all read before any of them is removed: one that can't be read leaves them all (not
   // counted as done). A generation's own items need no reading
   let sharedRead = true;
@@ -2797,6 +2912,24 @@ function removeSettingsOf(cfg) {
         // The rest of this group stays with it
         ok = false;
         break;
+      }
+    }
+  }
+  // ...and not when another run saved settings of its own meanwhile (a retry: its display preferences are its own now). Settings that
+  // can't be read keep them and leave the removal unfinished (a retry removes them once it can tell)
+  let others = true;
+  try {
+    const now = readConfig();
+    others = Boolean(now) && !sameConfig(now, cfg);
+  } catch (_) {
+    ok = false;
+  }
+  if (ok && !others) {
+    for (const k of display) {
+      try {
+        if (Keychain.contains(k)) Keychain.remove(k);
+      } catch (_) {
+        ok = false;
       }
     }
   }
@@ -2991,15 +3124,17 @@ async function displayMenu() {
   for (;;) {
     const menu = new Alert();
     menu.title = "Display";
-    menu.message = "For every widget on the Home Screen and the details page, at each widget's next refresh.";
+    menu.message = "For every widget on the Home Screen and the details page, at each widget's next refresh. Layout guides draw lines at the Home Screen widgets' edges, corners, padding and middle (Transparent draws as Auto while they are on).";
     const chosen = readIconChoice();
     const lines = [[`Appearance: ${APPEARANCE_NAMES[readAppearance()]}`, null],
-      ...PROVIDER_ORDER.filter((p) => ALT_ICONS[p]).map((p) => [`${PROVIDER_NAMES[p]} icon: ${chosen.includes(p) ? "Alternate" : "Default"}`, p])];
+      ...PROVIDER_ORDER.filter((p) => ALT_ICONS[p]).map((p) => [`${PROVIDER_NAMES[p]} icon: ${chosen.includes(p) ? "Alternate" : "Default"}`, p]),
+      [`Layout guides: ${readGuides() ? "On" : "Off"}`, "guides"]];
     for (const [label] of lines) menu.addAction(label);
     menu.addCancelAction("Back");
     const index = await menu.presentSheet();
     if (index < 0 || index >= lines.length) return;
     if (index === 0) await chooseAppearance();
+    else if (lines[index][1] === "guides") await switchGuides();
     else await switchIcon(lines[index][1]);
   }
 }
@@ -3049,14 +3184,16 @@ async function savedDataMenu() {
   }
 }
 
-/** Chooses the appearance for the whole iPhone: Auto (as the iPhone is set; leaves no item behind), Light or Dark */
+/** Chooses the appearance for the whole iPhone: Auto (as the iPhone is set; leaves no item behind), Light, Dark or Transparent */
 async function chooseAppearance() {
   const current = readAppearance();
   const pick = new Alert();
   pick.title = "Appearance";
-  pick.message = "For every widget on the Home Screen and the details page. Auto follows the iPhone's Light or Dark setting.";
-  const modes = ["auto", "light", "dark"];
-  for (const mode of modes) pick.addAction(`${mode === "auto" ? "Auto (iPhone setting)" : APPEARANCE_NAMES[mode]}${mode === current ? " ✓" : ""}`);
+  pick.message = "For every widget on the Home Screen and the details page. Auto follows the iPhone's Light or Dark setting. " +
+    "Transparent shows the wallpaper behind the Home Screen widgets (iOS 27.2 and Scriptable 1.8 or newer; drawn as Auto before), with texts as Auto.";
+  const modes = ["auto", "light", "dark", "transparent"];
+  const names = { auto: "Auto (iPhone setting)", transparent: "Transparent (iOS 27.2 or newer)" };
+  for (const mode of modes) pick.addAction(`${names[mode] ?? APPEARANCE_NAMES[mode]}${mode === current ? " ✓" : ""}`);
   pick.addCancelAction("Back");
   const next = modes[await pick.presentSheet()];
   if (!next || next === current) return;
@@ -3070,6 +3207,19 @@ async function chooseAppearance() {
     await notice("Can't save", "Couldn't write to the Keychain. Nothing was changed.");
   }
   appearanceChoice = undefined;
+}
+
+/** Turns the layout guides on or off for every Home Screen widget (off leaves no item) */
+async function switchGuides() {
+  try {
+    if (readGuides()) {
+      if (Keychain.contains(KEYCHAIN_GUIDES)) Keychain.remove(KEYCHAIN_GUIDES);
+    } else {
+      Keychain.set(KEYCHAIN_GUIDES, "on");
+    }
+  } catch (_) {
+    await notice("Can't save", "Couldn't write to the Keychain. Nothing was changed.");
+  }
 }
 
 /** Switches one provider's icon between its first and second, for the whole iPhone (every provider on its first leaves no item) */
@@ -4789,7 +4939,7 @@ function rowPlan(row, opts) {
     missing, w,
     label: missing ? row.label ?? "5h limit" : rowLabel(w),
     // The text size is fitted between this and the long name (Weekly limit, Fable weekly)
-    fitLabel: missing ? row.fitLabel ?? row.label ?? "5h limit" : limitLabel(w),
+    fitLabel: missing ? row.fitLabel ?? row.label ?? "5h limit" : w.scope ? `${widgetScopeName(w.scope)} ${windowName(w).toLowerCase()}` : limitLabel(w),
     showPct: true,
     pct: lead ? `${lead} ${value}` : value,
     sub: c.reset || c.marks || c.pace || c.forecastTime,
@@ -4946,7 +5096,11 @@ function addRow(stack, group, row, opts) {
  * Kept rows are shown in their original order (5h position, overall, scoped)
  */
 /** Row priority (lower is kept first): overall limit 0, "no 5h limit" 1, per-model and per-group limits 2 */
-const rowRank = (r) => (r.kind === "missing" ? 1 : r.window.scope === null ? 0 : 2);
+/**
+ * A row's priority when rows are dropped for room (lower stays longer): the overall limits, the no-5h row, the provider's own
+ * per-model and per-group limits, then other makers' models it offers (their weekly limit before the rest)
+ */
+const rowRank = (r) => (r.kind === "missing" ? 1 : r.window.scope === null ? 0 : !r.window.detail_only ? 2 : r.window.id.includes("seven_day") ? 3 : 4);
 
 function visibleRows(rows, limit) {
   if (rows.length <= limit) return rows;
@@ -4983,8 +5137,9 @@ function timerWidth(date, now, size) {
 const TREND_WINDOW = "seven_day";
 const TREND_HOURS = 170;
 
-/** Spacing between the limits and the chart in large */
-const TREND_GAP = 20;
+/** Spacing between the limits and the chart in large (it was TREND_GAP_BEFORE: the chart is taller, and the refresh control has room) */
+const TREND_GAP = 8;
+const TREND_GAP_BEFORE = 20;
 /** Spacing between the chart and its day labels */
 const TREND_LABEL_GAP = 3;
 /** Day labels under the large chart (the week starts on Sunday) */
@@ -5012,13 +5167,38 @@ function dayStarts(range) {
   return range.days.slice(1, 7);
 }
 
-/** Height the large chart needs besides its plot: spacing above, the heading row, and the day labels below */
+/**
+ * Height the large chart needs besides its plot: spacing above, the heading row (Weekly usage at the provider names' size, the legend
+ * smaller), and the day labels below
+ */
 function trendChrome(scale) {
-  return TREND_GAP + scale.small * 1.25 + 4 + TREND_LABEL_GAP + scale.small * 1.25;
+  return TREND_GAP + Math.max(scale.name, scale.small) * 1.25 + 4 + TREND_LABEL_GAP + scale.small * 1.25;
 }
-/** Height of the large trend chart (min and max) */
+/** The large trend chart's least height (it grows to use the room the rows leave) */
 const TREND_MIN_HEIGHT = 56;
-const TREND_MAX_HEIGHT = 320;
+/**
+ * Room kept beside the large chart for the rows' estimation error, as a share of their height (it was 10%: the chart now takes that room,
+ * the rows' estimate keeping its 2pt)
+ */
+const CHART_ROWS_MARGIN = 0;
+/**
+ * The refresh control of a home screen widget (Scriptable 1.8 or newer): "Refresh" and its symbol, small, in the widget's gray, at the
+ * bottom right of the content: its right edge on the content's, where the large chart's legend (the providers) ends, never past it. Its row is centered on the bottom padding's edge,
+ * REFRESH_GAP under the content: its upper half and the gap take room from the content (only room the rows leave; where they leave
+ * less it sits lower, down to its top on the edge). Tapping it runs the widget as an automatic refresh
+ * does (a stack's action: reads the server, and with notify on, its events too); anywhere else still opens the details. Also under a
+ * fetch error with nothing saved to show
+ */
+const REFRESH_TITLE = "Refresh";
+const REFRESH_SYMBOL = "arrow.triangle.2.circlepath";
+const REFRESH_FONT = 8;
+const REFRESH_ROW = Math.ceil(REFRESH_FONT * 1.25);
+/** Space between the content (the large chart's day labels) and the refresh control's row (points; the rows' 2pt estimate stays) */
+const REFRESH_GAP = 0;
+/** The large widget's content sits a little above the middle: the space under it is this much more (points) than the space over it */
+const LARGE_LIFT = 6;
+/** The small widget's providers stacked: half the room left under them goes between them, up to this much more than their usual space */
+const SMALL_SPREAD_MAX = 16;
 
 /** Length of the weekly limit's cycle */
 const WEEK_MS = 7 * 24 * 60 * 60000;
@@ -5262,7 +5442,8 @@ function drawCombinedTrend(stack, groups, opts) {
   legend.size = new Size(opts.width, 0); // fix the row width to the chart width so the legend is right-aligned
   // Chart heading on the left, legend right-aligned
   const title = legend.addText("Weekly usage");
-  title.font = Font.semiboldSystemFont(opts.scale.small);
+  // At the provider names' size and weight (the headers above it)
+  title.font = Font.semiboldSystemFont(opts.scale.name);
   title.textColor = TEXT();
   title.lineLimit = 1;
   legend.addSpacer(null);
@@ -5284,10 +5465,14 @@ function drawCombinedTrend(stack, groups, opts) {
   const drawn = trendDrawOrder(series.filter(has))
     .map((s) => ({ lines: sparkLines(s.points, opts.now, opts.width, opts.height, TREND_INSET, TREND_HOURS, range), hex: BRAND_COLORS[s.provider], provider: s.provider }));
   const starts = range.days;
-  stack.addImage(combinedTrendImage(drawn, opts.width, opts.height, TREND_INSET, {
+  // At its own size, as the bars: iOS never shrinks it to fit the height (a shrunk chart kept its aspect and moved off the left edge,
+  // its sides no longer on the padding's and its days off their labels). A rows' estimate that is a little off spills into the padding
+  const chart = stack.addImage(combinedTrendImage(drawn, opts.width, opts.height, TREND_INSET, {
     days: starts.slice(1, -1).map((t) => trendX(t, range, opts.width)),
     ...trendMarks(series, range, opts.now, opts.width, opts.height),
   }));
+  chart.resizable = false;
+  chart.imageSize = new Size(opts.width, opts.height);
   stack.addSpacer(TREND_LABEL_GAP);
   // Day labels, each centered under its day; today's stands out
   const labels = stack.addStack();
@@ -5339,14 +5524,15 @@ function screenSize() {
  * Home screen layout decision: from the size, padding and height budget, decide the rows shown per group (the result of visibleRows).
  * The header freshness, the trend windows and the drawing all use this result
  */
-function layoutGroups(view, family, parameter, now, { cached = false, screen = null, demo = false } = {}) {
+function layoutGroups(view, family, parameter, now, { cached = false, screen = null, demo = false, refresh = false } = {}) {
   const content = SIZE_CONTENT[family] ?? SIZE_CONTENT.medium;
   let scale = SCALES[family] ?? SCALES.medium;
   const pad = PADDING[family] ?? 0;
   const size = widgetSize(family, screen);
   const inner = size.width - 2 * pad;
   const large = family === "large" || family === "extraLarge";
-  // In small, two stacked groups pull the visual center down, so add a little space below to lift them
+  // In small, two stacked groups pull the visual center down, so add a little space below to lift them (always: the rows are chosen
+  // without it). Large sits a little higher too, but only out of the room its rows leave (no row is dropped for it: lifted below)
   const lift = family === "small" ? 2 : 0;
   const param = String(parameter ?? "").trim();
   const q = parseParameter(param);
@@ -5355,7 +5541,7 @@ function layoutGroups(view, family, parameter, now, { cached = false, screen = n
   const most = large && q.most;
   const compared = q.limits[0] ?? "five_hour";
   const chosen = most
-    ? mostFirst(groupsOf(view, q.providers.join(","), now, { allScoped: true }), compared, now)
+    ? mostFirst(groupsOf(view, q.providers.join(","), now, { allScoped: true, otherMakers: q.limits.length === 0 }), compared, now)
     : groupsOf(view, param, now, { allScoped: content.scoped });
   // Small with several providers by default (or named): one limit each, the same length for all (shortestShared)
   const groups = family === "small" && chosen.length >= 2 && q.limits.length === 0 ? shortestShared(chosen) : chosen;
@@ -5367,37 +5553,39 @@ function layoutGroups(view, family, parameter, now, { cached = false, screen = n
   // Words of the parameter not understood are said in the note row (small has none)
   const unknownNote = q.unknown.length > 0 ? `Unknown: ${q.unknown.join(", ")}` : "";
   const showNote = (cached || demoNote || Boolean(unknownNote)) && family !== "small";
-  // Height budget: the inside of the padding minus the visual correction, the note row and estimation error (2pt)
-  const available = size.height - 2 * pad - lift - (showNote ? 4 + scale.small * 1.25 : 0) - 2;
+  // Height budget for choosing the rows: the inside of the padding minus the small lift, the note row and estimation error (2pt)
+  const room = size.height - 2 * pad - lift - (showNote ? 4 + scale.small * 1.25 : 0) - 2;
   const message = scale.label * 1.25;
   const counts = (max) => groups.map((g) => Math.min(max, g.rows.length));
   const ranks = groups.map((g) => g.rows.map(rowRank));
   let limits;
   let between = 0;
+  // Most: the height of the others' row under the first (with its gap)
+  let othersHeight = 0;
   // Reserve the large chart's share first (spacing, legend, minimum height). Not if it isn't drawn (no shown provider has a weekly limit)
   const withChart = large && !most && content.trend && groups.some((g) => view?.[g.provider]?.windows?.[TREND_WINDOW]);
   const chart = withChart ? trendChrome(scale) + TREND_MIN_HEIGHT : 0;
   if (most) {
     // The others: their overall limits (as a medium column, two at most). The first: what the rest of the height holds
     const others = groups.slice(1).map((g) => Math.min(MAX_WINDOWS.medium, g.rows.filter((r) => r.kind === "missing" || r.window.scope === null).length));
-    const othersHeight = groups.length > 1
+    othersHeight = groups.length > 1
       ? MOST_GAP + Math.max(0, ...groups.slice(1).map((g, i) => groupHeight(scale, others[i], g.rows.length > 0 ? 0 : message)))
       : 0;
     const first = groups[0];
     const firstLimit = first
-      ? fitRows([Math.min(MAX_WINDOWS_SINGLE.large, first.rows.length)], scale, available - othersHeight, 0, first.rows.length > 0 ? 0 : message, [ranks[0]])[0]
+      ? fitRows([Math.min(MAX_WINDOWS_SINGLE.large, first.rows.length)], scale, room - othersHeight, 0, first.rows.length > 0 ? 0 : message, [ranks[0]])[0]
       : 0;
     limits = [firstLimit, ...others];
   } else if (large && !two) {
-    limits = fitRows(counts(MAX_WINDOWS_SINGLE.large), scale, available - chart, 0, groups.map((g) => (g.rows.length > 0 ? 0 : message)), ranks);
+    limits = fitRows(counts(MAX_WINDOWS_SINGLE.large), scale, room - chart, 0, groups.map((g) => (g.rows.length > 0 ? 0 : message)), ranks);
   } else if (large) {
-    limits = groups.map((g, i) => fitRows([Math.min(MAX_WINDOWS.large, g.rows.length)], scale, available - chart, 0, g.rows.length > 0 ? 0 : message, [ranks[i]])[0]);
+    limits = groups.map((g, i) => fitRows([Math.min(MAX_WINDOWS.large, g.rows.length)], scale, room - chart, 0, g.rows.length > 0 ? 0 : message, [ranks[i]])[0]);
   } else if (two && family !== "small") {
-    limits = groups.map((g) => fitRows([Math.min(MAX_WINDOWS[family] ?? 2, g.rows.length)], scale, available, 0, g.rows.length > 0 ? 0 : message)[0]);
+    limits = groups.map((g) => fitRows([Math.min(MAX_WINDOWS[family] ?? 2, g.rows.length)], scale, room, 0, g.rows.length > 0 ? 0 : message)[0]);
   } else {
     between = smallThree ? 6 : family === "small" ? 10 : 12;
     const mins = groups.map((g) => (g.rows.length > 0 ? 0 : message));
-    limits = fitRows(counts(family === "small" && two ? MAX_WINDOWS.small : MAX_WINDOWS_SINGLE[family] ?? 4), scale, available, between, mins, ranks);
+    limits = fitRows(counts(family === "small" && two ? MAX_WINDOWS.small : MAX_WINDOWS_SINGLE[family] ?? 4), scale, room, between, mins, ranks);
   }
   const laid = groups.map((g, i) => {
     const rows = visibleRows(g.rows, limits[i]);
@@ -5407,20 +5595,41 @@ function layoutGroups(view, family, parameter, now, { cached = false, screen = n
     const freshness = fresh && cached ? { level: fresh.level === "fresh" ? "stale" : fresh.level, text: `${WARN_MARK} ${fresh.text}`.trim() } : fresh;
     return { ...g, rows, freshness };
   });
-  // Height of the large chart: what's left after the two (or one) columns, between min and max
-  const columns = Math.max(0, ...laid.map((g) => groupHeight(scale, g.rows.length, g.rows.length > 0 ? 0 : message)));
-  // 0 means no chart
+  // The rows' height as drawn: side by side, the tallest column; stacked, all of them with the space between; most, the first and the
+  // others' row under it
+  const heightOf = (g) => groupHeight(scale, g.rows.length, g.rows.length > 0 ? 0 : message);
+  const columns = Math.max(0, ...laid.map(heightOf));
+  const sideBySide = large || (two && family !== "small");
+  const rowsHeight = most ? (laid[0] ? heightOf(laid[0]) : 0) + othersHeight
+    : sideBySide ? columns
+    : laid.reduce((sum, g) => sum + heightOf(g), 0) + between * Math.max(0, laid.length - 1);
+  // The large chart's floor: never lower than it was before (the room left with a 10% margin, no lift, no refresh control and the gap
+  // above the chart at TREND_GAP_BEFORE), nor under its least
+  const before = Math.floor(room - columns * 1.1 - trendChrome(scale) - (TREND_GAP_BEFORE - TREND_GAP));
+  const chartFloor = withChart ? Math.max(TREND_MIN_HEIGHT, before) : 0;
+  // What the rows and the chart's floor leave of the room goes first to the refresh control (its upper half and the gap over it), then to
+  // large's lift (up to LARGE_LIFT; none with the refresh control: the chart reaches down to it); the chart is fitted in what is left
+  const spare = room - rowsHeight - (withChart ? trendChrome(scale) + chartFloor : 0);
+  const refreshInside = refresh ? Math.max(0, Math.min(REFRESH_ROW / 2 + REFRESH_GAP, Math.floor(spare))) : 0;
+  const raised = large && !refresh ? Math.max(0, Math.min(LARGE_LIFT, Math.floor(spare))) : 0;
+  const available = room - refreshInside - raised;
+  // Height of the large chart: all the room left beside the rows' estimation margin, never under its least (0 means no chart). It is
+  // drawn at this size (never shrunk), so it never takes more than that room (the floor is kept by the lift and the refresh control
+  // giving way, not by overflowing)
   const trendHeight = withChart
-    // Allow 10% extra column height for estimation error (the chart can shrink, so the bars don't disappear on overflow)
-    ? Math.max(TREND_MIN_HEIGHT, Math.min(TREND_MAX_HEIGHT, Math.floor(available - columns * 1.1 - trendChrome(scale))))
+    ? Math.max(TREND_MIN_HEIGHT, Math.floor(available - columns * (1 + CHART_ROWS_MARGIN) - trendChrome(scale)))
     : 0;
+  // Small with providers stacked: half the room left under them goes between them (the rest stays around them, inside the padding)
+  if (family === "small" && laid.length >= 2) {
+    between += Math.max(0, Math.min(SMALL_SPREAD_MAX, Math.floor((available - rowsHeight) / 2 / (laid.length - 1))));
+  }
   // Side by side (medium and large): columns of a fixed equal width (long text doesn't widen one), closer together when three. In most,
   // the others under the first
   const side = most ? groups.length - 1 : groups.length;
   const gap = side >= 3 ? 10 : 14;
   const colWidth = most ? (side > 0 ? Math.floor((inner - gap * (side - 1)) / side) : inner)
     : two ? Math.floor((inner - gap * (groups.length - 1)) / groups.length) : inner;
-  return { content, scale, pad, size, inner, large, lift, showNote, demoNote, unknownNote, most, two: most ? false : two, between, trendHeight, gap, colWidth, groups: laid };
+  return { content, scale, pad, size, inner, large, showNote, demoNote, unknownNote, most, two: most ? false : two, between, trendHeight, lift: lift + raised, refreshInside, gap, colWidth, groups: laid };
 }
 
 /** The parameter's word for a limit */
@@ -5489,8 +5698,8 @@ function fitRows(counts, scale, available, between, minBody = 0, ranks = null) {
 }
 
 /**
- * Frame for the content: fix the width to the inside of the padding (from the size table) and center it horizontally and vertically in the widget.
- * Even on devices larger than the table, content isn't off-center and padding is even on all sides. lift is the visual-center correction (extra space below)
+ * The body, centered in a frame of the inner width (from the device's widget size): even on devices larger than the table, content isn't
+ * off-center and padding is even on all sides. lift is the visual-center correction (extra space below: the content sits higher by half)
  */
 function centeredBody(widget, width, lift = 0) {
   widget.addSpacer(null);
@@ -5533,9 +5742,28 @@ function drawWidget(result, family, parameter, now) {
   // Same padding on all sides
   const pad = PADDING[family] ?? 0;
   widget.setPadding(pad, pad, pad, pad);
-  if (!accessory) widget.backgroundColor = themed(WIDGET_BG.light, WIDGET_BG.dark);
+  if (!accessory) {
+    // The layout guides (Settings › Display) are drawn as the background image, which Scriptable's transparent style would replace:
+    // while they are on, a Transparent choice draws as Auto
+    const guided = readGuides();
+    if (!guided && currentAppearance() === "transparent" && transparentShown(widget)) widget.backgroundStyle = "transparent";
+    else widget.backgroundColor = themed(WIDGET_BG.light, WIDGET_BG.dark);
+    // Over the background, taking no room
+    if (guided) {
+      const guides = guidesImage(family, pad);
+      if (guides) widget.backgroundImage = guides;
+    }
+  }
   if (result.error) {
+    // A home screen widget can be refreshed from here too (a fetch that failed with nothing saved to show: tried again on a tap). The
+    // message stays in the middle, the refresh control at the bottom
+    const retry = !accessory && refreshable(widget) && !result.demo;
+    if (retry) widget.addSpacer(null);
     addSmallText(widget, family === "accessoryInline" ? `Headroom: ${result.error}` : result.error, 12, SUB());
+    if (retry) {
+      widget.addSpacer(null);
+      addRefreshRow(widget, pad, REFRESH_ROW / 2, widgetSize(family, screenSize()).width - 2 * pad);
+    }
     return widget;
   }
   const cached = result.cachedAt !== undefined;
@@ -5654,7 +5882,9 @@ function drawWidget(result, family, parameter, now) {
   }
 
   // Home screen: compute the inner width from the device's widget size, then draw in a centered frame of that width
-  const layout = layoutGroups(result.view, family, param, now, { cached, screen: screenSize(), demo: Boolean(result.demo) });
+  // The refresh control (Scriptable 1.8 or newer, not in the demo): laid out with it, drawn at the end
+  const refresh = refreshable(widget) && !result.demo;
+  const layout = layoutGroups(result.view, family, param, now, { cached, screen: screenSize(), demo: Boolean(result.demo), refresh });
   const { content, scale, inner, groups, two, large } = layout;
   const body = centeredBody(widget, inner, layout.lift);
   if (tap && groups.length === 1) widget.url = tapTo(groups[0].provider);
@@ -5724,7 +5954,50 @@ function drawWidget(result, family, parameter, now) {
     row.addSpacer(null);
     addSmallText(row, [layout.demoNote ? "Demo" : "", note, layout.unknownNote].filter(Boolean).join(" · "), 9, SUB());
   }
+  if (refresh) addRefreshRow(widget, layout.pad, layout.refreshInside, layout.inner);
   return widget;
+}
+
+/** Whether this Scriptable can give a home screen widget a refresh control (Scriptable 1.8 or newer: stack actions) */
+function refreshable(widget) {
+  return typeof widget?.addRefreshButton === "function";
+}
+
+/**
+ * The refresh control's row at the bottom: inside (points, up to REFRESH_ROW / 2 + REFRESH_GAP: the layout took it from the content)
+ * above the bottom padding's edge, the row's upper half first, then the gap over it; the rest of the row is in the padding (the bottom
+ * padding gives up that much). Across, a frame of the content's width (centered as the content is), the control at its right
+ */
+function addRefreshRow(widget, pad, inside = 0, width = 0) {
+  const above = Math.min(REFRESH_ROW / 2, inside);
+  widget.setPadding(pad, pad, Math.max(0, pad - (REFRESH_ROW - above)), pad);
+  if (inside > above) widget.addSpacer(inside - above);
+  const row = widget.addStack();
+  row.layoutHorizontally();
+  row.centerAlignContent();
+  row.size = new Size(0, REFRESH_ROW);
+  row.addSpacer(null);
+  const frame = row.addStack();
+  frame.layoutHorizontally();
+  frame.centerAlignContent();
+  frame.size = new Size(width, REFRESH_ROW);
+  row.addSpacer(null);
+  frame.addSpacer(null);
+  const control = frame.addStack();
+  control.layoutHorizontally();
+  control.centerAlignContent();
+  control.spacing = 2;
+  try {
+    control.setAction(REFRESH_TITLE, { id: "refresh" });
+  } catch (_) {
+    // A Scriptable that can't make it a button: the row stays empty (no Refresh that can't be tapped; the layout as with it)
+    return row;
+  }
+  addSmallText(control, REFRESH_TITLE, REFRESH_FONT, SUB());
+  const image = control.addImage(SFSymbol.named(REFRESH_SYMBOL).image);
+  image.imageSize = new Size(REFRESH_FONT, REFRESH_FONT);
+  image.tintColor = SUB();
+  return row;
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -5738,12 +6011,12 @@ if (typeof Script !== "undefined" && typeof ListWidget !== "undefined") {
   module.exports = {
     HEADROOM_VERSION, VIEW_VERSION, KEYCHAIN_CONFIG, KEYCHAIN_CURRENT, KEYCHAIN_LEGACY, MAX_WINDOWS, normalizeBaseUrl, buildRequest, validateSetup, sanitizeView,
     atDisplayTime, recentSettledAt, shortMark, selectWindows, groupsOf, barSegments, barWidths, windowName, limitLabel, shortName,
-    percentText, compactPercent, parseParameter, lockMissing, LIMIT_NAMES, mostFirst, sortRows, demoResult, DEMO_SCENARIOS, rowPlan, textWidth, fittedSizes, ringOf, ringImage, LOCK_RINGS, lockPicks, drawLockPair, drawLockOthers, othersMissing, LOCK_TITLE_WIDTH, LOCK_TEXT, LOCK_LINE_WIDTH, LOCK_SHORT_WORDS, fitSize, countdownWidth, INLINE_WIDTH, SHORT_ERROR_NAMES, timeShort, whenShort, TIME_SYMBOLS, limitName, refreshAfter, inlineText, segmentShape, BRAND_COLORS, ICONS, ALT_ICONS, KEYCHAIN_ICONS, readIconChoice, currentIcons, pngAspect, iconBox, iconSlot, lockSlack, lockOrder, KEYCHAIN_APPEARANCE, readAppearance, themed, pageAppearance, WIDGET_BG,
-    SIZE_CONTENT, paceText, sanitizeHistory, sparkLines, trendWindows, clockText, widgetSize, PADDING, drawnJunction,
+    percentText, compactPercent, parseParameter, lockMissing, LIMIT_NAMES, mostFirst, sortRows, demoResult, DEMO_SCENARIOS, rowPlan, textWidth, fittedSizes, ringOf, ringImage, LOCK_RINGS, lockPicks, drawLockPair, drawLockOthers, othersMissing, LOCK_TITLE_WIDTH, LOCK_TEXT, LOCK_LINE_WIDTH, LOCK_SHORT_WORDS, fitSize, countdownWidth, INLINE_WIDTH, SHORT_ERROR_NAMES, timeShort, whenShort, TIME_SYMBOLS, limitName, refreshAfter, inlineText, segmentShape, BRAND_COLORS, ICONS, ALT_ICONS, KEYCHAIN_ICONS, readIconChoice, currentIcons, pngAspect, iconBox, iconSlot, lockSlack, lockOrder, KEYCHAIN_APPEARANCE, readAppearance, rowLabel, WIDGET_SCOPE_NAMES, widgetScopeName, KEYCHAIN_GUIDES, readGuides, guidesImage, GUIDE_COLORS, themed, pageAppearance, WIDGET_BG, transparentShown,
+    CHART_ROWS_MARGIN, LARGE_LIFT, SMALL_SPREAD_MAX, TREND_MIN_HEIGHT, TREND_GAP, REFRESH_TITLE, REFRESH_SYMBOL, REFRESH_FONT, REFRESH_ROW, REFRESH_GAP, trendChrome, SIZE_CONTENT, paceText, sanitizeHistory, sparkLines, trendWindows, clockText, widgetSize, PADDING, drawnJunction,
     projectionOf, barSegmentsAt, barPieces, freshnessOf, resetShort, rowMark, SCALES, WARN_MARK, BAR_COLORS, PROVIDER_ORDER, NOT_AVAILABLE, trendDrawOrder, lineHeight, subHeight, rowHeightOf, FRESH_COLORS, fitRows, groupHeight, thinPoints, paceOf, visibleRows, sanitizeBoundaries, layoutGroups, rowRank, trendSeries, timerWidth, remainingText, trendY, TREND_HOURS, weekRange, dayStarts, trendX, WEEKDAYS, resetTimes, cycleEnd, scopeName, RESET_MARK, limitLifted, clipSegment, paceGuide, forecastSegment, trendMarks,
     splitNotify, notifyPrefs, reminderPlan, reconcileReminders, reminderId, sanitizeEvents, selectAlerts, alertNotifications, sampleNotifications, eventPhrase, notifyTitle, SYMBOLS, eventsFileName, eventsCursor,
     readNotifyState, readRecords, forgetSwitched, withdrawnAt, accountMark, emptyViewAt, recordName, parseRecord, eventMark, lockFree, holdsLock, withoutCancelled, orphanFiles, fileTag, deliveredSeqs, keepTold, readConfigState, LOCK_SETTLE_MS, detailUrl, parameterGuideHtml, buildParameter, PARAMETER_CHOICES, PARAMETER_GUIDE, detailHtml, detailTiles, tilesHtml, tileTime, providerAge, worstText, fullLimitName, detailChart, dayLabel, iconCss, missingFiveHour, esc, KEYCHAIN_NOTIFY, RUNOUT_LEAD_MINUTES,
-    resetDate, errorText, cachedNote, readCache, originTag, cacheTag, sameConfig, DEFAULT_CONFIG_ID, cacheFileName, seenFileName, pickCache, seenFrom, OWN_FILE, formatDuration,
+    resetDate, errorText, errorHint, ERROR_NAMES, DETAIL_ERROR_NAMES, cachedNote, readCache, originTag, cacheTag, sameConfig, DEFAULT_CONFIG_ID, cacheFileName, seenFileName, pickCache, seenFrom, OWN_FILE, formatDuration,
     TIME_MARKS, timeMarkOf, providerList, defaultProviders, missingText, demoParameter, MAX_REMINDERS, KEPT_REMINDERS, SHORT_PROVIDER_NAMES, NOT_SET_UP, NOT_SET_UP_HINT, DENIED_HINT, UNVERIFIED_PROVIDERS, DEFAULT_PROVIDERS, MAX_PROVIDERS, VIEW_PROVIDERS, FALLBACK_MARKS, PROVIDER_NAMES,
   };
 }
