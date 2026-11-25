@@ -247,6 +247,10 @@ pub struct GeminiState {
     pub limits_changed: bool,
     /// The limits seen when the pause began (taken on --same-account or --accept-account)
     pub pending_windows: Vec<String>,
+    /// The next limits seen wait for the user's confirmation whatever they are: a pause was dropped with its clock epoch (its limits
+    /// may not be seen again: an earlier version's pause on a model's limit, or overall limits that went back while a model's limit
+    /// changed). Its doubt is kept through the pauses it makes (also across another epoch change) until an acceptance is saved
+    pub confirm_limits: bool,
     /// Clock epoch of the fetch that showed the pending limits. A pause of another epoch is dropped (the next fetch sees it again)
     pub pending_epoch: Option<u64>,
     /// Accepted as another account on other limits, before its email was seen: the next other email is that account (no second
@@ -1563,7 +1567,7 @@ impl GeminiProvider {
         shape.extend(cap.quota_disabled.iter().cloned());
         shape.sort();
         shape.dedup();
-        if !self.state.known_windows.is_empty() && shape != self.state.known_windows {
+        if self.state.confirm_limits || self.limits_differ(&shape) {
             self.state.limits_changed = true;
             self.state.switch_seq += 1;
             self.state.pending_windows = shape;
@@ -1572,9 +1576,8 @@ impl GeminiProvider {
             self.log_diag("statusLine", Diag::LimitsChanged);
             return;
         }
-        if self.state.known_windows.is_empty() {
-            self.state.known_windows = shape;
-        }
+        // The limits of one model or of the other vendors' models that came or went are taken as they are
+        self.state.known_windows = shape;
         self.state.last_ok = Some(Observation {
             fetched_ms: at,
             windows,
@@ -1585,12 +1588,29 @@ impl GeminiProvider {
         self.state.refetch = false;
     }
 
-    /// A pause on other limits seen in another clock epoch is dropped: the next fetch sees them again in this one (an observation of
-    /// an earlier epoch never leads to an acceptance). true if dropped
+    /// Whether a set of known limits differs from this account's where it tells of another plan or account: its overall limits (those
+    /// of no model and not of the other vendors' models). A limit of one model, or the other vendors' group, comes and goes as the
+    /// service changes (Antigravity dropped Argon's own weekly limit), and is taken as it is. None known yet: nothing to differ from
+    fn limits_differ(&self, shape: &[String]) -> bool {
+        let overall = |ids: &[String]| -> Vec<String> {
+            ids.iter()
+                .filter(|id| matches!(crate::schema::sendable_scope_in("gemini", id), Some(None)))
+                .cloned()
+                .collect()
+        };
+        !self.state.known_windows.is_empty() && overall(shape) != overall(&self.state.known_windows)
+    }
+
+    /// A pause on other limits seen in another clock epoch is dropped (an observation of an earlier epoch never leads to an
+    /// acceptance), its doubt kept: the next limits seen in this one wait for a confirmation. true if dropped
     fn drop_old_pause(&mut self, current: Option<u64>) -> bool {
         if !self.state.limits_changed || current.is_none() || self.state.pending_epoch == current {
             return false;
         }
+        // Its doubt isn't dropped with it: the next limits seen wait for the user's confirmation whatever they are (the limits it
+        // waited on may not be seen again: an earlier version's pause on a model's limit, or overall limits that went back while
+        // a model's limit changed)
+        self.state.confirm_limits = true;
         self.state.limits_changed = false;
         self.state.pending_windows.clear();
         self.state.pending_epoch = None;
@@ -1704,6 +1724,8 @@ impl GeminiProvider {
         self.state.pending_epoch = None;
         self.state.account_changed = false;
         self.state.limits_changed = false;
+        // A doubt kept from an earlier pause ends with the user's acceptance (also of another account), saved below
+        self.state.confirm_limits = false;
         if matches!(
             self.state.last_error,
             Some(Diag::AccountChanged | Diag::LimitsChanged)
@@ -1826,8 +1848,9 @@ impl GeminiProvider {
                     .log("gemini: the account changed during the fetch: its result isn't used");
             }
             Ok((windows, shape)) => {
-                if !self.state.known_windows.is_empty() && shape != self.state.known_windows {
-                    // Other limits than this account's: paused, and these values are neither shown nor sent until confirmed
+                if self.state.confirm_limits || self.limits_differ(&shape) {
+                    // Other overall limits than this account's (or a doubt kept from an earlier pause): paused, and these values are
+                    // neither shown nor sent until confirmed
                     self.state.limits_changed = true;
                     self.state.switch_seq += 1;
                     self.state.pending_windows = shape;
@@ -1837,9 +1860,8 @@ impl GeminiProvider {
                     self.run = left_out;
                     return;
                 }
-                if self.state.known_windows.is_empty() {
-                    self.state.known_windows = shape;
-                }
+                // The limits of one model or of the other vendors' models that came or went are taken as they are
+                self.state.known_windows = shape;
                 self.state.last_ok = Some(Observation {
                     fetched_ms: now,
                     windows,
@@ -2742,6 +2764,20 @@ mod tests {
         let s = p.collect(NOW + 3 * MINUTE_MS, false);
         assert!(!p.state.limits_changed);
         assert!(!ids(&s).contains(&"partner_five_hour".to_string()));
+        // a model's own limit gone (Argon's, as on 2026-11-23): taken as it is, no pause
+        let mut gone = quota_of("usage-pro.json");
+        gone.as_object_mut()
+            .unwrap()
+            .remove("gemini-argon-wtu-weekly");
+        statusline(
+            &h,
+            "a@example.com",
+            Some(gone),
+            NOW + 3 * MINUTE_MS + 10_000,
+        );
+        let s = p.collect(NOW + 3 * MINUTE_MS + 20_000, false);
+        assert!(!p.state.limits_changed);
+        assert!(!ids(&s).contains(&"seven_day_argon".to_string()));
         // other limits: paused, as from a fetch
         statusline(
             &h,
@@ -3323,6 +3359,64 @@ mod tests {
     }
 
     #[test]
+    fn a_model_s_limit_or_the_other_vendors_limits_coming_or_going_don_t_pause_other_overall_limits_do()
+     {
+        let h = home("limits-aux");
+        let fake = Fake::default();
+        identify(&h, "a@example.com", NOW);
+        let mut p = provider(&h, &fake);
+        p.collect(NOW, false);
+        assert!(
+            p.state
+                .known_windows
+                .contains(&"seven_day_argon".to_string())
+        );
+        // Argon's own weekly limit dropped (as on 2026-11-23), then the other vendors' limits too: taken as they are
+        let without = |ids: &[&str]| {
+            let mut v = fixture("usage-pro.json");
+            for g in v["command"]["data"]["groups"].as_array_mut().unwrap() {
+                g["buckets"]
+                    .as_array_mut()
+                    .unwrap()
+                    .retain(|b| !ids.contains(&b["id"].as_str().unwrap()));
+            }
+            v
+        };
+        fake.reply(vec![Ok(without(&["gemini-argon-wtu-weekly"]))]);
+        let s = p.collect(NOW + 6 * MINUTE_MS, false);
+        assert!(!p.state.limits_changed);
+        assert_eq!(s.status, ProviderStatus::Ok);
+        assert!(!ids(&s).contains(&"seven_day_argon".to_string()));
+        assert!(
+            !p.state
+                .known_windows
+                .contains(&"seven_day_argon".to_string())
+        );
+        fake.reply(vec![Ok(without(&[
+            "gemini-argon-wtu-weekly",
+            "3p-5h",
+            "3p-weekly",
+        ]))]);
+        let s = p.collect(NOW + 12 * MINUTE_MS, false);
+        assert!(!p.state.limits_changed);
+        assert_eq!(s.status, ProviderStatus::Ok);
+        // and one coming back the same
+        fake.reply(vec![Ok(fixture("usage-pro.json"))]);
+        p.collect(NOW + 18 * MINUTE_MS, false);
+        assert!(!p.state.limits_changed);
+        assert!(
+            p.state
+                .known_windows
+                .contains(&"seven_day_argon".to_string())
+        );
+        // an overall limit gone (the 5-hour one: another plan, or another account): paused as before
+        fake.reply(vec![Ok(without(&["gemini-5h"]))]);
+        let s = p.collect(NOW + 24 * MINUTE_MS, false);
+        assert!(p.state.limits_changed);
+        assert_eq!(s.error_code, Some(ErrorCode::FetchFailed));
+    }
+
+    #[test]
     fn other_limits_pause_and_resume_as_the_same_account_without_a_boundary_or_as_another_with_one()
     {
         let h = home("limits");
@@ -3458,6 +3552,90 @@ mod tests {
         p.collect(NOW + 13 * MINUTE_MS, true);
         assert!(!p.state.limits_changed);
         assert_eq!(p.state.last_ok, fetched);
+    }
+
+    #[test]
+    fn an_earlier_version_s_pause_on_a_model_s_limit_waits_for_a_confirmation_also_after_its_clock_epoch_is_gone()
+     {
+        let h = home("pause-inherited");
+        let fake = Fake::default();
+        identify(&h, "a@example.com", NOW);
+        let mut p = provider(&h, &fake);
+        p.collect(NOW, false);
+        // paused by an earlier version on Argon's limit gone (the overall limits the same), in an epoch since gone
+        let mut state = load_state(&h.join(STATE_FILE));
+        let mut pending = state.known_windows.clone();
+        pending.retain(|id| id != "seven_day_argon");
+        state.limits_changed = true;
+        state.pending_windows = pending;
+        state.pending_epoch = Some(12345);
+        state.last_error = Some(Diag::LimitsChanged);
+        write_json_atomic(&h.join(STATE_FILE), &state).unwrap();
+        // its doubt is kept: the next fetch's limits, the same overall ones, wait for a confirmation in this epoch
+        let usages = fake.usages();
+        p.collect(NOW + 20 * MINUTE_MS, true);
+        assert_eq!(fake.usages(), usages + 1, "fetched again in this epoch");
+        assert!(p.state.limits_changed, "paused again, now in this epoch");
+        assert_eq!(p.state.pending_epoch, crate::clock::usable_epoch(&h));
+        // the epoch gone again before an acceptance: the doubt stays, the same limits pause again
+        refuse_clock(&h);
+        lift_refusal(&h);
+        let usages = fake.usages();
+        p.collect(NOW + 30 * MINUTE_MS, true);
+        assert_eq!(fake.usages(), usages + 1);
+        assert!(p.state.limits_changed, "still waits for a confirmation");
+        assert!(p.state.confirm_limits);
+        // confirmed as the same account: resumes, and the doubt is over
+        p.accept_target(p.pending_switch());
+        p.confirm_same_account();
+        p.collect(NOW + 31 * MINUTE_MS, false);
+        assert_eq!(p.account_accepted(), Some(true));
+        assert!(!p.state.limits_changed);
+        assert!(!p.state.confirm_limits);
+
+        // a pause on other overall limits (only the weekly one), dropped with its epoch, then the earlier overall limits back with
+        // Argon's gone: still waits for a confirmation
+        let h = home("pause-overall-then-aux");
+        let mut p = provider(&h, &fake);
+        identify(&h, "a@example.com", NOW);
+        p.collect(NOW, false);
+        let mut state = load_state(&h.join(STATE_FILE));
+        state.limits_changed = true;
+        state.pending_windows = vec!["partner_seven_day".into(), "seven_day".into()];
+        state.pending_epoch = Some(12345);
+        write_json_atomic(&h.join(STATE_FILE), &state).unwrap();
+        let mut v = fixture("usage-pro.json");
+        for g in v["command"]["data"]["groups"].as_array_mut().unwrap() {
+            g["buckets"]
+                .as_array_mut()
+                .unwrap()
+                .retain(|b| b["id"] != "gemini-argon-wtu-weekly");
+        }
+        fake.reply(vec![Ok(v)]);
+        p.collect(NOW + 20 * MINUTE_MS, true);
+        assert!(p.state.limits_changed, "waits for a confirmation");
+
+        // the same when a statusLine input brings the next limits (no fetch)
+        let h = home("pause-inherited-passive");
+        statusline(&h, "a@example.com", Some(quota_of("usage-pro.json")), NOW);
+        let mut p = provider(&h, &fake);
+        p.hold_fetch_until(i64::MAX);
+        p.collect(NOW + MINUTE_MS, false);
+        let mut state = load_state(&h.join(STATE_FILE));
+        let mut pending = state.known_windows.clone();
+        pending.retain(|id| id != "seven_day_argon");
+        state.limits_changed = true;
+        state.pending_windows = pending;
+        state.pending_epoch = Some(12345);
+        write_json_atomic(&h.join(STATE_FILE), &state).unwrap();
+        let mut gone = quota_of("usage-pro.json");
+        gone.as_object_mut()
+            .unwrap()
+            .remove("gemini-argon-wtu-weekly");
+        statusline(&h, "a@example.com", Some(gone), NOW + 2 * MINUTE_MS);
+        p.collect(NOW + 3 * MINUTE_MS, false);
+        assert!(p.state.limits_changed, "paused again, now in this epoch");
+        assert_eq!(p.state.pending_epoch, crate::clock::usable_epoch(&h));
     }
 
     #[test]
