@@ -5705,6 +5705,58 @@ test("the details list the providers the widget shows by default, Gemini's detai
   assert.equal(lib.sanitizeView({ ...limited, data_version: 3 }).claude.blocked, true, "a limit without a denial stays");
 });
 
+test("an empty provider's details give one next step, once, only without a more specific hint or any limit (also from the saved view)", () => {
+  const at = "2026-11-16T12:59:00.000Z";
+  const w = (id: string, used: number, kind: "session" | "weekly") =>
+    ({ id, label: id, kind, scope: null, used_percent: used, resets_at: kind === "session" ? "2026-11-16T16:00:00.000Z" : "2026-11-20T00:00:00.000Z", fetched_at: at });
+  const producer = (windows: unknown[], error_code: string | null = null) => {
+    const s = fixture();
+    s.providers.gemini = { status: "ok", fetched_at: at, collector: "win-desktop", error: null, error_code, plan: "pro", blocked: false, history_since: null, windows } as never;
+    return lib.sanitizeView({ ...toView(mergeSnapshots([s])!, NOW), data_version: 3, boundaries: { claude: "#0", codex: "#0", gemini: "" } });
+  };
+  const page = (view: any) => lib.detailHtml({ view, events: [], trends: {}, now: NOW, provider: "gemini" }) as string;
+  const hint = lib.esc(lib.EMPTY_HINT);
+  const count = (s: string, part: string) => s.split(part).length - 1;
+  // default: the tapped provider without any limit shows the sentence once, beside the unchanged message and no unavailable 5h tile
+  const empty = producer([]);
+  assert.equal(empty.gemini.window_ids.length, 0, "the producer's confirmed-empty provider");
+  const html = page(empty);
+  assert.equal(count(html, "No limits to show"), 1);
+  assert.equal(count(html, hint), 1);
+  assert.ok(!html.includes(`<span class="name">5h limit</span>`), "no unavailable 5h tile");
+  // the not-set-up branch keeps its own hint only
+  const none = page({ ...empty, gemini: null });
+  assert.ok(none.includes(lib.esc(lib.NOT_SET_UP_HINT)) && !none.includes(hint));
+  // an access denial keeps its recovery hint and gets no generic one
+  const denied = page(producer([], "access_denied"));
+  assert.ok(denied.includes(lib.esc(lib.errorHint("access_denied", "gemini"))), "the denial's own hint");
+  assert.ok(!denied.includes(hint) && !denied.includes("No limits to show"));
+  // a weekly-only provider: its weekly tile stays, the existing unavailable 5h tile stays, and no generic sentence
+  const weeklyView = producer([w("seven_day", 40, "weekly")]);
+  const weekly = page(weeklyView);
+  const wk = lib.atDisplayTime(weeklyView.gemini.windows.seven_day, NOW);
+  assert.ok(lib.remainingText(wk).includes("60%"), lib.remainingText(wk));
+  assert.ok(weekly.includes(`<span class="name">${lib.esc(lib.limitLabel(wk))}</span><b>${lib.esc(lib.remainingText(wk))}</b>`), "the weekly tile and its value");
+  assert.ok(weekly.includes(`<span class="name">5h limit</span>`) && !weekly.includes(hint) && !weekly.includes("No limits to show"));
+  // a populated view shows its limits without the sentence
+  const full = producer([w("five_hour", 30, "session"), w("seven_day", 40, "weekly")]);
+  assert.ok(!page(full).includes(hint));
+  // the saved-view round trip (the fallback when a fetch fails), empty and populated: same pages, no new fields in the saved payload
+  for (const [view, expectHint] of [[empty, true], [full, false]] as const) {
+    const files = new Map<string, string>();
+    const fm = { documentsDirectory: () => "/docs", joinPath: (a: string, b: string) => `${a}/${b}`, writeString: (p: string, t: string) => void files.set(p, t),
+      readString: (p: string) => files.get(p)!, listContents: () => [...files.keys()].map((p) => p.replace("/docs/", "")), remove: (p: string) => void files.delete(p) };
+    assert.equal(lib.saveCache(fm, TAG, "https://headroom.example.com", view), true);
+    const saved = JSON.parse(files.get(`/docs/${lib.cacheFileName(TAG, 3)}`)!);
+    assert.deepEqual(Object.keys(saved).sort(), ["origin", "saved_at", "view"]);
+    assert.deepEqual(saved.view, plain(view), "the saved view is the received one");
+    assert.ok(!JSON.stringify(saved).includes(lib.EMPTY_HINT), "no hint text saved");
+    const loaded = lib.loadCache(fm, TAG, "https://headroom.example.com");
+    assert.equal(count(page(loaded.view), hint), expectHint ? 1 : 0);
+    assert.equal(page(loaded.view), page(view), "the same page from the saved view");
+  }
+});
+
 test("past 50 time reminders, the earliest are planned and every one planned is read back (none rings twice)", () => {
   // 17 overall windows per provider, each running out at its own time
   const now = NOW;

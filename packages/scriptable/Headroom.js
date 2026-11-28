@@ -2347,6 +2347,9 @@ function detailOrder(p) {
     .map((x) => x.id);
 }
 
+/** The one next step under "No limits to show" (only when no error hint is shown; the refresh control is the page's own) */
+const EMPTY_HINT = "Check that the Headroom collector is running on your PC, then refresh the widget.";
+
 function detailHtml(input) {
   const { view, events, trends, now, provider = null, note = "" } = input;
   // The providers the widget shows by default (Codex, Claude and any other with values), or the one tapped
@@ -2372,7 +2375,7 @@ function detailHtml(input) {
     // A provider in error: what it is and what to do, also while values from before are shown under it
     const message = p.error_code
       ? `<p class="message">${esc(SYMBOLS.runout)} ${esc(DETAIL_ERROR_NAMES[p.error_code] ?? ERROR_NAMES[p.error_code])}</p><p class="na-note">${esc(errorHint(p.error_code, id))}</p>`
-      : p.window_ids.length === 0 ? `<p class="message">${esc(SYMBOLS.runout)} No limits to show</p>` : "";
+      : p.window_ids.length === 0 ? `<p class="message">${esc(SYMBOLS.runout)} No limits to show</p><p class="na-note">${esc(EMPTY_HINT)}</p>` : "";
     const missing = missingFiveHour(p)
       ? `<div class="limit na"><div class="top"><span class="name">5h limit</span><b>—</b></div><div class="bar"></div>` +
         `<p class="na-note">${esc(TIME_MARKS.none)} ${esc(NOT_AVAILABLE)}</p></div>`
@@ -6024,6 +6027,6 @@ if (typeof Script !== "undefined" && typeof ListWidget !== "undefined") {
     splitNotify, notifyPrefs, reminderPlan, reconcileReminders, reminderId, sanitizeEvents, selectAlerts, alertNotifications, sampleNotifications, eventPhrase, notifyTitle, SYMBOLS, eventsFileName, eventsCursor,
     readNotifyState, readRecords, forgetSwitched, withdrawnAt, accountMark, emptyViewAt, recordName, parseRecord, eventMark, lockFree, holdsLock, withoutCancelled, orphanFiles, fileTag, deliveredSeqs, keepTold, readConfigState, LOCK_SETTLE_MS, detailUrl, parameterGuideHtml, buildParameter, PARAMETER_CHOICES, PARAMETER_GUIDE, detailHtml, detailTiles, tilesHtml, tileTime, providerAge, worstText, fullLimitName, detailChart, dayLabel, iconCss, missingFiveHour, esc, KEYCHAIN_NOTIFY, RUNOUT_LEAD_MINUTES,
     resetDate, errorText, errorHint, ERROR_NAMES, DETAIL_ERROR_NAMES, cachedNote, readCache, originTag, cacheTag, sameConfig, DEFAULT_CONFIG_ID, cacheFileName, seenFileName, pickCache, seenFrom, OWN_FILE, formatDuration,
-    TIME_MARKS, timeMarkOf, providerList, defaultProviders, missingText, demoParameter, MAX_REMINDERS, KEPT_REMINDERS, SHORT_PROVIDER_NAMES, NOT_SET_UP, NOT_SET_UP_HINT, DENIED_HINT, UNVERIFIED_PROVIDERS, DEFAULT_PROVIDERS, MAX_PROVIDERS, VIEW_PROVIDERS, FALLBACK_MARKS, PROVIDER_NAMES,
+    TIME_MARKS, timeMarkOf, providerList, defaultProviders, missingText, demoParameter, MAX_REMINDERS, KEPT_REMINDERS, SHORT_PROVIDER_NAMES, NOT_SET_UP, NOT_SET_UP_HINT, EMPTY_HINT, saveCache, loadCache, DENIED_HINT, UNVERIFIED_PROVIDERS, DEFAULT_PROVIDERS, MAX_PROVIDERS, VIEW_PROVIDERS, FALLBACK_MARKS, PROVIDER_NAMES,
   };
 }
