@@ -54,11 +54,13 @@ final class AppState {
     /** Saves on the settings queue; `done` gets the error (nil when saved), on the main thread */
     func save(url: String, token: String?, demo: Bool, done: @escaping (SaveError?) -> Void) {
         saving.async { [self] in
-            // Under the lock, so no read's result comes in between (a save is rare, and the screen waits for it at most briefly);
-            // the main thread never waits on the keychain for it
+            // The keychain and the file outside the lock (saves run one at a time on this queue, so the settings read here stay the
+            // current ones until applied); then the state, briefly, under it
             let outcome: SaveError?
             do {
-                try with { try $0.save(url: url, token: token, demo: demo, keep: keep) }
+                let (settings, has) = with { ($0.settings, $0.hasToken) }
+                let saved = try State.persist(settings: settings, hasToken: has, url: url, token: token, demo: demo, keep: keep)
+                with { $0.apply(saved) }
                 tokenKnown = true
                 outcome = nil
             } catch let e as SaveError {
@@ -79,7 +81,8 @@ final class AppState {
         saving.async { [self] in
             let outcome: SaveError?
             do {
-                try with { try $0.removeToken(keep: keep) }
+                let saved = try State.persistRemoval(settings: with { $0.settings }, keep: keep)
+                with { $0.apply(saved) }
                 outcome = nil
             } catch let e as SaveError {
                 outcome = e
@@ -102,13 +105,21 @@ final class AppState {
     private func checkToken() {
         if tokenKnown { return }
         let settings = with { $0.settings }
-        switch keep.lookUp(settings) {
-        case .token:
+        let found = keep.lookUp(settings)
+        // Taken only for the settings it was asked about (a save meanwhile has said for itself)
+        let current = with { s -> Bool in
+            guard s.settings == settings else { return false }
+            switch found {
+            case .token: s.hasToken = true
+            case .none: s.hasToken = false
+            case .unknown: break
+            }
+            return true
+        }
+        if !current { return }
+        switch found {
+        case .token, .none:
             tokenKnown = true
-            with { $0.hasToken = true }
-        case .none:
-            tokenKnown = true
-            with { $0.hasToken = false }
         case .unknown:
             // Asked again on the next turn (a nudge, waking from sleep, or an hour)
             with { $0.error = "Couldn't read the keychain" }

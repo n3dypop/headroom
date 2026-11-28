@@ -121,9 +121,30 @@ public struct State {
         }
     }
 
-    /** Saves the server and (when given) its token. The token goes to the keychain only, never to a file or a log; each saved
-     * token gets an item of its own, which only the settings file names, so the save takes effect when the file is written */
-    public mutating func save(url rawURL: String, token rawToken: String?, demo: Bool, keep: Keep) throws {
+    /** Saves the server and (when given) its token: persist, then apply. The token goes to the keychain only, never to a file or a
+     * log; each saved token gets an item of its own, which only the settings file names, so the save takes effect when the file is
+     * written */
+    public mutating func save(url: String, token: String?, demo: Bool, keep: Keep) throws {
+        apply(try State.persist(settings: settings, hasToken: hasToken, url: url, token: token, demo: demo, keep: keep))
+    }
+
+    /** Forgets the token: persist, then apply */
+    public mutating func removeToken(keep: Keep) throws {
+        apply(try State.persistRemoval(settings: settings, keep: keep))
+    }
+
+    /** A save written to the keychain and the settings file, to be applied to the state */
+    public struct Saved {
+        public let old: Settings
+        public let next: Settings
+        /** A new token was stored */
+        public let newEntry: Bool
+        public let hasToken: Bool
+    }
+
+    /** Writes a save to the keychain and the settings file (no state is touched: this can take its time, outside any lock) */
+    public static func persist(settings old: Settings, hasToken: Bool, url rawURL: String, token rawToken: String?, demo: Bool,
+                               keep: Keep) throws -> Saved {
         let url: String
         if rawURL.trimmingCharacters(in: .whitespaces).isEmpty {
             url = ""
@@ -134,11 +155,10 @@ public struct State {
         var token = rawToken?.trimmingCharacters(in: .whitespacesAndNewlines)
         if token?.isEmpty == true { token = nil }
         if token != nil && url.isEmpty { throw SaveError("Enter the server the token is for") }
-        let sameServer = url == settings.url
+        let sameServer = url == old.url
         if !demo && (url.isEmpty || (token == nil && !(sameServer && hasToken))) {
             throw SaveError("Enter the server and its read token, or choose the sample")
         }
-        let old = settings
         // The same token for the same server again: nothing to store, and what is shown stays
         if let t = token, sameServer, keep.read(old) == t { token = nil }
         var slot: UInt64 = sameServer ? old.tokenSlot : 0
@@ -161,26 +181,31 @@ public struct State {
         }
         // The old item is no longer named
         if (old.url, old.tokenSlot) != (next.url, slot) { try? keep.delete(origin: old.url, slot: old.tokenSlot) }
-        let has = keep.read(next) != nil
-        let newServer = old.url != next.url
-        if newServer { switchServer(from: old.url, to: next.url) }
-        // A new token: the wait is cut back to 5 minutes after the server's last read (failures were likely the old token's)
-        if newEntry { schedule.newToken() }
-        let newSource = newServer || newEntry || hasToken != has
-        settings = next
-        hasToken = has
-        if newSource { startOver() }
+        let has = sameServer && !newEntry && slot == old.tokenSlot ? (hasToken || keep.read(next) != nil) : keep.read(next) != nil
+        return Saved(old: old, next: next, newEntry: newEntry, hasToken: has)
     }
 
-    /** Forgets the token: the settings stop naming it first, then its item goes */
-    public mutating func removeToken(keep: Keep) throws {
-        var next = settings
+    /** Writes a removal: the settings stop naming the token first, then its item goes */
+    public static func persistRemoval(settings old: Settings, keep: Keep) throws -> Saved {
+        var next = old
         next.tokenSlot = 0
         try keep.write(next)
-        try? keep.delete(origin: settings.url, slot: settings.tokenSlot)
-        settings = next
-        hasToken = false
-        startOver()
+        try? keep.delete(origin: old.url, slot: old.tokenSlot)
+        return Saved(old: old, next: next, newEntry: false, hasToken: false)
+    }
+
+    /** Applies a written save to the state (brief: the reader's results meanwhile are kept, and a read started before is not taken
+     * when the server or the token changed) */
+    public mutating func apply(_ saved: Saved) {
+        let newServer = saved.old.url != saved.next.url
+        if newServer { switchServer(from: saved.old.url, to: saved.next.url) }
+        // A new token: the wait is cut back to 5 minutes after the server's last read (failures were likely the old token's)
+        if saved.newEntry { schedule.newToken() }
+        let removed = saved.old.tokenSlot != 0 && saved.next.tokenSlot == 0
+        let newSource = newServer || saved.newEntry || removed || hasToken != saved.hasToken
+        settings = saved.next
+        hasToken = saved.hasToken
+        if newSource { startOver() }
     }
 
     /** What a read brought, applied to the state of the generation it was started in */

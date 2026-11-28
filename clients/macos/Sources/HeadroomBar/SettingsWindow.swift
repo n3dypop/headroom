@@ -96,7 +96,9 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
             if let error {
                 self.status.stringValue = error.text + (typed.isEmpty ? "" : ". Enter the token again.")
             } else {
-                self.load()
+                // Only the token's note: what is being typed in the other fields stays
+                let has = self.app.with { $0.hasToken }
+                self.token.placeholderString = has ? "Saved (leave empty to keep it)" : ""
                 self.status.stringValue = "Saved."
             }
         }

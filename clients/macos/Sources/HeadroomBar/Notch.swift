@@ -204,9 +204,18 @@ final class NotchController {
         recheck()
     }
 
-    /** Whether the pointer is over what takes it, checked again after the notch moved, opened, folded or changed */
+    /** Whether the pointer is over what takes clicks, checked again after the notch moved, opened, folded or changed */
     private func recheck() {
-        panel.ignoresMouseEvents = !hot(pointerInView())
+        panel.ignoresMouseEvents = !clickable(pointerInView())
+    }
+
+    /** What takes clicks: the nub's strip, the open pill and the open card (not the margin around them, nor the gap between) */
+    private func clickable(_ p: CGPoint) -> Bool {
+        let mid = winH / 2
+        var rects = [CGRect(x: WIN_W - NUB_HOT_W, y: mid - NUB_H / 2, width: NUB_HOT_W, height: NUB_H)]
+        if fold.value > 0.5 { rects.append(CGRect(x: pillX, y: pillY, width: PILL_W, height: pillH)) }
+        if let b = cardBox { rects.append(b) }
+        return rects.contains { $0.contains(p) }
     }
 
     // MARK: State
@@ -279,7 +288,7 @@ final class NotchController {
     private func pointerMoved() {
         let p = pointerInView()
         let now = hot(p)
-        panel.ignoresMouseEvents = !now
+        panel.ignoresMouseEvents = !clickable(p)
         if now {
             if !inside { inside = true }
             foldTimer?.invalidate()
