@@ -379,7 +379,8 @@ Headroom can also show Gemini's limits, read with Google's Antigravity CLI (`agy
 
 1. Install [Scriptable](https://apps.apple.com/app/id1405459188).
 2. **Get the script.**
-   - Use `packages/scriptable/Headroom.js` as it is.
+   - Download `Headroom.js` from the [Releases page](https://github.com/n3dypop/headroom/releases) (from the release that has it;
+     check it against `Headroom.js.sha256` or the digest shown there), or use `packages/scriptable/Headroom.js` as it is.
    - Or build a copy with provider icons:
      1. Put `claude.png`, `codex.png` and `gemini.png` (16–1024 px, 64 KB at most) in `packages/scriptable/icons/`. These are not included because they are third-party logos. Crop each to what is visible (little transparent margin): a wide icon is drawn wider and shorter, so it looks as large as a square one.
      2. Optionally, put a second set with the same names in `packages/scriptable/icons/alt/`. **Settings › Display** in the app then switches each provider's icon between its two, on every widget and the details page at once.
@@ -477,15 +478,20 @@ If the widget can't schedule notifications on your iPhone, use a Shortcuts autom
 ## 6. Windows desktop client (preview)
 
 A small notch on the right edge of the screen and a tray icon show the same limits as the widget, read from your server with a read
-token. It never touches Claude, Codex or Gemini. It is a preview: there is no installer yet, and you build it yourself.
+token. It never touches Claude, Codex or Gemini. It is a preview: there is no installer yet.
 
-1. **Build it** (Windows 10 or 11, x64, with [Rust](https://rustup.rs)):
+1. **Get it** (Windows 10 or 11, x64), either way:
+   - **Download** `headroom-desktop-<version>-windows-x64.zip` from the [Releases page](https://github.com/n3dypop/headroom/releases)
+     (from the release that has it), check it as in section 2.3 (its `.sha256` file, and `gh attestation verify`), and extract it
+     into a new, empty folder. It isn't code-signed, so Windows SmartScreen may ask before the first run. The rings show letters:
+     the provider icons are third-party logos and aren't in the package.
+   - **Build it** with [Rust](https://rustup.rs):
 
-   ```powershell
-   cargo build --release --manifest-path clients/windows/Cargo.toml
-   ```
+     ```powershell
+     cargo build --release --manifest-path clients/windows/Cargo.toml
+     ```
 
-   If `packages/scriptable/icons/` has the provider icons (section 3), they are built in; otherwise the rings show letters.
+     If `packages/scriptable/icons/` has the provider icons (section 3), they are built in; otherwise the rings show letters.
 2. **Create a read token for the PC** (from the repository root), and add its line to `TOKENS` as in section 1, step 6 (store the
    whole array again):
 
@@ -494,7 +500,7 @@ token. It never touches Claude, Codex or Gemini. It is a preview: there is no in
    ```
 
    Use a name that doesn't identify you, and keep it apart from the PC's write token: the two are separate credentials.
-3. **Run** `clients/windows/target/release/headroom-desktop.exe`. The first time, **Settings** opens: enter the Worker URL (the origin
+3. **Run** `headroom-desktop.exe` (from the package's folder, or `clients/windows/target/release/`). The first time, **Settings** opens: enter the Worker URL (the origin
    only) and the read token, and choose **Save**. The token is kept in Windows Credential Manager, for that server only; changing the
    server asks for its token. To look around first, choose **Show sample data instead of the server**.
 4. **Use it.**
@@ -522,16 +528,34 @@ token. It never touches Claude, Codex or Gemini. It is a preview: there is no in
 ## 7. macOS desktop client (preview)
 
 The same notch as on Windows, on the right edge of the screen, with a menu bar item in place of the tray icon. It reads your server
-with a read token and never touches Claude, Codex or Gemini. It is a preview: you build and run it yourself, and it isn't signed.
+with a read token and never touches Claude, Codex or Gemini. It is a preview, and it has only an ad-hoc signature (not notarized).
 
-1. **Build it** (macOS 13 or later, with Xcode or the Xcode Command Line Tools):
+1. **Get it** (macOS 13 or later), either way:
+   - **Download** `headroom-desktop-<version>-macos-arm64.tar.gz` (Apple silicon) from the
+     [Releases page](https://github.com/n3dypop/headroom/releases), from the release that has it. As with the agent (section 2.3), use
+     `curl`, not a browser, check its SHA-256 value, and extract it into a new, empty folder:
 
-   ```bash
-   swift build -c release --package-path clients/macos
-   ```
+     ```bash
+     set -euo pipefail
+     V=<version>
+     EXPECTED=<sha256 of the tar.gz>
+     F="headroom-desktop-$V-macos-arm64.tar.gz"
+     D="headroom-desktop-$(date +%Y%m%d%H%M%S)"
+     mkdir "$D"
+     cd "$D"
+     curl -fsSLO "https://github.com/n3dypop/headroom/releases/download/v$V/$F"
+     echo "$EXPECTED  $F" | shasum -a 256 -c -
+     tar -xzf "$F"
+     cd "headroom-desktop-$V-macos-arm64"
+     ```
+   - **Build it** (with Xcode or the Xcode Command Line Tools):
+
+     ```bash
+     swift build -c release --package-path clients/macos
+     ```
 2. **Create a read token for the Mac** as in section 6, step 2 (for example `node packages/worker/scripts/new-token.ts read mac-view`),
    and add its line to `TOKENS`.
-3. **Run** `clients/macos/.build/release/HeadroomBar`. It has no Dock icon. The first time, **Settings** opens: enter the Worker URL
+3. **Run** `./HeadroomBar` in the package's folder (or `clients/macos/.build/release/HeadroomBar`). It has no Dock icon. The first time, **Settings** opens: enter the Worker URL
    and the read token, and choose **Save**. The token is kept in your login keychain (as `headroom-desktop`), for that server only.
    To look around first, choose **Show sample data instead of the server**.
 4. **Use it** as on Windows (section 6, step 4): the nub at the right edge opens the notch, a ring shows its card, a click reads the
