@@ -42,7 +42,6 @@ final class KeychainKeep: Keep {
         var q = query(origin, slot)
         SecItemDelete(q as CFDictionary)
         q[kSecValueData as String] = Data(token.utf8)
-        q[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
         guard SecItemAdd(q as CFDictionary, nil) == errSecSuccess else { throw SaveError("Couldn't save the token in the keychain") }
     }
 
@@ -53,15 +52,28 @@ final class KeychainKeep: Keep {
     }
 
     func read(_ s: Settings) -> String? {
-        if s.url.isEmpty || s.tokenSlot == 0 { return nil }
+        if case .token(let t) = lookUp(s) { return t }
+        return nil
+    }
+
+    enum Found {
+        case token(String)
+        case none
+        /** The keychain didn't answer (locked, busy): asked again later */
+        case unknown
+    }
+
+    /** The read token the settings name, told apart from "there is none" and "the keychain couldn't say" */
+    func lookUp(_ s: Settings) -> Found {
+        if s.url.isEmpty || s.tokenSlot == 0 { return .none }
         var q = query(s.url, s.tokenSlot)
         q[kSecReturnData as String] = true
         q[kSecMatchLimit as String] = kSecMatchLimitOne
         var out: AnyObject?
-        guard SecItemCopyMatching(q as CFDictionary, &out) == errSecSuccess, let data = out as? Data,
-              let token = String(data: data, encoding: .utf8), !token.trimmingCharacters(in: .whitespaces).isEmpty
-        else { return nil }
-        return token
+        let status = SecItemCopyMatching(q as CFDictionary, &out)
+        if status == errSecItemNotFound { return .none }
+        guard status == errSecSuccess, let data = out as? Data, let token = String(data: data, encoding: .utf8) else { return .unknown }
+        return token.trimmingCharacters(in: .whitespaces).isEmpty ? .none : .token(token)
     }
 
     /** Only a keychain that says there is no such item counts as free: when it can't tell, the slot isn't used */

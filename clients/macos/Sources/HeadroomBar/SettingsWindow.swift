@@ -25,7 +25,8 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
     /** Opens the settings (or brings them to the front) */
     func show() {
         if window == nil { build() }
-        load()
+        // Brought to the front as it is when already open (what is being typed stays)
+        if window?.isVisible != true { load() }
         NSApp.activate(ignoringOtherApps: true)
         window?.makeKeyAndOrderFront(nil)
         window?.makeFirstResponder(url)
@@ -89,26 +90,27 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         // Out of the field at once: it never stays in the window, whether the save works or not
         let typed = token.stringValue
         token.stringValue = ""
-        do {
-            try app.save(url: url.stringValue, token: typed.isEmpty ? nil : typed, demo: demo.state == .on)
-            load()
-            status.stringValue = "Saved."
-        } catch let e as SaveError {
-            status.stringValue = e.text + (typed.isEmpty ? "" : ". Enter the token again.")
-        } catch {
-            status.stringValue = "Couldn't save the settings"
+        status.stringValue = "Saving…"
+        app.save(url: url.stringValue, token: typed.isEmpty ? nil : typed, demo: demo.state == .on) { [weak self] error in
+            guard let self else { return }
+            if let error {
+                self.status.stringValue = error.text + (typed.isEmpty ? "" : ". Enter the token again.")
+            } else {
+                self.load()
+                self.status.stringValue = "Saved."
+            }
         }
     }
 
     @objc private func removeClicked() {
-        do {
-            try app.removeToken()
-            load()
-            status.stringValue = "Token removed."
-        } catch let e as SaveError {
-            status.stringValue = e.text
-        } catch {
-            status.stringValue = "Couldn't remove the token"
+        app.removeToken { [weak self] error in
+            guard let self else { return }
+            if let error {
+                self.status.stringValue = error.text
+            } else {
+                self.load()
+                self.status.stringValue = "Token removed."
+            }
         }
     }
 

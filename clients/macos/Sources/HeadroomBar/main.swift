@@ -4,20 +4,26 @@
 import AppKit
 import HeadroomKit
 
+/** One app per sign-in: an exclusive lock on a file of the user's own, held until the app ends (the system lets it go then) */
+private func takeTheLock() -> Bool {
+    guard let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first?.appendingPathComponent("Headroom")
+    else { return true }
+    try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    let fd = open(dir.appendingPathComponent("desktop.lock").path, O_CREAT | O_RDWR, 0o600)
+    if fd < 0 { return true }
+    // Kept open on purpose: the lock lasts as long as the process
+    return flock(fd, LOCK_EX | LOCK_NB) == 0
+}
+
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    private let app = AppState()
+    private lazy var app = AppState()
     private var notch: NotchController?
     private var status: StatusItemController?
     private var settings: SettingsWindowController?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        // One notch per sign-in
-        let mine = Bundle.main.bundleIdentifier
-        let others = NSWorkspace.shared.runningApplications.filter {
-            $0.processIdentifier != ProcessInfo.processInfo.processIdentifier
-                && ($0.executableURL?.lastPathComponent == "HeadroomBar" || (mine != nil && $0.bundleIdentifier == mine))
-        }
-        if !others.isEmpty {
+        // One notch per sign-in, decided before anything reads or writes the settings
+        if !takeTheLock() {
             NSApp.terminate(nil)
             return
         }

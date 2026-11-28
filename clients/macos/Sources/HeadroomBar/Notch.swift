@@ -146,6 +146,7 @@ final class NotchController {
         panel.isMovable = false
         panel.hidesOnDeactivate = false
         panel.ignoresMouseEvents = true
+        panel.acceptsMouseMovedEvents = true
         view = NotchView(frame: NSRect(x: 0, y: 0, width: WIN_W, height: WIN_H))
         view.controller = self
         panel.contentView = view
@@ -200,6 +201,12 @@ final class NotchController {
         panel.setFrame(NSRect(x: area.maxX - WIN_W, y: area.minY + (area.height - winH) / 2, width: WIN_W, height: winH), display: false)
         view.frame = NSRect(x: 0, y: 0, width: WIN_W, height: winH)
         view.needsDisplay = true
+        recheck()
+    }
+
+    /** Whether the pointer is over what takes it, checked again after the notch moved, opened, folded or changed */
+    private func recheck() {
+        panel.ignoresMouseEvents = !hot(pointerInView())
     }
 
     // MARK: State
@@ -220,6 +227,7 @@ final class NotchController {
         if let c = card, c >= count { card = 0 }
         setTick()
         view.needsDisplay = true
+        recheck()
     }
 
     private func setTick() {
@@ -239,6 +247,7 @@ final class NotchController {
                 self.animTimer = nil
             }
             self.view.needsDisplay = true
+            self.recheck()
         }
     }
 
@@ -355,10 +364,15 @@ final class NotchController {
 
     /** Moves the card's rows by a row: down for a negative delta, up for a positive one */
     fileprivate func wheel(_ delta: CGFloat) {
+        scroll(by: delta < 0 ? ROW_H : -ROW_H)
+    }
+
+    /** Moves the card's rows by points (a trackpad's movement as it is; a wheel's step and the up and down lines by a row) */
+    fileprivate func scroll(by points: Double) {
         guard let i = card else { return }
         let f = fit(i)
         guard f.scrolls else { return }
-        let next = min(f.max, max(0, f.offset + (delta < 0 ? ROW_H : -ROW_H)))
+        let next = min(f.max, max(0, f.offset + points))
         if next != f.offset {
             cardScroll = next
             view.needsDisplay = true
@@ -646,6 +660,10 @@ final class NotchView: NSView {
     override func scrollWheel(with event: NSEvent) {
         let p = convert(event.locationInWindow, from: nil)
         guard let c = controller, let box = c.cardBox, box.contains(p), event.scrollingDeltaY != 0 else { return }
-        c.wheel(event.scrollingDeltaY)
+        if event.hasPreciseScrollingDeltas {
+            c.scroll(by: Double(-event.scrollingDeltaY))
+        } else {
+            c.wheel(event.scrollingDeltaY)
+        }
     }
 }

@@ -1,5 +1,5 @@
-// The state the reading thread and the screen share, and the reading loop. The server, its token and the generation are taken
-// together under one lock, so a change in Settings meanwhile can't mix them.
+// The state the reading thread and the screen share, and the reading loop. The keychain and the settings file are used on the
+// reading thread or the settings queue, never on the main thread; the reader reads the token outside the lock.
 
 import Foundation
 import HeadroomKit
@@ -17,15 +17,20 @@ final class AppState {
     private let lock = NSLock()
     private var state = State()
     private let wake = DispatchSemaphore(value: 0)
+    /** Saving and removing, one at a time, off the main thread */
+    private let saving = DispatchQueue(label: "Headroom settings")
     let keep = KeychainKeep()
     /** Told (on the main thread) whenever the state may have changed */
     var onChange: (() -> Void)?
+    /** Whether the keychain has said whether the settings' token is there (asked on the reading thread) */
+    private var tokenKnown = false
 
     init() {
-        var s = State()
-        s.settings = keep.loadSettings()
-        s.hasToken = keep.read(s.settings) != nil
-        state = s
+        // The settings file only (the keychain is asked on the reading thread)
+        let settings = keep.loadSettings()
+        state.settings = settings
+        // Until the keychain answers, a server with a token named is taken to have it (nothing is read before it answers)
+        state.hasToken = settings.tokenSlot != 0 && !settings.url.isEmpty
     }
 
     func with<R>(_ f: (inout State) throws -> R) rethrows -> R {
@@ -46,31 +51,81 @@ final class AppState {
         return (wait + 59_999) / 60_000
     }
 
-    func save(url: String, token: String?, demo: Bool) throws {
-        try with { try $0.save(url: url, token: token, demo: demo, keep: keep) }
-        nudge()
-        changed()
+    /** Saves on the settings queue; `done` gets the error (nil when saved), on the main thread */
+    func save(url: String, token: String?, demo: Bool, done: @escaping (SaveError?) -> Void) {
+        saving.async { [self] in
+            // Under the lock, so no read's result comes in between (a save is rare, and the screen waits for it at most briefly);
+            // the main thread never waits on the keychain for it
+            let outcome: SaveError?
+            do {
+                try with { try $0.save(url: url, token: token, demo: demo, keep: keep) }
+                tokenKnown = true
+                outcome = nil
+            } catch let e as SaveError {
+                outcome = e
+            } catch {
+                outcome = SaveError("Couldn't save the settings")
+            }
+            nudge()
+            DispatchQueue.main.async {
+                done(outcome)
+                self.onChange?()
+            }
+        }
     }
 
-    func removeToken() throws {
-        try with { try $0.removeToken(keep: keep) }
-        nudge()
-        changed()
+    /** Removes the token on the settings queue; `done` gets the error (nil when removed), on the main thread */
+    func removeToken(done: @escaping (SaveError?) -> Void) {
+        saving.async { [self] in
+            let outcome: SaveError?
+            do {
+                try with { try $0.removeToken(keep: keep) }
+                outcome = nil
+            } catch let e as SaveError {
+                outcome = e
+            } catch {
+                outcome = SaveError("Couldn't remove the token")
+            }
+            nudge()
+            DispatchQueue.main.async {
+                done(outcome)
+                self.onChange?()
+            }
+        }
     }
 
     private func changed() {
         DispatchQueue.main.async { self.onChange?() }
     }
 
+    /** Asks the keychain whether the settings' token is there (until it has said so) */
+    private func checkToken() {
+        if tokenKnown { return }
+        let settings = with { $0.settings }
+        switch keep.lookUp(settings) {
+        case .token:
+            tokenKnown = true
+            with { $0.hasToken = true }
+        case .none:
+            tokenKnown = true
+            with { $0.hasToken = false }
+        case .unknown:
+            // Asked again on the next turn (a nudge, waking from sleep, or an hour)
+            with { $0.error = "Couldn't read the keychain" }
+        }
+    }
+
     /** Reads the server when the schedule allows it, and tells the screen. Sleeps until the next allowed time or a nudge */
     func startReading() {
         let thread = Thread { [self] in
             while true {
-                let job: (UInt64, String, String?)? = with { s in
-                    s.mode == .live && s.schedule.mayRead(monoMs()) ? (s.generation, s.settings.url, keep.read(s.settings)) : nil
+                checkToken()
+                // The settings and the generation together; the token is read for exactly those settings, outside the lock
+                let job: (UInt64, Settings)? = with { s in
+                    tokenKnown && s.mode == .live && s.schedule.mayRead(monoMs()) ? (s.generation, s.settings) : nil
                 }
-                if let (generation, url, token) = job {
-                    let result: Result<JSON, ReadError> = token.map { readView(base: url, token: $0, tz: TimeZone.current.identifier) }
+                if let (generation, settings) = job {
+                    let result: Result<JSON, ReadError> = keep.read(settings).map { readView(base: settings.url, token: $0, tz: TimeZone.current.identifier) }
                         ?? .failure(.notSetUp)
                     // Checked before taking the lock (a large answer doesn't hold up the screen)
                     let checked = result.map { sanitizeView($0) }
@@ -79,7 +134,7 @@ final class AppState {
                             s.take(checked, now: nowMs(), mono: monoMs())
                         } else {
                             // Settings changed meanwhile: the result isn't shown, but the server was read, so its 5 minutes count
-                            s.withSchedule(of: url) { $0.readAnyway(monoMs()) }
+                            s.withSchedule(of: settings.url) { $0.readAnyway(monoMs()) }
                         }
                     }
                 }
