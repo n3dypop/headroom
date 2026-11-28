@@ -853,6 +853,11 @@ public func notchModel(_ view: View, _ now: Double, _ tz: TimeZone) -> [Cell] {
 public struct Tray: Equatable {
     public var lines: [String]
     public var tooltip: String
+
+    public init(lines: [String], tooltip: String) {
+        self.lines = lines
+        self.tooltip = tooltip
+    }
 }
 
 /** The menu bar's tooltip is kept as short as the Windows tray's (127 characters) */
