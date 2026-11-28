@@ -40,6 +40,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         app.onChange = { [weak notch] in notch?.refresh() }
         // A change in the settings' Placement, Appearance or Behavior: placed and drawn again at once
         app.onPrefs = { [weak notch] in notch?.applyPrefs() }
+        // The icons the settings read when they open (both sets), for the notch too
+        settings.onIcons = { [weak notch] in notch?.setIcons($0) }
         app.startReading()
         // Back from sleep: read again when the schedule allows it
         NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [app] _ in

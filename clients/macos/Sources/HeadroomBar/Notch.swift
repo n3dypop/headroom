@@ -204,12 +204,6 @@ private struct Anim {
     }
 }
 
-/** A provider's icon: a PNG the user put in ~/Library/Application Support/Headroom/icons/ (the vendors' logos aren't shipped) */
-private func providerIcon(_ provider: String) -> NSImage? {
-    guard let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else { return nil }
-    return NSImage(contentsOf: dir.appendingPathComponent("Headroom/icons/\(provider).png"))
-}
-
 /** The size an icon of that shape is drawn at in place of a square of side `box`: the widget's iconBox */
 private func iconBox(_ aspect: CGFloat, _ box: CGFloat) -> CGSize {
     let ar = aspect.isFinite && aspect > 0 ? aspect : 1
@@ -271,7 +265,8 @@ final class NotchController {
     private var pal = DARK
     private var pillGlass: NSView?
     private var cardGlass: NSView?
-    private var icons: [String: NSImage] = [:]
+    /** Both sets of the providers' icons (the prefs say which is drawn) */
+    private var icons = ProviderIcons()
     private var animTimer: Timer?
     private var tickTimer: Timer?
     private var foldTimer: Timer?
@@ -311,7 +306,7 @@ final class NotchController {
         view.controller = self
         root.addSubview(view)
         panel.contentView = root
-        for p in PROVIDER_ORDER { if let i = providerIcon(p) { icons[p] = i } }
+        icons = ProviderIcons.load()
         applyPrefs()
         refresh()
         if !covered { panel.orderFrontRegardless() }
@@ -405,6 +400,12 @@ final class NotchController {
             if r.insetBy(dx: -1, dy: -1).contains(display) { return true }
         }
         return false
+    }
+
+    /** Icons read again (the settings opened: files added since show up) */
+    func setIcons(_ next: ProviderIcons) {
+        icons = next
+        redraw()
     }
 
     private func appearanceChanged() {
@@ -861,7 +862,7 @@ final class NotchController {
             arc(cx, cy, OUTER_R * k, 0, 1, OUTER_STROKE * k, fade(pal.outerTrack, ringA))
             arc(cx, cy, OUTER_R * k, 0, CGFloat(w.solid + w.projected), OUTER_STROKE * k, color(c.color, 0.6 * ringA))
         }
-        if let icon = icons[c.provider] {
+        if let icon = icons.icon(c.provider, prefs: prefs) {
             let size = iconBox(icon.size.height > 0 ? icon.size.width / icon.size.height : 1, ICON_BOX)
             let r = CGRect(x: cx - size.width * k / 2, y: cy - size.height * k / 2, width: size.width * k, height: size.height * k)
             icon.draw(in: r, from: .zero, operation: .sourceOver, fraction: ringA, respectFlipped: true, hints: nil)

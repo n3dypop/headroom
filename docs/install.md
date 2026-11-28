@@ -484,15 +484,15 @@ token. It never touches Claude, Codex or Gemini. It is a preview: there is no in
 1. **Get it** (Windows 10 or 11, x64), either way:
    - **Download** `headroom-desktop-<version>-windows-x64.zip` from the [Releases page](https://github.com/n3dypop/headroom/releases)
      (from the release that has it), check it as in section 2.3 (its `.sha256` file, and `gh attestation verify`), and extract it
-     into a new, empty folder. It isn't code-signed, so Windows SmartScreen may ask before the first run. The rings show letters:
-     the provider icons are third-party logos and aren't in the package.
+     into a new, empty folder. It isn't code-signed, so Windows SmartScreen may ask before the first run. The provider icons are
+     third-party logos and aren't in the package: add them as in step 6, or the rings show letters.
    - **Build it** with [Rust](https://rustup.rs):
 
      ```powershell
      cargo build --release --manifest-path clients/windows/Cargo.toml
      ```
 
-     If `packages/scriptable/icons/` has the provider icons (section 3), they are built in; otherwise the rings show letters.
+     If `packages/scriptable/icons/` has the provider icons (section 3), they are built in, and so is a second set in its `alt/`.
 2. **Create a read token for the PC** (from the repository root), and add its line to `TOKENS` as in section 1, step 6 (store the
    whole array again):
 
@@ -522,8 +522,12 @@ token. It never touches Claude, Codex or Gemini. It is a preview: there is no in
    - **Behavior:** whether the notch opens when the pointer touches it or when it is clicked, how soon it folds after the pointer
      leaves, hiding it while a full-screen app (a game, a video) is in front, and starting Headroom when you sign in to Windows (a
      `Headroom` value in your user's Run key, removed when you turn it off).
-6. **Remove it:** in **Settings**, turn off starting at sign-in and choose **Remove token** (or remove the `headroom-desktop`
-   entries in Credential Manager), then choose **Quit Headroom** and delete `%APPDATA%\Headroom\desktop.json`. If you put a
+6. **Provider icons** (optional): put `claude.png`, `codex.png` and `gemini.png` (as in section 3) in `%APPDATA%\Headroom\icons\`,
+   and a second set with the same names in `%APPDATA%\Headroom\icons\alt\`. They take the place of built-in ones, and are read
+   again when you open **Settings**. As on the widget, **Settings › Appearance › Icons** switches each provider to its second icon.
+   Without any icons the rings show letters.
+7. **Remove it:** in **Settings**, turn off starting at sign-in and choose **Remove token** (or remove the `headroom-desktop`
+   entries in Credential Manager), then choose **Quit Headroom** and delete `%APPDATA%\Headroom\` (the settings and the icons). If you put a
    shortcut in `shell:startup` before, delete it too. Remove its line from `TOKENS` on the server as well.
 
 ## 7. macOS desktop client (preview)
@@ -567,7 +571,9 @@ with a read token and never touches Claude, Codex or Gemini. It is a preview, an
    own glass (on earlier versions, its translucent material), so nothing is read from the screen; **Start Headroom when you log in**
    adds a `com.headroom.desktop.plist` to `~/Library/LaunchAgents/`, used from the next login.
 6. **Provider icons** (optional): put `claude.png`, `codex.png` and `gemini.png` (as in section 3) in
-   `~/Library/Application Support/Headroom/icons/` and start it again. Without them the rings show letters.
+   `~/Library/Application Support/Headroom/icons/`, and a second set with the same names in its `alt/` folder. They are read again
+   when you open **Settings**, where **Appearance › Icons** switches each provider to its second icon. Without them the rings show
+   letters.
 7. **Remove it:** in **Settings**, turn off starting at login and choose **Remove token** (or delete the `headroom-desktop` items in
    Keychain Access), then choose **Quit Headroom** and delete `~/Library/Application Support/Headroom/`. Remove its line from `TOKENS` on the server too.
 

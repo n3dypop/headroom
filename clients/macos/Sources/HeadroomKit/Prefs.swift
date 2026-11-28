@@ -74,10 +74,12 @@ public struct Prefs: Equatable {
     public var motion = true
     /** Leave other apps' full-screen spaces to them */
     public var hideFullscreen = true
+    /** The providers drawn with their second icon (when they have one), in PROVIDER_ORDER's order */
+    public private(set) var altIcons: [String] = []
 
     /** The keys, as written in desktop.json */
     public static let keys = ["display", "position", "size", "theme", "glass_backdrop", "glass_tint", "open_on", "fold_delay", "motion",
-                              "hide_fullscreen"]
+                              "hide_fullscreen", "alt_icons"]
 
     public init() {}
 
@@ -101,6 +103,21 @@ public struct Prefs: Equatable {
         foldDelay = pick("fold_delay", FoldDelay.normal)
         motion = flag("motion", true)
         hideFullscreen = flag("hide_fullscreen", true)
+        // Names this client knows, each once; anything else in the array (or a value that isn't one) is left out
+        let named = Set((o["alt_icons"]?.array ?? []).compactMap { $0.string })
+        altIcons = PROVIDER_ORDER.filter { named.contains($0) }
+    }
+
+    /** Whether the provider is to be drawn with its second icon */
+    public func usesAltIcon(_ provider: String) -> Bool {
+        altIcons.contains(provider)
+    }
+
+    /** Chooses the second icon for a provider or not (a name this client doesn't know is left out) */
+    public mutating func setAltIcon(_ provider: String, _ on: Bool) {
+        var named = Set(altIcons)
+        if on { named.insert(provider) } else { named.remove(provider) }
+        altIcons = PROVIDER_ORDER.filter { named.contains($0) }
     }
 
     /** As the settings file's keys */
@@ -116,6 +133,7 @@ public struct Prefs: Equatable {
             "fold_delay": .string(foldDelay.rawValue),
             "motion": .bool(motion),
             "hide_fullscreen": .bool(hideFullscreen),
+            "alt_icons": .array(altIcons.map { .string($0) }),
         ]
     }
 }

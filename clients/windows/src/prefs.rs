@@ -58,6 +58,8 @@ pub struct Prefs {
     pub motion: bool,
     /// Hidden while a full-screen app is in front on its screen
     pub hide_fullscreen: bool,
+    /// The providers whose second icon is used (as on the widget), in the providers' order
+    pub alt_icons: Vec<&'static str>,
 }
 
 impl Default for Prefs {
@@ -73,8 +75,20 @@ impl Default for Prefs {
             fold_delay: FoldDelay::Normal,
             motion: true,
             hide_fullscreen: true,
+            alt_icons: Vec::new(),
         }
     }
+}
+
+/** The names in a list that are providers, once each, in the providers' order (a list of anything else gives none) */
+fn providers_in(v: Option<&Value>) -> Vec<&'static str> {
+    let Some(list) = v.and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    crate::model::PROVIDER_ORDER
+        .into_iter()
+        .filter(|p| list.iter().any(|x| x.as_str() == Some(p)))
+        .collect()
 }
 
 /** A key's value among the names it may have, as its own value (None for a missing, unknown or wrong-typed one) */
@@ -138,6 +152,7 @@ impl Prefs {
             fold_delay: named(v, "fold_delay", &DELAYS).unwrap_or(d.fold_delay),
             motion: flag("motion", d.motion),
             hide_fullscreen: flag("hide_fullscreen", d.hide_fullscreen),
+            alt_icons: providers_in(v.get("alt_icons")),
         }
     }
 
@@ -156,6 +171,7 @@ impl Prefs {
         );
         v.insert("motion".into(), self.motion.into());
         v.insert("hide_fullscreen".into(), self.hide_fullscreen.into());
+        v.insert("alt_icons".into(), self.alt_icons.clone().into());
     }
 
     /** How much larger than normal the notch is drawn */
@@ -234,6 +250,7 @@ mod tests {
             fold_delay: FoldDelay::Long,
             motion: false,
             hide_fullscreen: false,
+            alt_icons: vec!["claude", "gemini"],
         };
         let mut m = Map::new();
         m.insert("url".into(), "https://a.example".into());
@@ -241,6 +258,17 @@ mod tests {
         assert_eq!(m["size"], "large");
         assert_eq!(m["url"], "https://a.example", "the rest of the file stays");
         assert_eq!(Prefs::from_value(&Value::Object(m)), p);
+    }
+
+    #[test]
+    fn the_second_icons_are_providers_once_each_in_order() {
+        let alt = |v: Value| Prefs::from_value(&json!({ "alt_icons": v })).alt_icons;
+        assert_eq!(
+            alt(json!(["gemini", "claude", "x", 3, "claude"])),
+            vec!["claude", "gemini"]
+        );
+        assert_eq!(alt(json!("claude")), Vec::<&str>::new());
+        assert_eq!(alt(json!(null)), Vec::<&str>::new());
     }
 
     #[test]

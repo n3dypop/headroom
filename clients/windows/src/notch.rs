@@ -277,15 +277,6 @@ fn png_aspect(png: &[u8]) -> f32 {
     }
 }
 
-fn provider_icon(provider: &str) -> Option<&'static [u8]> {
-    match provider {
-        "claude" => crate::icons::CLAUDE,
-        "codex" => crate::icons::CODEX,
-        "gemini" => crate::icons::GEMINI,
-        _ => None,
-    }
-}
-
 pub struct Notch {
     hwnd: HWND,
     gfx: Gfx,
@@ -462,12 +453,18 @@ impl Notch {
         }
     }
 
+    /** The icons in use: each provider's second when chosen and there, else its first */
     fn load_icons(&mut self) {
         self.icons.clear();
         for p in model::PROVIDER_ORDER {
-            if let Some(png) = provider_icon(p) {
-                if let Ok(bitmap) = self.gfx.png(png) {
-                    let (w, h) = icon_box(png_aspect(png), ICON_BOX);
+            let alt = self.prefs.alt_icons.contains(&p);
+            let png = alt
+                .then(|| crate::art::png(p, true))
+                .flatten()
+                .or_else(|| crate::art::png(p, false));
+            if let Some(png) = png {
+                if let Ok(bitmap) = self.gfx.png(&png) {
+                    let (w, h) = icon_box(png_aspect(&png), ICON_BOX);
                     self.icons.push((p, Icon { bitmap, w, h }));
                 }
             }
@@ -492,6 +489,8 @@ impl Notch {
     fn take_prefs(&mut self) {
         self.prefs = crate::prefs();
         self.system_light = theme::apps_light();
+        // The icons again: the choice, or the files in the icon folder, may have changed
+        self.icons_stale = true;
         // A copy of the screen includes the notch (layered windows too, as the screen is composed): while the glass is set to read
         // what is behind, the notch is left out of copies, its own and screenshots alike. Where Windows can't (before Windows 10 2004,
         // where the same call blacks the window out of copies instead), the glass doesn't read

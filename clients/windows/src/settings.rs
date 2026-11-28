@@ -50,6 +50,11 @@ const ID_BACKDROP_HINT: i32 = 54;
 const ID_TINT_LABEL: i32 = 55;
 const ID_TINT: i32 = 56;
 const ID_MOTION: i32 = 57;
+const ID_ICONS_GROUP: i32 = 58;
+const ID_ICONS_HINT: i32 = 59;
+/** The second-icon checkboxes, one per provider in the providers' order */
+const ID_ALT: [i32; 3] = [60, 61, 62];
+const ALT_NAMES: [&str; 3] = ["Claude", "Codex", "Gemini"];
 // Behavior
 const ID_OPEN_LABEL: i32 = 70;
 const ID_OPEN: i32 = 71;
@@ -258,9 +263,34 @@ fn load_prefs(dlg: HWND) {
     fill_named(dlg, ID_OPEN, &OPENS, p.open_on);
     fill_named(dlg, ID_FOLD, &DELAYS, p.fold_delay);
     check(dlg, ID_FULL, p.hide_fullscreen);
+    load_icons(dlg, &p);
     check(dlg, ID_STARTUP, crate::startup::enabled());
     enable_glass(dlg, p.theme == Theme::Glass);
     LOADING.with(|l| l.set(false));
+}
+
+/** The second-icon checkboxes: one per provider that has a second icon (read again from the icon folder each time) */
+fn load_icons(dlg: HWND, p: &Prefs) {
+    let mut any = false;
+    for (n, provider) in crate::model::PROVIDER_ORDER.into_iter().enumerate() {
+        let has = crate::art::has_alt(provider);
+        any |= has;
+        check(dlg, ID_ALT[n], has && p.alt_icons.contains(&provider));
+        unsafe {
+            let _ = EnableWindow(item(dlg, ID_ALT[n]), has);
+        }
+    }
+    let folder =
+        crate::art::folder().map_or_else(String::new, |d| d.join("alt").display().to_string());
+    set_text(
+        dlg,
+        ID_ICONS_HINT,
+        &if any {
+            "Use the second icon for:".to_string()
+        } else {
+            format!("Put a second set of icons in {folder} to choose between them.")
+        },
+    );
 }
 
 /** The glass's choices only matter with the Liquid Glass theme */
@@ -293,6 +323,12 @@ fn prefs_shown(dlg: HWND) -> Prefs {
         fold_delay: selected(dlg, ID_FOLD, &DELAYS, d.fold_delay),
         motion: checked(dlg, ID_MOTION),
         hide_fullscreen: checked(dlg, ID_FULL),
+        alt_icons: crate::model::PROVIDER_ORDER
+            .into_iter()
+            .enumerate()
+            .filter(|&(n, _)| checked(dlg, ID_ALT[n]))
+            .map(|(_, p)| p)
+            .collect(),
     }
 }
 
@@ -352,6 +388,7 @@ fn command(dlg: HWND, id: i32, code: u32) {
             take_prefs(dlg, true)
         }
         ID_BACKDROP | ID_MOTION | ID_FULL if code == BN_CLICKED => take_prefs(dlg, true),
+        _ if ID_ALT.contains(&id) && code == BN_CLICKED => take_prefs(dlg, true),
         ID_STARTUP if code == BN_CLICKED => {
             let on = checked(dlg, ID_STARTUP);
             match crate::startup::set(on) {
@@ -429,6 +466,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
                     ID_TOKEN_HINT,
                     ID_SCREEN_HINT,
                     ID_BACKDROP_HINT,
+                    ID_ICONS_HINT,
                     ID_POS_TOP,
                     ID_POS_MID,
                     ID_POS_BOTTOM,
@@ -682,9 +720,21 @@ fn controls() -> Vec<Control> {
             "Animations (opening, folding and moving the card)",
             check,
             ID_MOTION,
-            (X, 288, CW, 22),
+            (X, 284, CW, 22),
             2,
         ),
+        c(
+            w!("BUTTON"),
+            "Icons",
+            BS_GROUPBOX as u32,
+            ID_ICONS_GROUP,
+            (X, 312, CW, 98),
+            2,
+        ),
+        label("", ID_ICONS_HINT, (X + 16, 334, CW - 32, 34), 2),
+        c(w!("BUTTON"), ALT_NAMES[0], check, ID_ALT[0], (X + 16, 372, 120, 22), 2),
+        c(w!("BUTTON"), ALT_NAMES[1], check, ID_ALT[1], (X + 146, 372, 120, 22), 2),
+        c(w!("BUTTON"), ALT_NAMES[2], check, ID_ALT[2], (X + 276, 372, 120, 22), 2),
         // Behavior
         head("Open the notch", ID_OPEN_LABEL, (X, 56, CW, 18), 3),
         c(w!("COMBOBOX"), "", list, ID_OPEN, (X, 76, 300, 200), 3),
@@ -881,6 +931,8 @@ fn build() -> Result<()> {
         PAGE.with(|p| p.set(0));
         load(dlg);
         load_prefs(dlg);
+        // The notch reads the icon folder again too (icons put there since are taken up)
+        crate::notch::post_place();
         let _ = ShowWindow(dlg, SW_SHOW);
         let _ = SetForegroundWindow(dlg);
         let _ = SetFocus(Some(item(dlg, ID_URL)));

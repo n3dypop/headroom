@@ -60,6 +60,8 @@ public struct Settings: Codable, Equatable {
         try c.encode(prefs.foldDelay.rawValue, forKey: SettingsKey("fold_delay"))
         try c.encode(prefs.motion, forKey: SettingsKey("motion"))
         try c.encode(prefs.hideFullscreen, forKey: SettingsKey("hide_fullscreen"))
+        // Names in PROVIDER_ORDER's order, as strings
+        try c.encode(prefs.altIcons, forKey: SettingsKey("alt_icons"))
     }
 
     /** The same server and keychain item (what the token is read for; the prefs don't count) */
