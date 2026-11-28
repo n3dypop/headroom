@@ -23,6 +23,43 @@ fn usable(png: &[u8]) -> bool {
         && size(20) > 0
 }
 
+/** Whether the image decodes whole (its pixels can be read), as drawing needs: a header alone isn't enough */
+fn decodes(png: &[u8]) -> bool {
+    use windows::Win32::Graphics::Imaging::*;
+    use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
+    let read = || -> windows::core::Result<bool> {
+        unsafe {
+            let wic: IWICImagingFactory =
+                CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER)?;
+            let stream = wic.CreateStream()?;
+            stream.InitializeFromMemory(png)?;
+            let decoder = wic.CreateDecoderFromStream(
+                &stream,
+                std::ptr::null(),
+                WICDecodeMetadataCacheOnDemand,
+            )?;
+            let conv = wic.CreateFormatConverter()?;
+            conv.Initialize(
+                &decoder.GetFrame(0)?,
+                &GUID_WICPixelFormat32bppPBGRA,
+                WICBitmapDitherTypeNone,
+                None,
+                0.0,
+                WICBitmapPaletteTypeMedianCut,
+            )?;
+            let (mut w, mut h) = (0u32, 0u32);
+            conv.GetSize(&mut w, &mut h)?;
+            if w == 0 || h == 0 || w > 4096 || h > 4096 {
+                return Ok(false);
+            }
+            let mut pixels = vec![0u8; (w * h * 4) as usize];
+            conv.CopyPixels(std::ptr::null(), w * 4, &mut pixels)?;
+            Ok(true)
+        }
+    };
+    read().unwrap_or(false)
+}
+
 fn built(provider: &str, alt: bool) -> Option<&'static [u8]> {
     match (provider, alt) {
         ("claude", false) => crate::icons::CLAUDE,
@@ -35,7 +72,7 @@ fn built(provider: &str, alt: bool) -> Option<&'static [u8]> {
     }
 }
 
-/** A provider's icon of the first or the second set (the user's folder first), when there is one */
+/** A provider's icon of the first or the second set (the user's folder first, then the build), when there is one that decodes */
 pub fn png(provider: &str, alt: bool) -> Option<Vec<u8>> {
     let file = folder().map(|d| {
         let d = if alt { d.join("alt") } else { d };
@@ -45,10 +82,10 @@ pub fn png(provider: &str, alt: bool) -> Option<Vec<u8>> {
     let from_folder = file
         .filter(|f| std::fs::metadata(f).is_ok_and(|m| m.len() as usize <= MAX_ICON_BYTES))
         .and_then(|f| std::fs::read(f).ok())
-        .filter(|b| usable(b));
+        .filter(|b| usable(b) && decodes(b));
     from_folder.or_else(|| {
         built(provider, alt)
-            .filter(|b| usable(b))
+            .filter(|b| usable(b) && decodes(b))
             .map(<[u8]>::to_vec)
     })
 }
@@ -61,6 +98,25 @@ pub fn has_alt(provider: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_an_image_that_decodes_whole_is_taken() {
+        unsafe {
+            let _ = windows::Win32::System::Com::CoInitializeEx(
+                None,
+                windows::Win32::System::Com::COINIT_APARTMENTTHREADED,
+            );
+        }
+        // A 1×1 PNG
+        let one: [u8; 68] = [
+            137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1,
+            8, 4, 0, 0, 0, 181, 28, 12, 2, 0, 0, 0, 11, 73, 68, 65, 84, 120, 218, 99, 100, 96, 0,
+            0, 0, 6, 0, 2, 48, 129, 208, 47, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
+        ];
+        assert!(usable(&one) && decodes(&one));
+        // Its header alone (no image data): not taken
+        assert!(usable(&one[..33]) && !decodes(&one[..33]));
+    }
 
     #[test]
     fn only_small_pngs_with_a_size_are_icons() {
