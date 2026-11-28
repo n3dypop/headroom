@@ -43,8 +43,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // The icons the settings read when they open (both sets), for the notch too
         settings.onIcons = { [weak notch] in notch?.setIcons($0) }
         app.startReading()
-        // A login item from an earlier version gets the restart after a crash (off the main thread: it reads and writes a file)
-        DispatchQueue.global(qos: .utility).async { LoginItem.update() }
+        // A login item from an earlier version gets the restart after a crash (a small file, read and written before Settings can
+        // change it)
+        LoginItem.update()
         // Back from sleep: read again when the schedule allows it
         NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [app] _ in
             app.nudge()

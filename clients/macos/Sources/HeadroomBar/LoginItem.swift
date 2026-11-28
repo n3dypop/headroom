@@ -68,15 +68,25 @@ enum LoginItem {
         ]
     }
 
-    /** A login item written by an earlier version (without the restart) is written again, when it starts this executable. It takes
-     * effect at the next login */
+    /** What an earlier version wrote (without the restart) */
+    private static func earlierAgent(_ path: String) -> [String: Any] {
+        [
+            "Label": label,
+            "ProgramArguments": [path],
+            "RunAtLoad": true,
+            "ProcessType": "Interactive",
+            "LimitLoadToSessionType": "Aqua",
+        ]
+    }
+
+    /** A login item exactly as an earlier version wrote it for this executable (nothing added by hand) is written again with the
+     * restart. Done once at start, before Settings can change it; it takes effect at the next login */
     static func update() {
         let url = plistURL
-        guard let data = try? Data(contentsOf: url),
-              let plist = (try? PropertyListSerialization.propertyList(from: data, options: [], format: nil)) as? [String: Any],
-              plist["KeepAlive"] == nil,
-              let path = program,
-              (plist["ProgramArguments"] as? [String])?.first == path
+        guard let path = program,
+              let data = try? Data(contentsOf: url),
+              let plist = (try? PropertyListSerialization.propertyList(from: data, options: [], format: nil)) as? NSDictionary,
+              plist.isEqual(to: earlierAgent(path))
         else { return }
         try? set(true)
     }

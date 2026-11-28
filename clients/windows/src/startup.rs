@@ -50,12 +50,17 @@ pub fn enabled() -> bool {
         .any(|c| now.eq_ignore_ascii_case(&c))
 }
 
-/** A Run value an earlier version wrote for this program gets the restart after a crash (from the next sign-in) */
+/** Windows reads a Run value up to this many characters */
+const MAX_RUN: usize = 260;
+
+/** A Run value an earlier version wrote for this program (exactly that) gets the restart after a crash, from the next sign-in.
+ * Done once at start, before Settings can change it; not when the new value would be too long for the Run key */
 pub fn update() {
-    if let (Some(now), Some(earlier)) = (value(), earlier_command()) {
-        if now.eq_ignore_ascii_case(&earlier) {
-            let _ = set(true);
-        }
+    let (Some(now), Some(earlier), Some(next)) = (value(), earlier_command(), command()) else {
+        return;
+    };
+    if now.eq_ignore_ascii_case(&earlier) && next.chars().count() < MAX_RUN {
+        let _ = set(true);
     }
 }
 

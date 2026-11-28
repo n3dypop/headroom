@@ -396,6 +396,8 @@ fn apply_remove(i: &mut Inner, keep: &impl Keep) -> Result<(), String> {
 }
 
 pub fn quit() {
+    // A watcher (started at sign-in) doesn't start it again, also when this copy was started by hand while it waited
+    keep::quit();
     tray::remove();
     unsafe { PostQuitMessage(0) };
 }
@@ -502,11 +504,11 @@ fn main() -> windows::core::Result<()> {
 
     // HEADROOM_DESKTOP_OPEN=1 keeps the notch open with its first card (for checking the look without the pointer)
     let pinned = std::env::var_os("HEADROOM_DESKTOP_OPEN").is_some();
+    // A Run value from an earlier version gets the restart after a crash (before Settings can be opened to change it)
+    startup::update();
     tray::create()?;
     notch::create(pinned)?;
     std::thread::spawn(move || reader(rx));
-    // A Run value from an earlier version gets the restart after a crash
-    std::thread::spawn(startup::update);
     // First run with nothing set: open Settings (development builds: also with HEADROOM_DESKTOP_SETTINGS=1, for checking it)
     let check_settings =
         cfg!(debug_assertions) && std::env::var_os("HEADROOM_DESKTOP_SETTINGS").is_some();
