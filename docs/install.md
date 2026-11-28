@@ -563,7 +563,9 @@ with a read token and never touches Claude, Codex or Gemini. It is a preview, an
    and add its line to `TOKENS`.
 3. **Run** `./HeadroomBar` in the package's folder (or `clients/macos/.build/release/HeadroomBar`). It has no Dock icon. The first time, **Settings** opens: enter the Worker URL
    and the read token, and choose **Save**. The token is kept in your login keychain (as `headroom-desktop`), for that server only.
-   To look around first, choose **Show sample data instead of the server**.
+   To look around first, choose **Show sample data instead of the server**. Started from a terminal, it goes on in the background
+   (the terminal gets its prompt back, and closing it doesn't end Headroom); quit it from its menu bar item. To keep it in the
+   terminal instead (its messages show there), run `./HeadroomBar --foreground`.
 4. **Use it** as on Windows (section 6, step 4): the nub at the right edge opens the notch, a ring shows its card, a click reads the
    server (at most once every 5 minutes), and the menu bar item lists each provider with **Refresh now**, **Settings…** and
    **Quit Headroom**. On a trackpad, the card's rows scroll when they don't fit.
