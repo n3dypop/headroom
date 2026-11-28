@@ -72,6 +72,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
+// Started from a terminal: on by itself, so closing the terminal doesn't end it (before anything else, the lock included)
+detachFromTerminal()
+
 let application = NSApplication.shared
 // No Dock icon: the notch and the menu bar item are the app
 application.setActivationPolicy(.accessory)
