@@ -227,7 +227,8 @@ Always download and extract into a new, empty folder. An older package you keep 
 cargo build --release --locked --manifest-path agent/Cargo.toml
 ```
 
-The server and widget steps (1 and 3) use files from the source repository. A release package contains only the agent.
+The server step (1) uses files from the source repository. A release also has the iPhone widget (`Headroom.js`, section 3) and the
+desktop clients (sections 6 and 7) as files of their own; the agent's package contains only the agent.
 
 ### 2.4 Configure (before installing)
 
@@ -533,12 +534,13 @@ with a read token and never touches Claude, Codex or Gemini. It is a preview, an
 1. **Get it** (macOS 13 or later), either way:
    - **Download** `headroom-desktop-<version>-macos-arm64.tar.gz` (Apple silicon) from the
      [Releases page](https://github.com/n3dypop/headroom/releases), from the release that has it. As with the agent (section 2.3), use
-     `curl`, not a browser, check its SHA-256 value, and extract it into a new, empty folder:
+     `curl`, not a browser, check its SHA-256 value, and extract it into a new, empty folder. Put the release's version and the
+     archive's SHA-256 value (from the Releases page) in the first two lines:
 
      ```bash
      set -euo pipefail
-     V=<version>
-     EXPECTED=<sha256 of the tar.gz>
+     V="0.0.0"
+     EXPECTED="the archive's SHA-256 value"
      F="headroom-desktop-$V-macos-arm64.tar.gz"
      D="headroom-desktop-$(date +%Y%m%d%H%M%S)"
      mkdir "$D"
