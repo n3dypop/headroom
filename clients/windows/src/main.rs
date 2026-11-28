@@ -498,8 +498,10 @@ fn main() -> windows::core::Result<()> {
     tray::create()?;
     notch::create(pinned)?;
     std::thread::spawn(move || reader(rx));
-    // First run with nothing set: open Settings
-    if mode_of(&inner()) == Mode::Setup {
+    // First run with nothing set: open Settings (development builds: also with HEADROOM_DESKTOP_SETTINGS=1, for checking it)
+    let check_settings =
+        cfg!(debug_assertions) && std::env::var_os("HEADROOM_DESKTOP_SETTINGS").is_some();
+    if mode_of(&inner()) == Mode::Setup || check_settings {
         settings::open();
     }
     unsafe {

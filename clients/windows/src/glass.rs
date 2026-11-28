@@ -1,8 +1,8 @@
 //! Liquid glass, after liquidGL (MIT, github.com/naughtyduk/liquidGL): what is behind a shape, blurred, with the band along its
 //! edge magnified a little (light bent by the glass's bevel), under a thin film of the tint, a rim of light brighter at the top,
-//! and a soft highlight. What is behind is read from the screen (without the notch itself: layered windows aren't in a plain
-//! copy of the screen) only while the notch is open, kept in memory and never saved or sent. Without it the film is denser and
-//! the rest the same.
+//! and a soft highlight. What is behind is read from the screen only while the notch is open, kept in memory and never saved or
+//! sent; the notch is left out of screen copies meanwhile (notch.rs), so it never reads itself. Without it the film is denser
+//! and the rest the same.
 
 use crate::gfx::{color, pt, Gfx};
 use crate::theme::Ink;
@@ -44,7 +44,6 @@ pub fn capture(x: i32, y: i32, w: i32, h: i32) -> Option<Vec<u8>> {
         let mut out = None;
         if let Ok(bitmap) = CreateDIBSection(Some(mem), &bmi, DIB_RGB_COLORS, &mut bits, None, 0) {
             let old = SelectObject(mem, bitmap.into());
-            // No CAPTUREBLT: layered windows (the notch) are left out of the copy
             // GDI may batch the copy: flushed before the pixels are read
             if BitBlt(mem, 0, 0, w, h, Some(screen), x, y, SRCCOPY).is_ok()
                 && GdiFlush().as_bool()
@@ -80,9 +79,13 @@ pub struct Glass {
 pub const MIN_READ: std::time::Duration = std::time::Duration::from_millis(250);
 
 impl Glass {
-    /** The render target was made again: what was made on the old one goes */
+    /** The render target was made again: what was made on the old one goes (when the screen was last read stays, so the
+     * reads keep their interval) */
     pub fn reset(&mut self) {
-        *self = Glass::default();
+        *self = Glass {
+            read_at: self.read_at,
+            ..Glass::default()
+        };
     }
 
     pub fn drop_backdrop(&mut self) {

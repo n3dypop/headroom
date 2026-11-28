@@ -49,6 +49,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if app.with({ $0.mode == .setup }) { settings.show() }
     }
 
+    /** Quitting waits for the settings queue: a change shown as set is in the file when the app ends (only once the app has its state;
+     * a second copy that quits at once never made one) */
+    func applicationWillTerminate(_ notification: Notification) {
+        if settings != nil { app.finishSaving() }
+    }
+
     /** Copy, paste and select all in the settings fields (an app without a Dock icon has no menu bar of its own) */
     private func installEditMenu() {
         let main = NSMenu()

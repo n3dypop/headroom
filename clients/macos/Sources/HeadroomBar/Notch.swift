@@ -220,7 +220,12 @@ private func iconBox(_ aspect: CGFloat, _ box: CGFloat) -> CGSize {
 
 /** The screen's number, as the settings name it */
 func screenKey(of screen: NSScreen) -> String? {
-    (screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber).map { HeadroomKit.screenKey($0.uint32Value) }
+    screenNumber(of: screen).map { HeadroomKit.screenKey($0) }
+}
+
+/** The screen's NSScreenNumber (its CGDirectDisplayID) */
+func screenNumber(of screen: NSScreen) -> UInt32? {
+    (screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value
 }
 
 /** Whether the glass theme gets the system's Liquid Glass here (macOS 26 and an app built for it); a blurred background if not */
@@ -273,6 +278,12 @@ final class NotchController {
     private var cardTimer: Timer?
     private var monitors: [Any] = []
     private var appearanceWatch: NSKeyValueObservation?
+    /** The display the notch is on (for the check whether a window covers it) */
+    private var displayID: CGDirectDisplayID?
+    /** Checks about once a second whether another app covers the notch's screen (while full-screen hiding is on) */
+    private var coverTimer: Timer?
+    /** Hidden (ordered out) because the frontmost app covers the whole screen */
+    private var covered = false
     /** Where the card and its up and down lines were last drawn (for the wheel and clicks) */
     fileprivate var cardBox: CGRect?
     fileprivate var upBox: CGRect?
@@ -303,7 +314,7 @@ final class NotchController {
         for p in PROVIDER_ORDER { if let i = providerIcon(p) { icons[p] = i } }
         applyPrefs()
         refresh()
-        panel.orderFrontRegardless()
+        if !covered { panel.orderFrontRegardless() }
         // The pointer, wherever it is (global) and over the notch (local)
         if let g = NSEvent.addGlobalMonitorForEvents(matching: [.mouseMoved, .leftMouseDragged], handler: { [weak self] _ in self?.pointerMoved() }) {
             monitors.append(g)
@@ -340,6 +351,60 @@ final class NotchController {
         }
         applyTheme()
         place()
+        watchCover()
+    }
+
+    // MARK: Covered by another app
+
+    /** While full-screen hiding is on, the notch goes away whenever the frontmost app covers its whole screen in the normal Space
+     * (a game or a video player with a borderless window), as it stays out of full-screen Spaces */
+    private func watchCover() {
+        if prefs.hideFullscreen {
+            if coverTimer == nil {
+                coverTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in self?.checkCover() }
+            }
+            checkCover()
+        } else {
+            coverTimer?.invalidate()
+            coverTimer = nil
+            setCovered(false)
+        }
+    }
+
+    private func checkCover() {
+        setCovered(screenCovered())
+    }
+
+    private func setCovered(_ now: Bool) {
+        if now == covered { return }
+        covered = now
+        if now {
+            panel.orderOut(nil)
+        } else {
+            panel.orderFrontRegardless()
+            recheck()
+        }
+    }
+
+    /** Whether the frontmost app (not this one) has an on-screen window at the normal level over the whole of the notch's screen.
+     * Only each window's owner, bounds and level are read (never its name), which needs no screen-recording permission */
+    private func screenCovered() -> Bool {
+        guard let id = displayID, let front = NSWorkspace.shared.frontmostApplication else { return false }
+        let pid = front.processIdentifier
+        if pid == getpid() { return false }
+        let display = CGDisplayBounds(id)
+        guard let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]]
+        else { return false }
+        for w in windows {
+            guard (w[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value == pid,
+                  (w[kCGWindowLayer as String] as? NSNumber)?.intValue == 0,
+                  let bounds = w[kCGWindowBounds as String] as? NSDictionary,
+                  let r = CGRect(dictionaryRepresentation: bounds as CFDictionary)
+            else { continue }
+            // A point either way (rounding)
+            if r.insetBy(dx: -1, dy: -1).contains(display) { return true }
+        }
+        return false
     }
 
     private func appearanceChanged() {
@@ -414,6 +479,7 @@ final class NotchController {
         guard let i = chosenScreen(display: prefs.display, keys: screens.map { screenKey(of: $0) }, rightEdges: screens.map { Double($0.frame.maxX) })
         else { return }
         let area = screens[i].visibleFrame
+        displayID = screenNumber(of: screens[i])
         let s = CGFloat(prefs.size.scale)
         scale = s
         areaH = area.height / s
@@ -440,12 +506,35 @@ final class NotchController {
         CGRect(x: WIN_W - NUB_HOT_W, y: nubMid - NUB_H / 2, width: NUB_HOT_W, height: NUB_H)
     }
 
-    /** What takes clicks: the nub's strip, the open pill and the open card (not the margin around them, nor the gap between) */
+    /** The box the pill is cut to as it opens: from the nub's to the whole pill's (`e` is how far open) */
+    private func pillClip(_ e: CGFloat) -> CGRect {
+        let lerp = { (a: CGFloat, b: CGFloat) in a + (b - a) * e }
+        let x = lerp(WIN_W - NUB_W, pillX)
+        let top = lerp(nubMid - NUB_H / 2, pillY)
+        return CGRect(x: x, y: top, width: WIN_W - x, height: lerp(nubMid + NUB_H / 2, pillY + pillH) - top)
+    }
+
+    /** Where the card of a cell is now */
+    private func cardRect(_ i: Int) -> CGRect {
+        CGRect(x: WIN_W - CARD_RIGHT - CARD_W, y: currentCardTop(i), width: CARD_W, height: CGFloat(fit(i).h))
+    }
+
+    /** What takes clicks: the nub's strip, and the pill and the card in their rounded shapes while the notch is open or opening
+     * (not their clear corners, the margin around them, nor the gap between; nothing of them once the card goes or the notch folds) */
     private func clickable(_ p: CGPoint) -> Bool {
-        var rects = [nubStrip]
-        if fold.value > 0.5 { rects.append(CGRect(x: pillX, y: pillY, width: PILL_W, height: pillH)) }
-        if let b = cardBox { rects.append(b) }
-        return rects.contains { $0.contains(p) }
+        if nubStrip.contains(p) { return true }
+        let e = CGFloat(fold.value)
+        guard fold.to > 0, e > 0.001 else { return false }
+        if pillClip(e).contains(p) && pillPath(pillX, pillY, PILL_W, pillH).contains(p) { return true }
+        if let i = card, e > 0.5, NSBezierPath(roundedRect: cardRect(i), xRadius: CARD_RADIUS, yRadius: CARD_RADIUS).contains(p) { return true }
+        return false
+    }
+
+    /** Forgets where the card and its lines were drawn (the card went: nothing of it takes the wheel or clicks) */
+    private func forgetCard() {
+        cardBox = nil
+        upBox = nil
+        downBox = nil
     }
 
     // MARK: State
@@ -490,7 +579,7 @@ final class NotchController {
             pg.isHidden = true
         }
         if let i = card, e > 0.5 {
-            cg.frame = onRoot(CGRect(x: WIN_W - CARD_RIGHT - CARD_W, y: currentCardTop(i), width: CARD_W, height: CGFloat(fit(i).h)))
+            cg.frame = onRoot(cardRect(i))
             cg.isHidden = false
         } else {
             cg.isHidden = true
@@ -601,6 +690,7 @@ final class NotchController {
     private func foldAway() {
         if pinned { return }
         card = nil
+        forgetCard()
         if prefs.motion {
             fold.go(0)
             animate()
@@ -609,6 +699,7 @@ final class NotchController {
             redraw()
         }
         setTick()
+        // Clicks go through at once (the nub's strip takes them again with the next check)
         panel.ignoresMouseEvents = true
     }
 
@@ -629,8 +720,10 @@ final class NotchController {
     private func hideCard() {
         if pinned { return }
         card = nil
+        forgetCard()
         setTick()
         redraw()
+        recheck()
     }
 
     fileprivate func currentCardTop(_ i: Int) -> CGFloat {
@@ -683,11 +776,8 @@ final class NotchController {
         let mid = nubMid
         // The pill, opened from the nub: clipped to a box that grows from the nub to the whole pill
         if e > 0.001 {
-            let lerp = { (a: CGFloat, b: CGFloat) in a + (b - a) * e }
-            let clip = CGRect(x: lerp(WIN_W - NUB_W, pillX), y: lerp(mid - NUB_H / 2, pillY), width: 0, height: 0)
-            let clipRect = CGRect(x: clip.minX, y: clip.minY, width: WIN_W - clip.minX, height: lerp(mid + NUB_H / 2, pillY + pillH) - clip.minY)
             NSGraphicsContext.saveGraphicsState()
-            NSBezierPath(rect: clipRect).addClip()
+            NSBezierPath(rect: pillClip(e)).addClip()
             pal.pill.setFill()
             pillPath(pillX, pillY, PILL_W, pillH).fill()
             if cells.isEmpty {
@@ -706,9 +796,7 @@ final class NotchController {
             fade(pal.nub, nubA).setFill()
             NSBezierPath(roundedRect: CGRect(x: WIN_W - NUB_W, y: mid - NUB_H / 2, width: NUB_W + 6, height: NUB_H), xRadius: 5, yRadius: 5).fill()
         }
-        cardBox = nil
-        upBox = nil
-        downBox = nil
+        forgetCard()
         if let i = card, e > 0.5 { drawCard(i, top: currentCardTop(i), centre: ringCentre(min(i, count - 1))) }
     }
 

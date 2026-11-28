@@ -43,6 +43,7 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
     private let hideFullscreen = NSButton(checkboxWithTitle: "Hide over full-screen apps", target: nil, action: nil)
     private let atLogin = NSButton(checkboxWithTitle: "Start Headroom when you log in", target: nil, action: nil)
     private let loginHint = NSTextField(wrappingLabelWithString: "")
+    private let openLoginItems = NSButton(title: "Open Login Items…", target: nil, action: nil)
     private let status = NSTextField(wrappingLabelWithString: "")
     private var screensWatch: Any?
 
@@ -130,6 +131,8 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         // Placement
         screenPopup.target = self
         screenPopup.action = #selector(screenChosen)
+        // Its items have no action of their own: never disabled for it, so every screen can be chosen
+        screenPopup.autoenablesItems = false
         position.minValue = 0
         position.maxValue = 100
         position.numberOfTickMarks = 3
@@ -183,6 +186,9 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         hideFullscreen.action = #selector(hideToggled)
         atLogin.target = self
         atLogin.action = #selector(loginToggled)
+        openLoginItems.target = self
+        openLoginItems.action = #selector(openLoginItemsClicked)
+        openLoginItems.isHidden = true
         let behavior = newPage()
         put(behavior, label("Open the notch"), x, 16, cw, 18)
         put(behavior, openPopup, x, 38, 280, 26)
@@ -193,6 +199,7 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         put(behavior, hint("While another app is full screen (a game or a video), its space shows no notch."), x, 184, cw, 16)
         put(behavior, atLogin, x, 214, cw, 22)
         put(behavior, loginHint, x, 238, cw, 34)
+        put(behavior, openLoginItems, x, 276, 170, 28)
         tabs.addTabViewItem(item("behavior", "Behavior", behavior))
         loginHint.font = .systemFont(ofSize: 11)
         loginHint.textColor = .secondaryLabelColor
@@ -244,6 +251,7 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         func add(_ title: String, _ key: String) {
             let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
             item.representedObject = key
+            item.isEnabled = true
             screenPopup.menu?.addItem(item)
         }
         add("Automatic (furthest right)", "")
@@ -267,14 +275,24 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         }
     }
 
+    /** On only when the system has the login item enabled for this copy; the hint says why not otherwise */
     private func showLogin(_ now: LoginItem.Status) {
-        atLogin.state = now == .off ? .off : .on
+        atLogin.state = now == .on ? .on : .off
+        openLoginItems.isHidden = now != .needsApproval
         switch now {
         case .off, .on:
             loginHint.stringValue = "A login item in ~/Library/LaunchAgents that starts this copy of Headroom."
         case .other(let path):
-            loginHint.stringValue = "The login item starts another copy\(path.isEmpty ? "" : " (\(path))"). Turn this off and on to start this one."
+            loginHint.stringValue = "The login item starts another copy\(path.isEmpty ? "" : " (\(path))"). Turn this on to start this one."
+        case .needsApproval:
+            loginHint.stringValue = "macOS has the login item turned off. Allow Headroom in System Settings > General > Login Items."
+        case .notRegistered:
+            loginHint.stringValue = "The login item is written, but macOS hasn't taken it up yet. Turn this on again, or log out and in."
         }
+    }
+
+    @objc private func openLoginItemsClicked() {
+        LoginItem.openSettings()
     }
 
     /** A change of the notch's prefs: shown at once, written in the background */
@@ -353,7 +371,14 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
             DispatchQueue.main.async {
                 self.atLogin.isEnabled = true
                 self.showLogin(now)
-                self.status.stringValue = outcome?.text ?? (on ? "Headroom starts when you log in." : "Headroom no longer starts when you log in.")
+                let said: String
+                switch now {
+                case .on: said = "Headroom starts when you log in."
+                case .off: said = "Headroom no longer starts when you log in."
+                case .needsApproval: said = "Allow Headroom in System Settings > Login Items to start it when you log in."
+                case .other, .notRegistered: said = on ? "The login item is written; macOS doesn't list it as enabled yet." : "Login item changed."
+                }
+                self.status.stringValue = outcome?.text ?? said
             }
         }
     }

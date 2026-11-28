@@ -2,7 +2,9 @@
 
 use crate::prefs::{Prefs, Theme, Tint};
 use windows::core::w;
-use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
+use windows::Win32::System::Registry::{
+    RegGetValueW, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, RRF_RT_REG_DWORD, RRF_RT_REG_SZ,
+};
 
 /** A colour ("#rrggbb") and its opacity */
 pub type Ink = (&'static str, f32);
@@ -83,6 +85,31 @@ const GLASS_BLACK: Palette = Palette {
     glass: Some(Tint::Light),
 };
 
+/** Windows' build number (0 when it can't be read) */
+pub fn windows_build() -> u32 {
+    let mut buf = [0u16; 32];
+    let mut size = std::mem::size_of_val(&buf) as u32;
+    let got = unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            w!("SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion"),
+            w!("CurrentBuildNumber"),
+            RRF_RT_REG_SZ,
+            None,
+            Some(buf.as_mut_ptr().cast()),
+            Some(&mut size),
+        )
+    };
+    if got.is_err() {
+        return 0;
+    }
+    let n = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    String::from_utf16_lossy(&buf[..n])
+        .trim()
+        .parse()
+        .unwrap_or(0)
+}
+
 /** Whether Windows' apps are set to light (the System theme follows it) */
 pub fn apps_light() -> bool {
     let mut v: u32 = 0;
@@ -112,11 +139,11 @@ pub fn palette(p: &Prefs, system_light: bool, backdrop: bool) -> Palette {
         Theme::Glass => {
             let (base, film) = match (p.glass_tint, backdrop) {
                 (Tint::Clear, true) => (GLASS_WHITE, ("#16161a", 0.20)),
-                (Tint::Clear, false) => (GLASS_WHITE, ("#16161a", 0.46)),
+                (Tint::Clear, false) => (GLASS_WHITE, ("#16161a", 0.72)),
                 (Tint::Dark, true) => (GLASS_WHITE, ("#0b0b10", 0.52)),
-                (Tint::Dark, false) => (GLASS_WHITE, ("#0b0b10", 0.74)),
+                (Tint::Dark, false) => (GLASS_WHITE, ("#0b0b10", 0.86)),
                 (Tint::Light, true) => (GLASS_BLACK, ("#ffffff", 0.50)),
-                (Tint::Light, false) => (GLASS_BLACK, ("#ffffff", 0.72)),
+                (Tint::Light, false) => (GLASS_BLACK, ("#ffffff", 0.84)),
             };
             Palette {
                 pill: film,

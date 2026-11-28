@@ -165,6 +165,9 @@ struct Surface {
     dc: HDC,
     bitmap: HBITMAP,
     old: HGDIOBJ,
+    /** The pixels (for the development build's frame dump) */
+    #[cfg_attr(not(debug_assertions), allow(dead_code))]
+    bits: *const u8,
     w: i32,
     h: i32,
 }
@@ -207,6 +210,7 @@ impl Surface {
                 dc,
                 bitmap,
                 old,
+                bits: bits as *const u8,
                 w,
                 h,
             })
@@ -333,6 +337,8 @@ pub struct Notch {
     monitor: HMONITOR,
     /** Hidden while a full-screen app is in front */
     hidden: bool,
+    /** Left out of screen copies (so the glass, reading what is behind, never reads itself) */
+    excluded: bool,
 }
 
 /** How a card is laid out: whether its rows scroll, how far they are scrolled and can be, their room, and the card's height */
@@ -486,6 +492,24 @@ impl Notch {
     fn take_prefs(&mut self) {
         self.prefs = crate::prefs();
         self.system_light = theme::apps_light();
+        // A copy of the screen includes the notch (layered windows too, as the screen is composed): while the glass reads what
+        // is behind, the notch is left out of copies, its own and screenshots alike. Where Windows can't (before Windows 10 2004,
+        // where the same call blacks the window out of copies instead), the glass doesn't read
+        let exclude = self.prefs.theme == Theme::Glass
+            && self.prefs.glass_backdrop
+            && theme::windows_build() >= 19_041;
+        if exclude != self.excluded {
+            let affinity = if exclude {
+                WDA_EXCLUDEFROMCAPTURE
+            } else {
+                WDA_NONE
+            };
+            if unsafe { SetWindowDisplayAffinity(self.hwnd, affinity) }.is_ok() {
+                self.excluded = exclude;
+            }
+            // Not set: still excluded when it was to be lifted (tried again at the next placement), not excluded when it was to
+            // be set (the glass doesn't read)
+        }
         let (fold_ms, move_ms) = if self.prefs.motion {
             (FOLD_MS, CARD_MOVE_MS)
         } else {
@@ -518,7 +542,10 @@ impl Notch {
 
     /** Whether the glass reads what is behind it */
     fn glass_reads(&self) -> bool {
-        self.prefs.theme == Theme::Glass && self.prefs.glass_backdrop && !self.hidden
+        self.prefs.theme == Theme::Glass
+            && self.prefs.glass_backdrop
+            && self.excluded
+            && !self.hidden
     }
 
     /** Reads what is behind the window for the glass (kept in memory only) */
@@ -837,6 +864,18 @@ impl Notch {
             return false;
         }
         self.failures = 0;
+        // Development builds only: HEADROOM_DESKTOP_DUMP=<file> writes each frame shown (width, height, then premultiplied BGRA),
+        // for checking a look that screen copies leave out
+        #[cfg(debug_assertions)]
+        if let (Some(path), Some(s)) = (std::env::var_os("HEADROOM_DESKTOP_DUMP"), &self.surface) {
+            let n = (s.w * s.h * 4) as usize;
+            let px = unsafe { std::slice::from_raw_parts(s.bits, n) };
+            let mut out = Vec::with_capacity(n + 8);
+            out.extend_from_slice(&(s.w as u32).to_le_bytes());
+            out.extend_from_slice(&(s.h as u32).to_le_bytes());
+            out.extend_from_slice(px);
+            let _ = std::fs::write(path, out);
+        }
         // The pointer is read at the scale of what is on the screen
         self.shown_scale = self.scale;
         true
@@ -1812,6 +1851,7 @@ pub fn create(pinned: bool) -> Result<()> {
             glass: Glass::default(),
             monitor: HMONITOR::default(),
             hidden: false,
+            excluded: false,
         };
         notch.load_icons();
         notch.refresh_model();

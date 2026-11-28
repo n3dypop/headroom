@@ -98,6 +98,8 @@ const DELAYS: [(&str, FoldDelay); 3] = [
 thread_local! {
     static HWND_NOW: Cell<isize> = const { Cell::new(0) };
     static FONTS: Cell<(isize, isize)> = const { Cell::new((0, 0)) };
+    /** The tabs' page colour, for the labels and boxes that sit on it */
+    static PANE: Cell<isize> = const { Cell::new(0) };
     static PAGE: Cell<usize> = const { Cell::new(0) };
     /** The screens' device names, in the order of the screen list ("" for automatic) */
     static SCREENS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
@@ -433,7 +435,13 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
                 ]
                 .contains(&GetDlgCtrlID(control));
                 SetTextColor(dc, COLORREF(if hint { 0x0070_6e6e } else { 0x0000_0000 }));
-                LRESULT(GetSysColorBrush(COLOR_WINDOW).0 as isize)
+                // On a tab's page its colour; the status line is on the window's
+                let pane = PANE.with(Cell::get);
+                if GetDlgCtrlID(control) != ID_STATUS && pane != 0 {
+                    LRESULT(pane)
+                } else {
+                    LRESULT(GetSysColorBrush(COLOR_WINDOW).0 as isize)
+                }
             }
             // Moved to a screen of another scale: the suggested size, then the controls and fonts at the new DPI
             WM_DPICHANGED => {
@@ -456,6 +464,10 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
             }
             WM_DESTROY => {
                 HWND_NOW.with(|h| h.set(0));
+                let pane = PANE.with(|p| p.replace(0));
+                if pane != 0 {
+                    let _ = DeleteObject(HGDIOBJ(pane as *mut _));
+                }
                 let (a, b) = FONTS.with(Cell::take);
                 for f in [a, b] {
                     if f != 0 {
@@ -490,6 +502,38 @@ fn fonts(dpi: u32) -> (HFONT, HFONT) {
     }
 }
 
+/** A brush of the colour the tabs' page is drawn in (the visual style's, else the classic face colour) */
+fn pane_brush(tabs: HWND) -> HBRUSH {
+    unsafe {
+        let mut color = GetSysColor(COLOR_BTNFACE);
+        let theme = OpenThemeData(Some(tabs), w!("TAB"));
+        if !theme.is_invalid() {
+            let screen = GetDC(None);
+            let mem = CreateCompatibleDC(Some(screen));
+            let bitmap = CreateCompatibleBitmap(screen, 40, 40);
+            let old = SelectObject(mem, bitmap.into());
+            let r = RECT {
+                left: 0,
+                top: 0,
+                right: 40,
+                bottom: 40,
+            };
+            if DrawThemeBackground(theme, mem, TABP_PANE.0, 0, &r, None).is_ok() {
+                let c = GetPixel(mem, 20, 20);
+                if c.0 != CLR_INVALID {
+                    color = c.0;
+                }
+            }
+            SelectObject(mem, old);
+            let _ = DeleteObject(bitmap.into());
+            let _ = DeleteDC(mem);
+            ReleaseDC(None, screen);
+            let _ = CloseThemeData(theme);
+        }
+        CreateSolidBrush(COLORREF(color))
+    }
+}
+
 /** Opens the settings (or brings them to the front) */
 pub fn open() {
     if let Some(h) = hwnd() {
@@ -520,7 +564,7 @@ struct Control {
 const X: i32 = 32;
 const CW: i32 = WIDTH - 64;
 const LEAD: &str = "Shows the usage limits your Headroom server has. It reads the server every 5 minutes at most, and never touches Claude, Codex or Gemini itself.";
-const BACKDROP_HINT: &str = "While the notch is open it reads the part of the screen right behind it, in memory only: nothing is saved or sent. Off, it only looks like glass.";
+const BACKDROP_HINT: &str = "While the notch is open it reads the part of the screen right behind it, in memory only: nothing is saved or sent. Screenshots and recordings leave the notch out meanwhile. Off, it only looks like glass.";
 
 fn controls() -> Vec<Control> {
     let tab = WS_TABSTOP.0;
@@ -630,7 +674,7 @@ fn controls() -> Vec<Control> {
             (X + 16, 142, CW - 32, 22),
             2,
         ),
-        label(BACKDROP_HINT, ID_BACKDROP_HINT, (X + 34, 166, CW - 50, 50), 2),
+        label(BACKDROP_HINT, ID_BACKDROP_HINT, (X + 34, 166, CW - 50, 52), 2),
         label("Tint", ID_TINT_LABEL, (X + 16, 228, 60, 18), 2),
         c(w!("COMBOBOX"), "", list, ID_TINT, (X + 80, 224, 160, 200), 2),
         c(
@@ -830,6 +874,7 @@ fn build() -> Result<()> {
             0,
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
         );
+        PANE.with(|p| p.set(pane_brush(tabs).0 as isize));
         lay_out(dlg, dpi);
         cue(dlg, ID_URL, "https://headroom.example.workers.dev");
         HWND_NOW.with(|h| h.set(dlg.0 as isize));

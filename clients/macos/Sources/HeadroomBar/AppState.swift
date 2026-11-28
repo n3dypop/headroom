@@ -26,6 +26,8 @@ final class AppState {
     var onPrefs: (() -> Void)?
     /** Moves on with every prefs change (under the lock): a write that a later one follows is skipped */
     private var prefsChange: UInt64 = 0
+    /** Why the last write of the prefs failed, kept until a later write succeeds (under the lock) */
+    private var prefsError: SaveError?
     /** Whether the keychain has said whether the settings' token is there (read and written under the lock only) */
     private var tokenKnown = false
 
@@ -72,6 +74,8 @@ final class AppState {
                     s.apply(saved)
                     // The save asked the keychain for these settings
                     tokenKnown = true
+                    // The file now holds the prefs in use, if they didn't change meanwhile
+                    if s.settings.prefs == saved.next.prefs { prefsError = nil }
                 }
                 outcome = nil
             } catch let e as SaveError {
@@ -89,7 +93,8 @@ final class AppState {
 
     /** Changes the notch's prefs (on the main thread): they take effect at once, and the settings file is written on the settings
      * queue, after any save before it and outside the lock. The server and the token are written as they are then. `done` gets the
-     * error (nil when written), on the main thread; a change another one follows before it is written reports nothing */
+     * error (nil once the file holds these prefs), on the main thread, after the writes before it; a change another one follows
+     * before it is written reports nothing (the later one reports). A value already in use reports what the last write came to */
     func setPrefs(_ change: (inout Prefs) -> Void, done: @escaping (SaveError?) -> Void) {
         let mine = with { s -> UInt64? in
             var p = s.settings.prefs
@@ -99,7 +104,14 @@ final class AppState {
             prefsChange += 1
             return prefsChange
         }
-        guard let mine else { return done(nil) }
+        guard let mine else {
+            // Nothing new to write: told after the writes already queued, with a failed one's error if no write since succeeded
+            saving.async { [self] in
+                let kept = with { _ in prefsError }
+                DispatchQueue.main.async { done(kept) }
+            }
+            return
+        }
         onPrefs?()
         saving.async { [self] in
             // The settings as they are now (a later change writes for itself)
@@ -114,8 +126,14 @@ final class AppState {
             } catch {
                 outcome = SaveError("Couldn't write the settings")
             }
+            with { _ in prefsError = outcome }
             DispatchQueue.main.async { done(outcome) }
         }
+    }
+
+    /** Waits for the saves and writes queued (before quitting: what was shown as set is in the file) */
+    func finishSaving() {
+        saving.sync {}
     }
 
     /** Removes the token on the settings queue; `done` gets the error (nil when removed), on the main thread */
