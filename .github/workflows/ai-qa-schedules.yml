@@ -50,11 +50,11 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
-    uses: n3dypop/repo-autopilot/.github/workflows/layer2-nightly-tests.yml@270d7328d75512af7dd96fb068608a6a7e7e1207 # v0.1.1
+    uses: n3dypop/repo-autopilot/.github/workflows/layer2-nightly-tests.yml@e582f18cb691f126bc7c3bf4a3b6beda5b45f813 # v0.1.2
     with:
       repo_tier: 'A'
       runtime: 'node'
-      max_targets: ${{ inputs.max_targets || 2 }}
+      max_targets: ${{ fromJSON(github.event_name == 'workflow_dispatch' && format('{0}', inputs.max_targets) != '' && format('{0}', inputs.max_targets) || '2') }}
     secrets:
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
@@ -72,7 +72,7 @@ jobs:
       contents: write
       issues: write
       pull-requests: write
-    uses: n3dypop/repo-autopilot/.github/workflows/layer3-weekly-audit.yml@270d7328d75512af7dd96fb068608a6a7e7e1207 # v0.1.1
+    uses: n3dypop/repo-autopilot/.github/workflows/layer3-weekly-audit.yml@e582f18cb691f126bc7c3bf4a3b6beda5b45f813 # v0.1.2
     with:
       repo_tier: 'A'
       runtime: 'node'
@@ -94,7 +94,7 @@ jobs:
       discussions: write
       issues: read
       pull-requests: read
-    uses: n3dypop/repo-autopilot/.github/workflows/layer5-product-evolve.yml@270d7328d75512af7dd96fb068608a6a7e7e1207 # v0.1.1
+    uses: n3dypop/repo-autopilot/.github/workflows/layer5-product-evolve.yml@e582f18cb691f126bc7c3bf4a3b6beda5b45f813 # v0.1.2
     with:
       repo_tier: 'A'
       runtime: 'node'
@@ -118,7 +118,7 @@ jobs:
       discussions: write
       issues: read
       pull-requests: read
-    uses: n3dypop/repo-autopilot/.github/workflows/layer5-product-evolve.yml@270d7328d75512af7dd96fb068608a6a7e7e1207 # v0.1.1
+    uses: n3dypop/repo-autopilot/.github/workflows/layer5-product-evolve.yml@e582f18cb691f126bc7c3bf4a3b6beda5b45f813 # v0.1.2
     with:
       repo_tier: 'A'
       runtime: 'node'
