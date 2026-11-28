@@ -22,6 +22,9 @@ pub struct Settings {
     /// only when this file is written, and an entry it doesn't name is never read
     #[serde(default)]
     pub token_slot: u64,
+    /// How the notch looks and behaves (its keys are read one by one, so a bad one never loses the server)
+    #[serde(skip)]
+    pub prefs: crate::prefs::Prefs,
 }
 
 /// %APPDATA%\Headroom\desktop.json (macOS: ~/Library/Application Support/Headroom/desktop.json)
@@ -36,12 +39,28 @@ pub fn settings_path() -> Option<PathBuf> {
 
 /// The saved settings. An address that isn't an https origin (the file edited by hand) is dropped: no token is ever sent there
 pub fn load_settings() -> Settings {
-    let mut s: Settings = settings_path()
+    let value: serde_json::Value = settings_path()
         .and_then(|p| std::fs::read_to_string(p).ok())
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default();
+    settings_from(&value)
+}
+
+/// The settings in a settings file's JSON
+pub fn settings_from(value: &serde_json::Value) -> Settings {
+    let mut s: Settings = serde_json::from_value(value.clone()).unwrap_or_default();
     s.url = normalize_base_url(&s.url).unwrap_or_default();
+    s.prefs = crate::prefs::Prefs::from_value(value);
     s
+}
+
+/// The settings as a settings file's JSON
+pub fn settings_json(s: &Settings) -> Result<String, String> {
+    let mut value = serde_json::to_value(s).map_err(|_| "Couldn't write the settings")?;
+    if let Some(m) = value.as_object_mut() {
+        s.prefs.write_into(m);
+    }
+    serde_json::to_string_pretty(&value).map_err(|_| "Couldn't write the settings".to_string())
 }
 
 pub fn save_settings(s: &Settings) -> Result<(), String> {
@@ -50,7 +69,7 @@ pub fn save_settings(s: &Settings) -> Result<(), String> {
         std::fs::create_dir_all(dir).map_err(|_| "Couldn't create the settings folder")?;
     }
     let tmp = path.with_extension("json.tmp");
-    let text = serde_json::to_string_pretty(s).map_err(|_| "Couldn't write the settings")?;
+    let text = settings_json(s)?;
     std::fs::write(&tmp, text).map_err(|_| "Couldn't write the settings")?;
     std::fs::rename(&tmp, &path).map_err(|_| "Couldn't write the settings")?;
     Ok(())

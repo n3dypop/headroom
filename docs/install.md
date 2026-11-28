@@ -498,14 +498,25 @@ token. It never touches Claude, Codex or Gemini. It is a preview: there is no in
    only) and the read token, and choose **Save**. The token is kept in Windows Credential Manager, for that server only; changing the
    server asks for its token. To look around first, choose **Show sample data instead of the server**.
 4. **Use it.**
-   - Move the pointer to the small nub at the right edge: the notch opens with a ring per provider (what is left of its 5-hour limit,
-     its weekly limit as the thin outer ring). Over a ring, a card shows every limit, as the widget's large size does.
+   - Move the pointer to the small nub at the right edge (with several monitors, of the one furthest right unless you choose
+     another): the notch opens with a ring per provider (what is left of its 5-hour limit, its weekly limit as the thin outer ring).
+     Over a ring, a card shows every limit, as the widget's large size does.
    - Click a ring to read the server now. It reads at most once every 5 minutes, and waits longer after failures.
    - The tray icon's menu lists each provider and has **Refresh now**, **Settings…** and **Quit Headroom**.
    - On a screen less than 300 px high (after scaling), the card points to the tray menu instead of listing the limits that don't fit.
-5. **Start it at sign-in** (optional): press Win+R, open `shell:startup`, and put a shortcut to `headroom-desktop.exe` there.
-6. **Remove it:** choose **Quit Headroom**, then in **Settings** choose **Remove token** (or remove the `headroom-desktop` entries in
-   Credential Manager), and delete `%APPDATA%\Headroom\desktop.json`. Remove its line from `TOKENS` on the server too.
+5. **Settings** (from the tray menu) has four tabs. Only **Connection** needs **Save**; the other tabs take each change at once.
+   - **Connection:** the Worker URL, the read token, and the sample data.
+   - **Placement:** the screen (automatic is the one furthest right), the position along the edge, and the size.
+   - **Appearance:** the theme (as Windows' apps are, dark, light, or **Liquid Glass**) and the animations. Liquid Glass blurs and
+     bends what is behind the notch: while the notch is open it reads the part of the screen right behind it, in memory only, and
+     never saves or sends it. Turn off **Blur and bend what is behind it** to have the look of glass without that. Its tint can be
+     clear, dark or light.
+   - **Behavior:** whether the notch opens when the pointer touches it or when it is clicked, how soon it folds after the pointer
+     leaves, hiding it while a full-screen app (a game, a video) is in front, and starting Headroom when you sign in to Windows (a
+     `Headroom` value in your user's Run key, removed when you turn it off).
+6. **Remove it:** in **Settings**, turn off starting at sign-in and choose **Remove token** (or remove the `headroom-desktop`
+   entries in Credential Manager), then choose **Quit Headroom** and delete `%APPDATA%\Headroom\desktop.json`. If you put a
+   shortcut in `shell:startup` before, delete it too. Remove its line from `TOKENS` on the server as well.
 
 ## 7. macOS desktop client (preview)
 
@@ -525,8 +536,11 @@ with a read token and never touches Claude, Codex or Gemini. It is a preview: yo
 4. **Use it** as on Windows (section 6, step 4): the nub at the right edge opens the notch, a ring shows its card, a click reads the
    server (at most once every 5 minutes), and the menu bar item lists each provider with **Refresh now**, **Settings…** and
    **Quit Headroom**. On a trackpad, the card's rows scroll when they don't fit.
-5. **Provider icons** (optional): put `claude.png`, `codex.png` and `gemini.png` (as in section 3) in
+5. **Settings** has the same four tabs as on Windows (section 6, step 5). On macOS 26 and later, **Liquid Glass** is the system's
+   own glass (on earlier versions, its translucent material), so nothing is read from the screen; **Start Headroom when you log in**
+   adds a `com.headroom.desktop.plist` to `~/Library/LaunchAgents/`, used from the next login.
+6. **Provider icons** (optional): put `claude.png`, `codex.png` and `gemini.png` (as in section 3) in
    `~/Library/Application Support/Headroom/icons/` and start it again. Without them the rings show letters.
-6. **Remove it:** choose **Quit Headroom**, then in **Settings** choose **Remove token** (or delete the `headroom-desktop` items in
-   Keychain Access), and delete `~/Library/Application Support/Headroom/`. Remove its line from `TOKENS` on the server too.
+7. **Remove it:** in **Settings**, turn off starting at login and choose **Remove token** (or delete the `headroom-desktop` items in
+   Keychain Access), then choose **Quit Headroom** and delete `~/Library/Application Support/Headroom/`. Remove its line from `TOKENS` on the server too.
 

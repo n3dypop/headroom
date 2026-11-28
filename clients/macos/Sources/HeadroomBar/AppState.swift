@@ -22,6 +22,10 @@ final class AppState {
     let keep = KeychainKeep()
     /** Told (on the main thread) whenever the state may have changed */
     var onChange: (() -> Void)?
+    /** Told (on the main thread) when the notch's prefs changed: it is placed and drawn again */
+    var onPrefs: (() -> Void)?
+    /** Moves on with every prefs change (under the lock): a write that a later one follows is skipped */
+    private var prefsChange: UInt64 = 0
     /** Whether the keychain has said whether the settings' token is there (read and written under the lock only) */
     private var tokenKnown = false
 
@@ -83,6 +87,37 @@ final class AppState {
         }
     }
 
+    /** Changes the notch's prefs (on the main thread): they take effect at once, and the settings file is written on the settings
+     * queue, after any save before it and outside the lock. The server and the token are written as they are then. `done` gets the
+     * error (nil when written), on the main thread; a change another one follows before it is written reports nothing */
+    func setPrefs(_ change: (inout Prefs) -> Void, done: @escaping (SaveError?) -> Void) {
+        let mine = with { s -> UInt64? in
+            var p = s.settings.prefs
+            change(&p)
+            if p == s.settings.prefs { return nil }
+            s.settings.prefs = p
+            prefsChange += 1
+            return prefsChange
+        }
+        guard let mine else { return done(nil) }
+        onPrefs?()
+        saving.async { [self] in
+            // The settings as they are now (a later change writes for itself)
+            let settings = with { s -> Settings? in prefsChange == mine ? s.settings : nil }
+            guard let settings else { return }
+            let outcome: SaveError?
+            do {
+                try keep.write(settings)
+                outcome = nil
+            } catch let e as SaveError {
+                outcome = e
+            } catch {
+                outcome = SaveError("Couldn't write the settings")
+            }
+            DispatchQueue.main.async { done(outcome) }
+        }
+    }
+
     /** Removes the token on the settings queue; `done` gets the error (nil when removed), on the main thread */
     func removeToken(done: @escaping (SaveError?) -> Void) {
         saving.async { [self] in
@@ -116,7 +151,7 @@ final class AppState {
         // Taken only for the settings it was asked about (a save meanwhile has said for itself)
         let current = with { s -> Bool in
             // A save meanwhile asked for itself: this answer is about settings no longer in use
-            guard s.settings == settings, !tokenKnown else { return false }
+            guard s.settings.sameToken(as: settings), !tokenKnown else { return false }
             switch found {
             case .token:
                 s.hasToken = true

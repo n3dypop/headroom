@@ -3,6 +3,15 @@
 
 import Foundation
 
+/** A key of the settings file */
+private struct SettingsKey: CodingKey {
+    let stringValue: String
+    init(_ s: String) { stringValue = s }
+    init?(stringValue: String) { self.stringValue = stringValue }
+    var intValue: Int? { nil }
+    init?(intValue: Int) { return nil }
+}
+
 /** The saved settings (~/Library/Application Support/Headroom/desktop.json) */
 public struct Settings: Codable, Equatable {
     /** The server's https origin (no path) */
@@ -12,23 +21,50 @@ public struct Settings: Codable, Equatable {
     /** Which keychain item holds the server's read token (0: none). Each saved token gets a new one, so a save takes effect only
      * when the settings file is written, and an item the file doesn't name is never read */
     public var tokenSlot: UInt64 = 0
+    /** The notch's look and behaviour (kept in the same file, beside the server) */
+    public var prefs = Prefs()
 
-    enum CodingKeys: String, CodingKey {
-        case url, demo
-        case tokenSlot = "token_slot"
-    }
-
-    public init(url: String = "", demo: Bool = false, tokenSlot: UInt64 = 0) {
+    public init(url: String = "", demo: Bool = false, tokenSlot: UInt64 = 0, prefs: Prefs = Prefs()) {
         self.url = url
         self.demo = demo
         self.tokenSlot = tokenSlot
+        self.prefs = prefs
     }
 
+    /** Each key on its own: one that is missing or of the wrong type is its default, and the others are kept */
     public init(from decoder: Decoder) throws {
-        let c = try decoder.container(keyedBy: CodingKeys.self)
-        url = (try? c.decode(String.self, forKey: .url)) ?? ""
-        demo = (try? c.decode(Bool.self, forKey: .demo)) ?? false
-        tokenSlot = (try? c.decode(UInt64.self, forKey: .tokenSlot)) ?? 0
+        let c = try decoder.container(keyedBy: SettingsKey.self)
+        url = (try? c.decode(String.self, forKey: SettingsKey("url"))) ?? ""
+        demo = (try? c.decode(Bool.self, forKey: SettingsKey("demo"))) ?? false
+        tokenSlot = (try? c.decode(UInt64.self, forKey: SettingsKey("token_slot"))) ?? 0
+        var found: [String: JSON] = [:]
+        for key in Prefs.keys {
+            if let v = try? c.decode(JSON.self, forKey: SettingsKey(key)) { found[key] = v }
+        }
+        prefs = Prefs(json: found)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: SettingsKey.self)
+        try c.encode(url, forKey: SettingsKey("url"))
+        try c.encode(demo, forKey: SettingsKey("demo"))
+        try c.encode(tokenSlot, forKey: SettingsKey("token_slot"))
+        // Typed as the Windows client reads them (the position as a whole number)
+        try c.encode(prefs.display, forKey: SettingsKey("display"))
+        try c.encode(prefs.position, forKey: SettingsKey("position"))
+        try c.encode(prefs.size.rawValue, forKey: SettingsKey("size"))
+        try c.encode(prefs.theme.rawValue, forKey: SettingsKey("theme"))
+        try c.encode(prefs.glassBackdrop, forKey: SettingsKey("glass_backdrop"))
+        try c.encode(prefs.glassTint.rawValue, forKey: SettingsKey("glass_tint"))
+        try c.encode(prefs.openOn.rawValue, forKey: SettingsKey("open_on"))
+        try c.encode(prefs.foldDelay.rawValue, forKey: SettingsKey("fold_delay"))
+        try c.encode(prefs.motion, forKey: SettingsKey("motion"))
+        try c.encode(prefs.hideFullscreen, forKey: SettingsKey("hide_fullscreen"))
+    }
+
+    /** The same server and keychain item (what the token is read for; the prefs don't count) */
+    public func sameToken(as other: Settings) -> Bool {
+        url == other.url && tokenSlot == other.tokenSlot
     }
 }
 
@@ -170,7 +206,8 @@ public struct State {
             try keep.store(origin: url, slot: free, token: t)
             slot = free
         }
-        let next = Settings(url: url, demo: demo, tokenSlot: slot)
+        // The prefs as they were: a save of the server is never a change of the look
+        let next = Settings(url: url, demo: demo, tokenSlot: slot, prefs: old.prefs)
         let newEntry = token != nil
         do {
             try keep.write(next)
@@ -203,7 +240,10 @@ public struct State {
         if saved.newEntry { schedule.newToken() }
         let removed = saved.old.tokenSlot != 0 && saved.next.tokenSlot == 0
         let newSource = newServer || saved.newEntry || removed || hasToken != saved.hasToken
+        // The prefs stay the state's own: ones changed while the save was written are not taken back (their own write follows)
+        let prefs = settings.prefs
         settings = saved.next
+        settings.prefs = prefs
         hasToken = saved.hasToken
         if newSource { startOver() }
     }
