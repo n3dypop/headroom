@@ -9,7 +9,7 @@ Headroom has three parts. Set them up in this order:
 Each device gets its own token:
 
 - Each PC gets a **write** token, which lets it send values under its own name only.
-- Each reader gets a **read** token. Readers are the iPhone and the Windows desktop client (preview, section 6).
+- Each reader gets a **read** token. Readers are the iPhone and the desktop clients (previews, sections 6 and 7).
 
 Tokens are sent only in the `Authorization` header, never in URLs.
 
@@ -21,6 +21,7 @@ Tokens are sent only in the `Authorization` header, never in URLs.
 - [4. Updating and removing](#4-updating-and-removing)
 - [5. Troubleshooting](#5-troubleshooting)
 - [6. Windows desktop client (preview)](#6-windows-desktop-client-preview)
+- [7. macOS desktop client (preview)](#7-macos-desktop-client-preview)
 
 ---
 
@@ -505,4 +506,27 @@ token. It never touches Claude, Codex or Gemini. It is a preview: there is no in
 5. **Start it at sign-in** (optional): press Win+R, open `shell:startup`, and put a shortcut to `headroom-desktop.exe` there.
 6. **Remove it:** choose **Quit Headroom**, then in **Settings** choose **Remove token** (or remove the `headroom-desktop` entries in
    Credential Manager), and delete `%APPDATA%\Headroom\desktop.json`. Remove its line from `TOKENS` on the server too.
+
+## 7. macOS desktop client (preview)
+
+The same notch as on Windows, on the right edge of the screen, with a menu bar item in place of the tray icon. It reads your server
+with a read token and never touches Claude, Codex or Gemini. It is a preview: you build and run it yourself, and it isn't signed.
+
+1. **Build it** (macOS 13 or later, with Xcode or the Xcode Command Line Tools):
+
+   ```bash
+   swift build -c release --package-path clients/macos
+   ```
+2. **Create a read token for the Mac** as in section 6, step 2 (for example `node packages/worker/scripts/new-token.ts read mac-view`),
+   and add its line to `TOKENS`.
+3. **Run** `clients/macos/.build/release/HeadroomBar`. It has no Dock icon. The first time, **Settings** opens: enter the Worker URL
+   and the read token, and choose **Save**. The token is kept in your login keychain (as `headroom-desktop`), for that server only.
+   To look around first, choose **Show sample data instead of the server**.
+4. **Use it** as on Windows (section 6, step 4): the nub at the right edge opens the notch, a ring shows its card, a click reads the
+   server (at most once every 5 minutes), and the menu bar item lists each provider with **Refresh now**, **Settings…** and
+   **Quit Headroom**. On a trackpad, the card's rows scroll when they don't fit.
+5. **Provider icons** (optional): put `claude.png`, `codex.png` and `gemini.png` (as in section 3) in
+   `~/Library/Application Support/Headroom/icons/` and start it again. Without them the rings show letters.
+6. **Remove it:** choose **Quit Headroom**, then in **Settings** choose **Remove token** (or delete the `headroom-desktop` items in
+   Keychain Access), and delete `~/Library/Application Support/Headroom/`. Remove its line from `TOKENS` on the server too.
 
