@@ -1,4 +1,5 @@
-//! Starting with Windows: a value in the signed-in user's Run key naming this program (nothing else is changed).
+//! Starting with Windows: a value in the signed-in user's Run key naming this program (nothing else is changed). It starts it with
+//! --keep-running, so a crash is followed by a new start (keep.rs).
 
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::ERROR_SUCCESS;
@@ -7,15 +8,19 @@ use windows::Win32::System::Registry::*;
 const RUN: PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
 const NAME: PCWSTR = w!("Headroom");
 
-/** The command the Run key gets: this program, quoted */
+/** The command the Run key gets: this program, quoted, kept running */
 fn command() -> Option<String> {
+    Some(format!("{} {}", earlier_command()?, crate::keep::FLAG))
+}
+
+/** What earlier versions put in the Run key: this program, quoted */
+fn earlier_command() -> Option<String> {
     let exe = std::env::current_exe().ok()?;
     Some(format!("\"{}\"", exe.display()))
 }
 
-/** Whether Windows starts this program at sign-in (the Run value names this program) */
-pub fn enabled() -> bool {
-    let Some(want) = command() else { return false };
+/** The Run value, when there is one */
+fn value() -> Option<String> {
     let mut buf = [0u16; 1024];
     let mut size = std::mem::size_of_val(&buf) as u32;
     let got = unsafe {
@@ -30,10 +35,28 @@ pub fn enabled() -> bool {
         )
     };
     if got != ERROR_SUCCESS {
-        return false;
+        return None;
     }
     let n = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
-    String::from_utf16_lossy(&buf[..n]).eq_ignore_ascii_case(&want)
+    Some(String::from_utf16_lossy(&buf[..n]))
+}
+
+/** Whether Windows starts this program at sign-in (the Run value names this program, as now or as earlier versions did) */
+pub fn enabled() -> bool {
+    let Some(now) = value() else { return false };
+    [command(), earlier_command()]
+        .into_iter()
+        .flatten()
+        .any(|c| now.eq_ignore_ascii_case(&c))
+}
+
+/** A Run value an earlier version wrote for this program gets the restart after a crash (from the next sign-in) */
+pub fn update() {
+    if let (Some(now), Some(earlier)) = (value(), earlier_command()) {
+        if now.eq_ignore_ascii_case(&earlier) {
+            let _ = set(true);
+        }
+    }
 }
 
 /** Starts this program at sign-in, or stops doing so */

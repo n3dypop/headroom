@@ -6,6 +6,7 @@ mod art;
 mod demo;
 mod gfx;
 mod glass;
+mod keep;
 mod model;
 mod notch;
 mod prefs;
@@ -468,6 +469,11 @@ fn reader(rx: mpsc::Receiver<()>) {
 }
 
 fn main() -> windows::core::Result<()> {
+    // Started at sign-in: a watcher that starts the app, and starts it again after a crash
+    if std::env::args().any(|a| a == keep::FLAG) {
+        keep::run();
+        return Ok(());
+    }
     unsafe {
         // One notch per sign-in
         let _single = CreateMutexW(None, true, w!("Local\\HeadroomDesktop"))?;
@@ -499,6 +505,8 @@ fn main() -> windows::core::Result<()> {
     tray::create()?;
     notch::create(pinned)?;
     std::thread::spawn(move || reader(rx));
+    // A Run value from an earlier version gets the restart after a crash
+    std::thread::spawn(startup::update);
     // First run with nothing set: open Settings (development builds: also with HEADROOM_DESKTOP_SETTINGS=1, for checking it)
     let check_settings =
         cfg!(debug_assertions) && std::env::var_os("HEADROOM_DESKTOP_SETTINGS").is_some();

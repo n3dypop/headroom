@@ -1,7 +1,7 @@
 // Starting at login: a LaunchAgent of the user's own (~/Library/LaunchAgents/com.headroom.desktop.plist) that runs this executable.
 // The app is a bare executable, not an app bundle, so the system's login items for apps don't apply. Kept by the system only: the
 // settings file doesn't hold it; whether it runs is the system's to say (the user can turn it off in System Settings > Login
-// Items). Used off the main thread.
+// Items). Used off the main thread. It also starts the app again when it ends abnormally (a crash), not when it is quit.
 
 import Foundation
 import HeadroomKit
@@ -54,6 +54,33 @@ enum LoginItem {
         return path == program ? .on : .other(path)
     }
 
+    /** The agent for an executable: started at login, and again when it ends abnormally (a crash or a kill: not a quit, which ends
+     * it normally), at most once a minute */
+    static func agent(_ path: String) -> [String: Any] {
+        [
+            "Label": label,
+            "ProgramArguments": [path],
+            "RunAtLoad": true,
+            "KeepAlive": ["SuccessfulExit": false],
+            "ThrottleInterval": 60,
+            "ProcessType": "Interactive",
+            "LimitLoadToSessionType": "Aqua",
+        ]
+    }
+
+    /** A login item written by an earlier version (without the restart) is written again, when it starts this executable. It takes
+     * effect at the next login */
+    static func update() {
+        let url = plistURL
+        guard let data = try? Data(contentsOf: url),
+              let plist = (try? PropertyListSerialization.propertyList(from: data, options: [], format: nil)) as? [String: Any],
+              plist["KeepAlive"] == nil,
+              let path = program,
+              (plist["ProgramArguments"] as? [String])?.first == path
+        else { return }
+        try? set(true)
+    }
+
     /** System Settings at Login Items, where the user allows it (on the main thread) */
     static func openSettings() {
         SMAppService.openSystemSettingsLoginItems()
@@ -72,15 +99,13 @@ enum LoginItem {
             return
         }
         guard let path = program else { throw SaveError("Couldn't find this app's path") }
-        let plist: [String: Any] = [
-            "Label": label,
-            "ProgramArguments": [path],
-            "RunAtLoad": true,
-            "ProcessType": "Interactive",
-            "LimitLoadToSessionType": "Aqua",
-        ]
+        let data: Data
         do {
-            let data = try PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0)
+            data = try PropertyListSerialization.data(fromPropertyList: agent(path), format: .xml, options: 0)
+        } catch {
+            throw SaveError("Couldn't write the login item")
+        }
+        do {
             try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
             try data.write(to: url, options: .atomic)
         } catch {

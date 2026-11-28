@@ -521,7 +521,9 @@ token. It never touches Claude, Codex or Gemini. It is a preview: there is no in
      clear, dark or light.
    - **Behavior:** whether the notch opens when the pointer touches it or when it is clicked, how soon it folds after the pointer
      leaves, hiding it while a full-screen app (a game, a video) is in front, and starting Headroom when you sign in to Windows (a
-     `Headroom` value in your user's Run key, removed when you turn it off).
+     `Headroom` value in your user's Run key, removed when you turn it off). Started that way, it is kept running: if it ends
+     abnormally (a crash, or ended from Task Manager) it starts again after a short wait, at most 5 times in 30 minutes. **Quit
+     Headroom** ends it for the session.
 6. **Provider icons** (optional): put `claude.png`, `codex.png` and `gemini.png` (as in section 3) in `%APPDATA%\Headroom\icons\`,
    and a second set with the same names in `%APPDATA%\Headroom\icons\alt\`. They take the place of built-in ones, and are read
    again when you open **Settings**. As on the widget, **Settings › Appearance › Icons** switches each provider to its second icon.
@@ -569,7 +571,8 @@ with a read token and never touches Claude, Codex or Gemini. It is a preview, an
    **Quit Headroom**. On a trackpad, the card's rows scroll when they don't fit.
 5. **Settings** has the same four tabs as on Windows (section 6, step 5). On macOS 26 and later, **Liquid Glass** is the system's
    own glass (on earlier versions, its translucent material), so nothing is read from the screen; **Start Headroom when you log in**
-   adds a `com.headroom.desktop.plist` to `~/Library/LaunchAgents/`, used from the next login.
+   adds a `com.headroom.desktop.plist` to `~/Library/LaunchAgents/`, used from the next login. Started that way, it is kept
+   running: if it ends abnormally, macOS starts it again (at most once a minute). **Quit Headroom** ends it for the session.
 6. **Provider icons** (optional): put `claude.png`, `codex.png` and `gemini.png` (as in section 3) in
    `~/Library/Application Support/Headroom/icons/`, and a second set with the same names in its `alt/` folder. They are read again
    when you open **Settings**, where **Appearance › Icons** switches each provider to its second icon. Without them the rings show
