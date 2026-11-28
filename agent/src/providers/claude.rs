@@ -1858,6 +1858,8 @@ fn run_child_with(
 
 /// Environment variables that a Claude Code host (desktop app, another Claude session) passes to child processes.
 /// Inheriting them would make the CLI use the host's connection instead of its own sign-in, so they are removed.
+/// A setting the user chose to cut Claude Code's traffic is kept, even under a host's prefix: Headroom never turns back on what
+/// the user turned off (the per-model weekly line of /usage may then be missing)
 pub fn is_host_injected_env(name: &str) -> bool {
     const PREFIXES: [&str; 4] = [
         "CLAUDE_CODE_",
@@ -1866,7 +1868,9 @@ pub fn is_host_injected_env(name: &str) -> bool {
         "CLAUDECODE",
     ];
     const EXACT: [&str; 3] = ["CLAUDE_PID", "CLAUDE_EFFORT", "ANTHROPIC_BASE_URL"];
-    PREFIXES.iter().any(|p| name.starts_with(p)) || EXACT.contains(&name)
+    const USER_CHOICES: [&str; 1] = ["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"];
+    !USER_CHOICES.contains(&name)
+        && (PREFIXES.iter().any(|p| name.starts_with(p)) || EXACT.contains(&name))
 }
 
 fn strip_host_env(cmd: &mut Command) {
@@ -3670,9 +3674,14 @@ Current session limit for org: 100% used
             "ANTHROPIC_API_KEY",
             "PATH",
             "HEADROOM_CLAUDE_BIN",
+            // the user's choices to cut traffic: kept (one under the host's prefix too)
+            "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
+            "DISABLE_TELEMETRY",
         ] {
             assert!(!is_host_injected_env(name), "{name}");
         }
+        // the rest of the host's prefix is still removed
+        assert!(is_host_injected_env("CLAUDE_CODE_SSE_PORT"));
     }
 
     #[test]

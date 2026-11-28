@@ -141,6 +141,10 @@ If `which -a claude` lists more than one `claude`, the agent uses the first one 
 
 **Accounts where the agent does not run `/usage`:** API-key logins, organization (Team / Enterprise) plans, and machines with managed settings. In these cases the agent cannot confirm that `/usage` is free, so it skips it. If you set up the statusLine (2.6), it still uses the values Claude Code reports there.
 
+**One Claude account per PC:** the agent and the statusLine read a single Claude Code profile. If you keep several sign-ins in separate config folders (`CLAUDE_CONFIG_DIR`), use the same one for the agent and the statusLine; `/usage` may not tell the profiles apart.
+
+**Traffic settings are kept:** if you turned off Claude Code's non-essential traffic or telemetry (`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`, `DISABLE_TELEMETRY`) in the environment the agent starts with, the agent keeps that choice for `/usage`. With it, `/usage` may leave out the per-model weekly limits (such as a model's own weekly line); the 5-hour and weekly limits are not affected.
+
 ### 2.2 Codex CLI (for Codex values)
 
 Install the **standalone** CLI.
