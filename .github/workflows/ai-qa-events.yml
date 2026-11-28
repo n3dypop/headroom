@@ -34,7 +34,7 @@ jobs:
     permissions:
       contents: read
       pull-requests: write
-    uses: n3dypop/repo-autopilot/.github/workflows/layer1-pr-review.yml@7a49c17f16561abcc8c661648c41adabd2039331 # v0.1.4
+    uses: n3dypop/repo-autopilot/.github/workflows/layer1-pr-review.yml@78160a8d1fb85ba7041b03a6c6f0ca8d574ad797 # v0.1.5
     with:
       repo_tier: 'A'
       runtime: 'node'
@@ -57,7 +57,7 @@ jobs:
       contents: write
       issues: write
       pull-requests: write
-    uses: n3dypop/repo-autopilot/.github/workflows/layer4-label-fix.yml@7a49c17f16561abcc8c661648c41adabd2039331 # v0.1.4
+    uses: n3dypop/repo-autopilot/.github/workflows/layer4-label-fix.yml@78160a8d1fb85ba7041b03a6c6f0ca8d574ad797 # v0.1.5
     with:
       repo_tier: 'A'
       runtime: 'node'
@@ -80,7 +80,7 @@ jobs:
       contents: write
       issues: write
       pull-requests: write
-    uses: n3dypop/repo-autopilot/.github/workflows/layer5-prototype.yml@7a49c17f16561abcc8c661648c41adabd2039331 # v0.1.4
+    uses: n3dypop/repo-autopilot/.github/workflows/layer5-prototype.yml@78160a8d1fb85ba7041b03a6c6f0ca8d574ad797 # v0.1.5
     with:
       repo_tier: 'A'
       runtime: 'node'
