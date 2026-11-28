@@ -22,8 +22,12 @@ final class AppState {
     let keep = KeychainKeep()
     /** Told (on the main thread) whenever the state may have changed */
     var onChange: (() -> Void)?
-    /** Whether the keychain has said whether the settings' token is there (asked on the reading thread) */
+    /** Whether the keychain has said whether the settings' token is there (read and written under the lock only) */
     private var tokenKnown = false
+
+    private func isTokenKnown() -> Bool {
+        with { _ in tokenKnown }
+    }
 
     init() {
         // The settings file only (the keychain is asked on the reading thread)
@@ -60,8 +64,11 @@ final class AppState {
             do {
                 let (settings, has) = with { ($0.settings, $0.hasToken) }
                 let saved = try State.persist(settings: settings, hasToken: has, url: url, token: token, demo: demo, keep: keep)
-                with { $0.apply(saved) }
-                tokenKnown = true
+                with { s in
+                    s.apply(saved)
+                    // The save asked the keychain for these settings
+                    tokenKnown = true
+                }
                 outcome = nil
             } catch let e as SaveError {
                 outcome = e
@@ -103,15 +110,20 @@ final class AppState {
 
     /** Asks the keychain whether the settings' token is there (until it has said so) */
     private func checkToken() {
-        if tokenKnown { return }
+        if isTokenKnown() { return }
         let settings = with { $0.settings }
         let found = keep.lookUp(settings)
         // Taken only for the settings it was asked about (a save meanwhile has said for itself)
         let current = with { s -> Bool in
-            guard s.settings == settings else { return false }
+            // A save meanwhile asked for itself: this answer is about settings no longer in use
+            guard s.settings == settings, !tokenKnown else { return false }
             switch found {
-            case .token: s.hasToken = true
-            case .none: s.hasToken = false
+            case .token:
+                s.hasToken = true
+                tokenKnown = true
+            case .none:
+                s.hasToken = false
+                tokenKnown = true
             case .unknown: break
             }
             return true
@@ -119,7 +131,7 @@ final class AppState {
         if !current { return }
         switch found {
         case .token, .none:
-            tokenKnown = true
+            break
         case .unknown:
             // Asked again on the next turn (a nudge, waking from sleep, or an hour)
             with { $0.error = "Couldn't read the keychain" }
@@ -133,7 +145,7 @@ final class AppState {
                 checkToken()
                 // The settings and the generation together; the token is read for exactly those settings, outside the lock
                 let job: (UInt64, Settings)? = with { s in
-                    tokenKnown && s.mode == .live && s.schedule.mayRead(monoMs()) ? (s.generation, s.settings) : nil
+                    self.tokenKnown && s.mode == .live && s.schedule.mayRead(monoMs()) ? (s.generation, s.settings) : nil
                 }
                 if let (generation, settings) = job {
                     let result: Result<JSON, ReadError> = keep.read(settings).map { readView(base: settings.url, token: $0, tz: TimeZone.current.identifier) }

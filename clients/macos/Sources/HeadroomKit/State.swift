@@ -181,8 +181,8 @@ public struct State {
         }
         // The old item is no longer named
         if (old.url, old.tokenSlot) != (next.url, slot) { try? keep.delete(origin: old.url, slot: old.tokenSlot) }
-        let has = sameServer && !newEntry && slot == old.tokenSlot ? (hasToken || keep.read(next) != nil) : keep.read(next) != nil
-        return Saved(old: old, next: next, newEntry: newEntry, hasToken: has)
+        // Asked of the keychain itself (never a guess made before it answered)
+        return Saved(old: old, next: next, newEntry: newEntry, hasToken: keep.read(next) != nil)
     }
 
     /** Writes a removal: the settings stop naming the token first, then its item goes */
