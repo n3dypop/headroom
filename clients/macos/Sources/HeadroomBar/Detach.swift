@@ -36,20 +36,31 @@ func detachFromTerminal() {
         guard posix_spawn_file_actions_addopen(&files, fd, "/dev/null", flags, 0) == 0 else { return }
     }
 
-    let argv: [UnsafeMutablePointer<CChar>?] = ([path] + args.dropFirst()).map { strdup($0) } + [nil]
     var copy = env
     copy[DETACHED] = "1"
-    let envp: [UnsafeMutablePointer<CChar>?] = copy.map { strdup("\($0.key)=\($0.value)") } + [nil]
+    let argStrings = [path] + args.dropFirst()
+    let envStrings = copy.map { "\($0.key)=\($0.value)" }
+    let argv: [UnsafeMutablePointer<CChar>?] = argStrings.map { strdup($0) } + [nil]
+    let envp: [UnsafeMutablePointer<CChar>?] = envStrings.map { strdup($0) } + [nil]
     defer {
         argv.forEach { free($0) }
         envp.forEach { free($0) }
     }
+    // A copy that couldn't be made (no memory) would cut the lists short: this one goes on instead
+    if argv.dropLast().contains(where: { $0 == nil }) || envp.dropLast().contains(where: { $0 == nil }) { return }
     var pid: pid_t = 0
     let started = posix_spawn(&pid, path, &files, &attr, argv, envp)
     if started == 0 {
-        print("Headroom is running in the background (process \(pid)). Quit it from its menu bar item.")
+        // Only that it was started: it may still end at once (Headroom already running)
+        say("Started Headroom in the background (process \(pid)). If it was running already, that one goes on. Quit it from its menu bar item.\n", to: STDOUT_FILENO)
         exit(0)
     }
     // Not started: this one goes on in the terminal (the hang-up is ignored)
-    FileHandle.standardError.write("Couldn't start in the background; running here (closing the terminal won't end it)\n".data(using: .utf8)!)
+    say("Couldn't start in the background; running here (closing the terminal won't end it)\n", to: STDERR_FILENO)
+}
+
+/** Writes a line to a standard stream, ignoring any failure (a closed stream must never stop the app) */
+private func say(_ text: String, to fd: Int32) {
+    let bytes = Array(text.utf8)
+    _ = bytes.withUnsafeBufferPointer { write(fd, $0.baseAddress, $0.count) }
 }
