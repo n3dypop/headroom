@@ -52,8 +52,9 @@ const ID_TINT: i32 = 56;
 const ID_MOTION: i32 = 57;
 const ID_ICONS_GROUP: i32 = 58;
 const ID_ICONS_HINT: i32 = 59;
-/** The second-icon checkboxes, one per provider in the providers' order */
+/** The second-icon checkboxes: their providers and names, in the order they are shown */
 const ID_ALT: [i32; 3] = [60, 61, 62];
+const ALT_PROVIDERS: [&str; 3] = ["claude", "codex", "gemini"];
 const ALT_NAMES: [&str; 3] = ["Claude", "Codex", "Gemini"];
 // Behavior
 const ID_OPEN_LABEL: i32 = 70;
@@ -108,6 +109,8 @@ thread_local! {
     static PAGE: Cell<usize> = const { Cell::new(0) };
     /** The screens' device names, in the order of the screen list ("" for automatic) */
     static SCREENS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    /** Which of ALT_PROVIDERS has a second icon now (the others' choices are kept as they are, not shown) */
+    static ALT_HAS: Cell<[bool; 3]> = const { Cell::new([false; 3]) };
     /** Filling the controls: their changes aren't taken as the user's */
     static LOADING: Cell<bool> = const { Cell::new(false) };
 }
@@ -271,13 +274,16 @@ fn load_prefs(dlg: HWND) {
 
 /** The second-icon checkboxes: one per provider that has a second icon (read again from the icon folder each time) */
 fn load_icons(dlg: HWND, p: &Prefs) {
-    let mut any = false;
-    for (n, provider) in crate::model::PROVIDER_ORDER.into_iter().enumerate() {
-        let has = crate::art::has_alt(provider);
-        any |= has;
-        check(dlg, ID_ALT[n], has && p.alt_icons.contains(&provider));
+    let has = ALT_PROVIDERS.map(crate::art::has_alt);
+    ALT_HAS.with(|h| h.set(has));
+    let any = has.contains(&true);
+    for (n, provider) in ALT_PROVIDERS.into_iter().enumerate() {
+        check(dlg, ID_ALT[n], has[n] && p.alt_icons.contains(&provider));
         unsafe {
-            let _ = EnableWindow(item(dlg, ID_ALT[n]), has);
+            let _ = EnableWindow(item(dlg, ID_ALT[n]), has[n]);
+            // None to choose: the boxes aren't shown, only where to put the icons
+            let shown = any && PAGE.with(Cell::get) == 2;
+            let _ = ShowWindow(item(dlg, ID_ALT[n]), if shown { SW_SHOW } else { SW_HIDE });
         }
     }
     let folder =
@@ -323,12 +329,17 @@ fn prefs_shown(dlg: HWND) -> Prefs {
         fold_delay: selected(dlg, ID_FOLD, &DELAYS, d.fold_delay),
         motion: checked(dlg, ID_MOTION),
         hide_fullscreen: checked(dlg, ID_FULL),
-        alt_icons: crate::model::PROVIDER_ORDER
-            .into_iter()
-            .enumerate()
-            .filter(|&(n, _)| checked(dlg, ID_ALT[n]))
-            .map(|(_, p)| p)
-            .collect(),
+        // A provider whose second icon isn't there now keeps its choice (the icon may come back)
+        alt_icons: {
+            let has = ALT_HAS.with(Cell::get);
+            crate::model::PROVIDER_ORDER
+                .into_iter()
+                .filter(|p| match ALT_PROVIDERS.iter().position(|a| a == p) {
+                    Some(n) if has[n] => checked(dlg, ID_ALT[n]),
+                    _ => d.alt_icons.contains(p),
+                })
+                .collect()
+        },
     }
 }
 
@@ -406,10 +417,13 @@ fn command(dlg: HWND, id: i32, code: u32) {
 /** Shows one tab's controls (and hides the others') */
 fn show_page(dlg: HWND, page: usize) {
     PAGE.with(|p| p.set(page));
+    let any_alt = ALT_HAS.with(Cell::get).contains(&true);
     for c in controls() {
         if let Some(on) = c.page {
+            // The second-icon boxes only when there is a second icon to choose
+            let shown = on == page && (any_alt || !ID_ALT.contains(&c.id));
             unsafe {
-                let _ = ShowWindow(item(dlg, c.id), if on == page { SW_SHOW } else { SW_HIDE });
+                let _ = ShowWindow(item(dlg, c.id), if shown { SW_SHOW } else { SW_HIDE });
             }
         }
     }
@@ -586,6 +600,11 @@ fn pane_brush(tabs: HWND) -> HBRUSH {
 /** Opens the settings (or brings them to the front) */
 pub fn open() {
     if let Some(h) = hwnd() {
+        // The icon folder read again, as when it opens
+        LOADING.with(|l| l.set(true));
+        load_icons(h, &crate::prefs());
+        LOADING.with(|l| l.set(false));
+        crate::notch::post_place();
         unsafe {
             let _ = ShowWindow(h, SW_RESTORE);
             let _ = SetForegroundWindow(h);

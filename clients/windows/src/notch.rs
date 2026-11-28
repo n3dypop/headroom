@@ -458,15 +458,20 @@ impl Notch {
         self.icons.clear();
         for p in model::PROVIDER_ORDER {
             let alt = self.prefs.alt_icons.contains(&p);
-            let png = alt
-                .then(|| crate::art::png(p, true))
-                .flatten()
-                .or_else(|| crate::art::png(p, false));
-            if let Some(png) = png {
-                if let Ok(bitmap) = self.gfx.png(&png) {
-                    let (w, h) = icon_box(png_aspect(&png), ICON_BOX);
-                    self.icons.push((p, Icon { bitmap, w, h }));
-                }
+            // The second when chosen, else (or when it can't be drawn) the first
+            let tries = if alt {
+                [true, false].as_slice()
+            } else {
+                [false].as_slice()
+            };
+            let drawn = tries.iter().find_map(|&second| {
+                let png = crate::art::png(p, second)?;
+                let bitmap = self.gfx.png(&png).ok()?;
+                let (w, h) = icon_box(png_aspect(&png), ICON_BOX);
+                Some(Icon { bitmap, w, h })
+            });
+            if let Some(icon) = drawn {
+                self.icons.push((p, icon));
             }
         }
     }

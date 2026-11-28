@@ -18,8 +18,11 @@ fn main() {
         for p in PROVIDERS {
             let file = dir.join(format!("{p}.png"));
             println!("cargo:rerun-if-changed={}", file.display());
-            let data = fs::read(&file)
-                .ok()
+            // The size checked before reading (a large file isn't read whole)
+            let small = fs::metadata(&file).is_ok_and(|m| m.len() <= MAX_ICON_BYTES);
+            let data = small
+                .then(|| fs::read(&file).ok())
+                .flatten()
                 .filter(|d| d.len() as u64 <= MAX_ICON_BYTES && d.starts_with(b"\x89PNG"));
             let name = format!("{}{suffix}", p.to_uppercase());
             match data {

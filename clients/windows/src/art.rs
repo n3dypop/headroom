@@ -12,9 +12,15 @@ pub fn folder() -> Option<PathBuf> {
     crate::server::settings_path().and_then(|p| p.parent().map(|d| d.join("icons")))
 }
 
-/** Bytes that can be an icon: a PNG of 64 KB at most */
+/** Bytes that can be an icon: a PNG of 64 KB at most, whose header gives a size */
 fn usable(png: &[u8]) -> bool {
-    png.len() <= MAX_ICON_BYTES && png.starts_with(b"\x89PNG")
+    let size = |o: usize| u32::from_be_bytes([png[o], png[o + 1], png[o + 2], png[o + 3]]);
+    png.len() <= MAX_ICON_BYTES
+        && png.len() >= 24
+        && png.starts_with(b"\x89PNG\r\n\x1a\n")
+        && &png[12..16] == b"IHDR"
+        && size(16) > 0
+        && size(20) > 0
 }
 
 fn built(provider: &str, alt: bool) -> Option<&'static [u8]> {
@@ -57,10 +63,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_small_pngs_are_icons() {
-        assert!(usable(b"\x89PNG\r\n\x1a\n"));
+    fn only_small_pngs_with_a_size_are_icons() {
+        let mut png = b"\x89PNG\r\n\x1a\n\0\0\0\x0dIHDR".to_vec();
+        png.extend_from_slice(&[0, 0, 0, 16, 0, 0, 0, 16]);
+        assert!(usable(&png));
+        assert!(!usable(b"\x89PNG\r\n\x1a\n"), "no header");
+        let mut empty = png.clone();
+        empty[19] = 0;
+        assert!(!usable(&empty), "no width");
         assert!(!usable(b"GIF89a"));
-        let mut big = b"\x89PNG".to_vec();
+        let mut big = png.clone();
         big.resize(MAX_ICON_BYTES + 1, 0);
         assert!(!usable(&big));
     }
