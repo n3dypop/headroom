@@ -492,8 +492,8 @@ impl Notch {
     fn take_prefs(&mut self) {
         self.prefs = crate::prefs();
         self.system_light = theme::apps_light();
-        // A copy of the screen includes the notch (layered windows too, as the screen is composed): while the glass reads what
-        // is behind, the notch is left out of copies, its own and screenshots alike. Where Windows can't (before Windows 10 2004,
+        // A copy of the screen includes the notch (layered windows too, as the screen is composed): while the glass is set to read
+        // what is behind, the notch is left out of copies, its own and screenshots alike. Where Windows can't (before Windows 10 2004,
         // where the same call blacks the window out of copies instead), the glass doesn't read
         let exclude = self.prefs.theme == Theme::Glass
             && self.prefs.glass_backdrop

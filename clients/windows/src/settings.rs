@@ -564,7 +564,7 @@ struct Control {
 const X: i32 = 32;
 const CW: i32 = WIDTH - 64;
 const LEAD: &str = "Shows the usage limits your Headroom server has. It reads the server every 5 minutes at most, and never touches Claude, Codex or Gemini itself.";
-const BACKDROP_HINT: &str = "While the notch is open it reads the part of the screen right behind it, in memory only: nothing is saved or sent. Screenshots and recordings leave the notch out meanwhile. Off, it only looks like glass.";
+const BACKDROP_HINT: &str = "While the notch is open it reads the part of the screen right behind it, in memory only: nothing is saved or sent. While this is on, screenshots and recordings leave the notch out. Off, it only looks like glass.";
 
 fn controls() -> Vec<Control> {
     let tab = WS_TABSTOP.0;

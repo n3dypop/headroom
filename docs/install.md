@@ -509,7 +509,8 @@ token. It never touches Claude, Codex or Gemini. It is a preview: there is no in
    - **Placement:** the screen (automatic is the one furthest right), the position along the edge, and the size.
    - **Appearance:** the theme (as Windows' apps are, dark, light, or **Liquid Glass**) and the animations. Liquid Glass blurs and
      bends what is behind the notch: while the notch is open it reads the part of the screen right behind it, in memory only, and
-     never saves or sends it. Meanwhile screenshots and screen recordings leave the notch out (so the glass never reads itself). Turn off **Blur and bend what is behind it** to have the look of glass without that. Its tint can be
+     never saves or sends it. While that is on, screenshots and screen recordings leave the notch out (so the glass never reads
+     itself). Turn off **Blur and bend what is behind it** to have the look of glass without that. Its tint can be
      clear, dark or light.
    - **Behavior:** whether the notch opens when the pointer touches it or when it is clicked, how soon it folds after the pointer
      leaves, hiding it while a full-screen app (a game, a video) is in front, and starting Headroom when you sign in to Windows (a
