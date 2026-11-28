@@ -2800,6 +2800,13 @@ test("The details page escapes what it shows and lists every limit with its pace
   assert.equal(lib.scopeName("codex_other"), "Other");
   assert.equal(lib.scopeName("Jane Doe <jane@example.com>"), "Other");
   assert.equal(lib.scopeName("Jane Doe"), "Other", "one plain word only");
+  // Names every object inherits are plain words, never the inherited function's source
+  for (const name of ["constructor", "toString", "valueOf", "hasOwnProperty"]) {
+    assert.equal(lib.scopeName(name), name);
+    assert.equal(lib.widgetScopeName(name), name);
+    assert.equal(lib.rowLabel({ id: "seven_day_x", scope: name }), `${name} wk`);
+  }
+  assert.equal(lib.scopeName("__proto__"), "Other", "not a plain word (it starts with _)");
   assert.equal(lib.windowName({ id: "odd", label: "Team plan" }, "odd"), "Limit", "an unknown window's label only if it is one plain word");
   assert.equal(lib.windowName({ id: "odd", label: "Burst" }, "odd"), "Burst");
   assert.equal(lib.fullLimitName({ id: "seven_day_x", scope: "<b>x</b>" }), "Other weekly limit");

@@ -9,7 +9,7 @@ Headroom has three parts. Set them up in this order:
 Each device gets its own token:
 
 - Each PC gets a **write** token, which lets it send values under its own name only.
-- Each reader gets a **read** token. Readers are the iPhone, and in the future other display clients.
+- Each reader gets a **read** token. Readers are the iPhone and the Windows desktop client (preview, section 6).
 
 Tokens are sent only in the `Authorization` header, never in URLs.
 
@@ -20,6 +20,7 @@ Tokens are sent only in the `Authorization` header, never in URLs.
 - [3. iPhone widget (Scriptable)](#3-iphone-widget-scriptable)
 - [4. Updating and removing](#4-updating-and-removing)
 - [5. Troubleshooting](#5-troubleshooting)
+- [6. Windows desktop client (preview)](#6-windows-desktop-client-preview)
 
 ---
 
@@ -471,3 +472,37 @@ If the widget can't schedule notifications on your iPhone, use a Shortcuts autom
 - **Widget shows `Can't reach the server`:** check the URL, or `ALLOWED_HOST` on the server.
 - **No notifications:** check that notifications are allowed for Scriptable, that exactly one widget has `notify`, and the last check time under **Notifications** in the app menu. After the server's database is recreated, choose **Settings** > **Saved data** > **Reset saved data**.
 - **Values look old:** `headroom status` shows when the agent last sent. The widget marks old values (for example `31m ago`) and limits whose reset time passed since the last value (`↻`).
+
+## 6. Windows desktop client (preview)
+
+A small notch on the right edge of the screen and a tray icon show the same limits as the widget, read from your server with a read
+token. It never touches Claude, Codex or Gemini. It is a preview: there is no installer yet, and you build it yourself.
+
+1. **Build it** (Windows 10 or 11, x64, with [Rust](https://rustup.rs)):
+
+   ```powershell
+   cargo build --release --manifest-path clients/windows/Cargo.toml
+   ```
+
+   If `packages/scriptable/icons/` has the provider icons (section 3), they are built in; otherwise the rings show letters.
+2. **Create a read token for the PC** (from the repository root), and add its line to `TOKENS` as in section 1, step 6 (store the
+   whole array again):
+
+   ```powershell
+   node packages/worker/scripts/new-token.ts read win-desktop-view
+   ```
+
+   Use a name that doesn't identify you, and keep it apart from the PC's write token: the two are separate credentials.
+3. **Run** `clients/windows/target/release/headroom-desktop.exe`. The first time, **Settings** opens: enter the Worker URL (the origin
+   only) and the read token, and choose **Save**. The token is kept in Windows Credential Manager, for that server only; changing the
+   server asks for its token. To look around first, choose **Show sample data instead of the server**.
+4. **Use it.**
+   - Move the pointer to the small nub at the right edge: the notch opens with a ring per provider (what is left of its 5-hour limit,
+     its weekly limit as the thin outer ring). Over a ring, a card shows every limit, as the widget's large size does.
+   - Click a ring to read the server now. It reads at most once every 5 minutes, and waits longer after failures.
+   - The tray icon's menu lists each provider and has **Refresh now**, **Settings…** and **Quit Headroom**.
+   - On a screen less than 300 px high (after scaling), the card points to the tray menu instead of listing the limits that don't fit.
+5. **Start it at sign-in** (optional): press Win+R, open `shell:startup`, and put a shortcut to `headroom-desktop.exe` there.
+6. **Remove it:** choose **Quit Headroom**, then in **Settings** choose **Remove token** (or remove the `headroom-desktop` entries in
+   Credential Manager), and delete `%APPDATA%\Headroom\desktop.json`. Remove its line from `TOKENS` on the server too.
+

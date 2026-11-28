@@ -11,7 +11,7 @@
 // From here down to "Widget rendering below" everything is a pure function that doesn't use the Scriptable API (tested with Node).
 // Startup is at the end (main runs after all constants are defined)
 
-const HEADROOM_VERSION = 124;
+const HEADROOM_VERSION = 125;
 /** View version this script can read (VIEW_VERSION in packages/core) */
 const VIEW_VERSION = 1;
 /** Settings are stored as JSON in a single Keychain item (so the server and credentials are always read as a pair) */
@@ -370,6 +370,13 @@ const ERROR_NAMES = {
   login_required: "Sign in required", not_installed: "Not installed", fetch_failed: "Couldn't fetch",
   safety_stop: "Paused for safety", account_changed: "Account changed, paused", access_denied: "Access denied",
 };
+/**
+ * A table's own entry for a key, never one every object inherits (a scope or a window id from the server can be "constructor" or
+ * "toString"). undefined when the table has none
+ */
+function own(table, key) {
+  return typeof key === "string" && Object.prototype.hasOwnProperty.call(table, key) ? table[key] : undefined;
+}
 /** Short display names for some scopes (names from KNOWN_SCOPES in packages/core) */
 const SCOPE_NAMES = { "Codex extra": "Extra", codex_other: "Other", "Claude and GPT": "Claude/GPT" };
 /**
@@ -378,12 +385,12 @@ const SCOPE_NAMES = { "Codex extra": "Extra", codex_other: "Other", "Claude and 
  */
 function scopeName(scope) {
   if (!scope) return null;
-  return SCOPE_NAMES[scope] ?? (/^[A-Za-z0-9][A-Za-z0-9._-]{0,23}$/.test(scope) ? scope : "Other");
+  return own(SCOPE_NAMES, scope) ?? (/^[A-Za-z0-9][A-Za-z0-9._-]{0,23}$/.test(scope) ? scope : "Other");
 }
 /** Shorter names on the widgets, where a column has room for about "Argon wk" (the details keep SCOPE_NAMES: Claude/GPT weekly) */
 const WIDGET_SCOPE_NAMES = { "Claude and GPT": "C+G" };
 function widgetScopeName(scope) {
-  return scope ? WIDGET_SCOPE_NAMES[scope] ?? scopeName(scope) : null;
+  return scope ? own(WIDGET_SCOPE_NAMES, scope) ?? scopeName(scope) : null;
 }
 const PROVIDER_STATUSES = ["ok", "stale", "error", "unavailable"];
 const str = (v, max = 80) => (typeof v === "string" ? v.slice(0, max) : null);
@@ -1052,7 +1059,7 @@ function inlineText(items, cached, prefix = "", now = new Date()) {
       if (x.missing) return `${who} ${step >= 2 ? (x.label === NOT_SET_UP ? "N/A" : (x.short ?? x.label).replace(NOT_AVAILABLE, "N/A")) : x.label}`;
       const reset = x.window.value_status === "reset_estimated";
       const value = reset ? `${RESET_MARK}${compactPercent(x.window)}` : compactPercent(x.window);
-      const name = step >= 3 ? "" : LIMIT_NAMES[x.window.id] ?? shortName(x.window);
+      const name = step >= 3 ? "" : own(LIMIT_NAMES, x.window.id) ?? shortName(x.window);
       // A value reset since its fetch already says so (↻): no time after it
       const time = step === 0 && items.length === 1 && !reset ? timeOf(x.window) : "";
       return [[who, name, value].filter(Boolean).join(" "), time].filter(Boolean).join(" · ");
@@ -4695,7 +4702,7 @@ function drawLockPair(widget, picks, result, now, cached) {
     const fits = (s) => textWidth(s, 9, true) * 0.8 <= 76;
     const name = w ? rowLabel(w) : "";
     const candidates = w
-      ? [`${name}${mark ? ` ${mark}` : ""}${demo}`, `${LIMIT_NAMES[w.id] ?? name}${mark ? ` ${mark}` : ""}${demo}`, `${LIMIT_NAMES[w.id] ?? name}${demo}`]
+      ? [`${name}${mark ? ` ${mark}` : ""}${demo}`, `${own(LIMIT_NAMES, w.id) ?? name}${mark ? ` ${mark}` : ""}${demo}`, `${own(LIMIT_NAMES, w.id) ?? name}${demo}`]
       : [`${pick.short}${demo}`];
     const label = col.addText(candidates.find(fits) ?? candidates[candidates.length - 1]);
     label.font = Font.semiboldSystemFont(9);
@@ -5787,7 +5794,7 @@ function drawWidget(result, family, parameter, now) {
     const icon = iconImage(provider);
     const ring = top ? ringOf(top.window) : null;
     if (tap && pick) widget.url = tapTo(provider);
-    const img = widget.addImage(ringImage(icon, ring, BRAND_COLORS[provider], LOCK_RINGS.circular, provider, top ? LIMIT_NAMES[top.window.id] ?? shortName(top.window) : "–"));
+    const img = widget.addImage(ringImage(icon, ring, BRAND_COLORS[provider], LOCK_RINGS.circular, provider, top ? own(LIMIT_NAMES, top.window.id) ?? shortName(top.window) : "–"));
     img.imageSize = new Size(LOCK_RINGS.circular.size, LOCK_RINGS.circular.size);
     img.centerAlignImage?.();
     // Limit name and marks (⚠ for previous values, reset estimate, staleness). Demo for the demo
