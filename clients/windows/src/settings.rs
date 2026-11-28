@@ -441,6 +441,17 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
                 }
                 LRESULT(0)
             }
+            // The window in the tabs' page colour, so what is drawn over it (group boxes, labels) matches the page
+            WM_ERASEBKGND => {
+                let pane = PANE.with(Cell::get);
+                if pane == 0 {
+                    return DefWindowProcW(hwnd, msg, wp, lp);
+                }
+                let mut r = RECT::default();
+                let _ = GetClientRect(hwnd, &mut r);
+                FillRect(HDC(wp.0 as *mut _), &r, HBRUSH(pane as *mut _));
+                LRESULT(1)
+            }
             // The position slider: shown as it moves, saved when it is let go
             WM_HSCROLL => {
                 if HWND(lp.0 as *mut _) == item(hwnd, ID_POS) {
@@ -473,9 +484,9 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
                 ]
                 .contains(&GetDlgCtrlID(control));
                 SetTextColor(dc, COLORREF(if hint { 0x0070_6e6e } else { 0x0000_0000 }));
-                // On a tab's page its colour; the status line is on the window's
+                // The tabs' page colour, which the whole window has (group boxes draw the window's background inside them)
                 let pane = PANE.with(Cell::get);
-                if GetDlgCtrlID(control) != ID_STATUS && pane != 0 {
+                if pane != 0 {
                     LRESULT(pane)
                 } else {
                     LRESULT(GetSysColorBrush(COLOR_WINDOW).0 as isize)
