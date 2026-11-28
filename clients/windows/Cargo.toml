@@ -1,0 +1,51 @@
+[package]
+name = "headroom-desktop"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Headroom desktop client for Windows: a notch on the screen edge and a tray icon showing usage limits read from your Headroom server"
+license = "MIT"
+publish = false
+
+# A crate of its own, apart from the agent (which keeps its strict size and memory limits)
+[workspace]
+
+[dependencies]
+# The view and the settings file
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["float_roundtrip"] }
+# HTTPS to the server (GET only). Uses the OS TLS and certificate store, as the agent does
+ureq = { version = "3", default-features = false, features = ["native-tls"] }
+# The read token, kept in the OS credential store (Windows Credential Manager), never in a file
+keyring = { version = "3", features = ["windows-native"] }
+# Times in the view, the clock in the PC's time zone, and the zone's IANA name for ?tz= (as the agent does)
+jiff = "0.2"
+windows-numerics = "0.3"
+
+# The notch is a layered window drawn with Direct2D and DirectWrite (icons through WIC); the tray and the settings are plain Win32
+[dependencies.windows]
+version = "0.62"
+features = [
+  "Win32_Foundation",
+  "Win32_Graphics_Direct2D",
+  "Win32_Graphics_Direct2D_Common",
+  "Win32_Graphics_DirectWrite",
+  "Win32_Graphics_Dxgi_Common",
+  "Win32_Graphics_Gdi",
+  "Win32_Graphics_Imaging",
+  "Win32_Security",
+  "Win32_System_Com",
+  "Win32_System_LibraryLoader",
+  "Win32_System_Threading",
+  "Win32_UI_Controls",
+  "Win32_UI_HiDpi",
+  "Win32_UI_Input_KeyboardAndMouse",
+  "Win32_UI_Shell",
+  "Win32_UI_WindowsAndMessaging",
+]
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+opt-level = "s"

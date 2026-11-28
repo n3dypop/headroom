@@ -83,6 +83,7 @@ You need at least one of the three CLIs.
 | [`packages/worker/`](packages/worker/) | The server: Cloudflare Worker and D1 schema | TypeScript |
 | [`packages/core/`](packages/core/) | Shared logic: types, merging, history, the view and events | TypeScript |
 | [`packages/scriptable/`](packages/scriptable/) | The iPhone widget | JavaScript (Scriptable) |
+| [`clients/windows/`](clients/windows/) | Windows desktop client (in development): a notch on the screen edge and a tray icon, reading the server like the widget | Rust (Win32, Direct2D) |
 | [`fixtures/`](fixtures/) | Recorded CLI responses (masked) and shared test data | JSON |
 | [`scripts/`](scripts/) | Release packaging | PowerShell / shell |
 | [`docs/install.md`](docs/install.md) | Installation, updating and troubleshooting | |

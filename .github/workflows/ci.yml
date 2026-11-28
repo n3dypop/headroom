@@ -32,6 +32,30 @@ jobs:
       - name: Test
         run: cargo test --locked --manifest-path agent/Cargo.toml
 
+  windows-client:
+    name: Windows client
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+      - name: Install Rust (stable)
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy,rustfmt
+          rustup default stable
+      - name: Format
+        run: cargo fmt --manifest-path clients/windows/Cargo.toml --check
+      - name: Clippy
+        run: cargo clippy --locked --manifest-path clients/windows/Cargo.toml --all-targets -- -D warnings
+      - name: Test
+        run: cargo test --locked --manifest-path clients/windows/Cargo.toml
+      # The client words and judges the limits as the widget does: its expected answers come from the widget itself
+      - name: Same as the widget
+        run: node clients/windows/scripts/make-parity.mjs --check
+
   packages:
     name: Core, Worker and widget
     runs-on: ubuntu-latest
