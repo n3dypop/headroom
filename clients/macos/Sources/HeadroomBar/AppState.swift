@@ -157,7 +157,14 @@ final class AppState {
             let outcome: SaveError?
             do {
                 let saved = try State.persistRemoval(settings: with { $0.settings }, keep: keep)
-                with { $0.apply(saved) }
+                with { s in
+                    s.apply(saved)
+                    // The whole file was written: it holds the prefs in use, if they didn't change meanwhile
+                    if s.settings.prefs == saved.next.prefs {
+                        prefsError = nil
+                        writtenChange = prefsChange
+                    }
+                }
                 outcome = nil
             } catch let e as SaveError {
                 outcome = e
