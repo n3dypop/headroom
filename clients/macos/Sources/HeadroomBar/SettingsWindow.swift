@@ -37,6 +37,9 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
     private let themePopup = NSPopUpButton(frame: .zero, pullsDown: false)
     private let tintPopup = NSPopUpButton(frame: .zero, pullsDown: false)
     private let motion = NSButton(checkboxWithTitle: "Animations", target: nil, action: nil)
+    private let iconsBox = NSBox()
+    /** Told the icons read when the settings open (both sets), so the notch draws files added since */
+    var onIcons: ((ProviderIcons) -> Void)?
     // Behavior
     private let openPopup = NSPopUpButton(frame: .zero, pullsDown: false)
     private let foldPopup = NSPopUpButton(frame: .zero, pullsDown: false)
@@ -82,7 +85,7 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
 
     /** A tab's page, laid out from the top */
     private func newPage() -> FlippedView {
-        FlippedView(frame: NSRect(x: 0, y: 0, width: 476, height: 350))
+        FlippedView(frame: NSRect(x: 0, y: 0, width: 476, height: 380))
     }
 
     private func put(_ page: NSView, _ view: NSView, _ x: CGFloat, _ y: CGFloat, _ w: CGFloat, _ h: CGFloat) {
@@ -98,12 +101,12 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
     }
 
     private func build() {
-        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 520, height: 470), styleMask: [.titled, .closable, .miniaturizable],
+        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 520, height: 500), styleMask: [.titled, .closable, .miniaturizable],
                          backing: .buffered, defer: false)
         w.title = "Headroom Settings"
         w.isReleasedWhenClosed = false
         w.delegate = self
-        let content = FlippedView(frame: NSRect(x: 0, y: 0, width: 520, height: 470))
+        let content = FlippedView(frame: NSRect(x: 0, y: 0, width: 520, height: 500))
         let x: CGFloat = 20, cw: CGFloat = 430
 
         // Connection: saved with Save only
@@ -177,6 +180,9 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         put(appearance, hint(glassNote + " The tint applies to Liquid Glass only; Light has dark text."), x, 148, cw, 30)
         put(appearance, motion, x, 192, cw, 22)
         put(appearance, hint("Opening, folding and moving the card. Off, they happen at once."), x, 216, cw, 16)
+        iconsBox.title = "Icons"
+        iconsBox.contentView = FlippedView(frame: NSRect(x: 0, y: 0, width: cw - 20, height: 84))
+        put(appearance, iconsBox, x, 244, cw, 112)
         tabs.addTabViewItem(item("appearance", "Appearance", appearance))
 
         // Behavior
@@ -204,13 +210,13 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         loginHint.font = .systemFont(ofSize: 11)
         loginHint.textColor = .secondaryLabelColor
 
-        tabs.frame = NSRect(x: 12, y: 12, width: 496, height: 392)
+        tabs.frame = NSRect(x: 12, y: 12, width: 496, height: 422)
         content.addSubview(tabs)
-        status.frame = NSRect(x: 20, y: 414, width: 380, height: 40)
+        status.frame = NSRect(x: 20, y: 444, width: 380, height: 40)
         content.addSubview(status)
         let close = NSButton(title: "Close", target: self, action: #selector(closeClicked))
         close.keyEquivalent = "\u{1b}"
-        close.frame = NSRect(x: 412, y: 418, width: 96, height: 28)
+        close.frame = NSRect(x: 412, y: 448, width: 96, height: 28)
         content.addSubview(close)
         w.contentView = content
         w.center()
@@ -240,7 +246,37 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         openPopup.selectItem(at: optionIndex(OPENS, prefs.openOn))
         foldPopup.selectItem(at: optionIndex(FOLDS, prefs.foldDelay))
         hideFullscreen.state = prefs.hideFullscreen ? .on : .off
+        let icons = ProviderIcons.load()
+        fillIcons(icons, prefs)
+        onIcons?(icons)
         readLoginItem()
+    }
+
+    /** A checkbox for each provider that has a second icon; where to put the second set when none has */
+    private func fillIcons(_ icons: ProviderIcons, _ prefs: Prefs) {
+        guard let inner = iconsBox.contentView else { return }
+        for v in inner.subviews { v.removeFromSuperview() }
+        let width = iconsBox.frame.width - 28
+        let choosable = icons.withSecond
+        if choosable.isEmpty {
+            let note = hint("Put a second set of icons in ~/Library/Application Support/Headroom/icons/alt/ to choose between them.")
+            note.frame = NSRect(x: 6, y: 6, width: width, height: 32)
+            inner.addSubview(note)
+            return
+        }
+        for (i, p) in choosable.enumerated() {
+            let box = NSButton(checkboxWithTitle: "\(providerName(p)): use the second icon", target: self, action: #selector(altIconToggled(_:)))
+            box.identifier = NSUserInterfaceItemIdentifier(p)
+            box.state = prefs.usesAltIcon(p) ? .on : .off
+            box.frame = NSRect(x: 6, y: 6 + CGFloat(i) * 24, width: width, height: 22)
+            inner.addSubview(box)
+        }
+    }
+
+    @objc private func altIconToggled(_ sender: NSButton) {
+        guard let p = sender.identifier?.rawValue else { return }
+        let on = sender.state == .on
+        change { $0.setAltIcon(p, on) }
     }
 
     /** The screens, by name and size (the menu bar's marked), after Automatic; a chosen screen that isn't connected stays listed */

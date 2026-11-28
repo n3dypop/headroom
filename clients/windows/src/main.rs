@@ -2,6 +2,7 @@
 // has (read with a read token, every 5 minutes at most). It never touches Claude, Codex or Gemini itself.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod art;
 mod demo;
 mod gfx;
 mod glass;

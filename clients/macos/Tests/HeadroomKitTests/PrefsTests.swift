@@ -188,4 +188,66 @@ final class PrefsTests: XCTestCase {
         XCTAssertNil(chosenScreen(display: "screen:1", keys: [], rightEdges: []))
         XCTAssertEqual(screenKey(69733378), "screen:69733378")
     }
+
+    // MARK: The second icons
+
+    func testTheSecondIconsAreReadAsKnownNamesInOrder() throws {
+        XCTAssertEqual(Prefs().altIcons, [])
+        XCTAssertEqual(try decode(#"{"alt_icons":["claude","gemini"]}"#).prefs.altIcons, ["claude", "gemini"])
+        // In PROVIDER_ORDER's order, each once
+        XCTAssertEqual(try decode(#"{"alt_icons":["gemini","codex","gemini","claude"]}"#).prefs.altIcons, ["codex", "claude", "gemini"])
+        // Unknown names and values that aren't names are left out
+        XCTAssertEqual(try decode(#"{"alt_icons":["Claude","openai",3,null,["codex"],{"a":1},"gemini"]}"#).prefs.altIcons, ["gemini"])
+        // Not an array: none
+        for bad in [#""claude""#, "true", "1", "null", #"{"claude":true}"#] {
+            XCTAssertEqual(try decode(#"{"alt_icons":\#(bad)}"#).prefs.altIcons, [], bad)
+        }
+    }
+
+    func testABadSecondIconsValueLeavesTheRestAlone() throws {
+        let s = try decode(#"{"url":"https://a.example","demo":false,"token_slot":4,"theme":"light","alt_icons":"claude"}"#)
+        XCTAssertEqual(s.url, "https://a.example")
+        XCTAssertEqual(s.tokenSlot, 4)
+        XCTAssertEqual(s.prefs.theme, .light)
+        XCTAssertEqual(s.prefs.altIcons, [])
+    }
+
+    func testChoosingASecondIcon() {
+        var p = Prefs()
+        p.setAltIcon("gemini", true)
+        p.setAltIcon("codex", true)
+        p.setAltIcon("codex", true)
+        XCTAssertEqual(p.altIcons, ["codex", "gemini"])
+        XCTAssertTrue(p.usesAltIcon("gemini"))
+        XCTAssertFalse(p.usesAltIcon("claude"))
+        p.setAltIcon("codex", false)
+        p.setAltIcon("openai", true)
+        XCTAssertEqual(p.altIcons, ["gemini"], "an unknown name isn't kept")
+    }
+
+    func testTheSecondIconsAreWrittenAsAnArrayOfNames() throws {
+        var p = Prefs()
+        p.setAltIcon("gemini", true)
+        p.setAltIcon("claude", true)
+        let s = Settings(url: "https://a.example", demo: false, tokenSlot: 2, prefs: p)
+        let data = try JSONEncoder().encode(s)
+        XCTAssertEqual(try written(s)["alt_icons"], .array([.string("claude"), .string("gemini")]))
+        XCTAssertEqual(try JSONDecoder().decode(Settings.self, from: data), s)
+        XCTAssertEqual(Prefs(json: p.json), p)
+        // None is an empty array
+        XCTAssertEqual(try written(Settings())["alt_icons"], .array([]))
+    }
+
+    func testAnIconFileIsASmallPNG() {
+        let png = Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])
+        XCTAssertTrue(usableIcon(png))
+        XCTAssertFalse(usableIcon(Data("GIF89a".utf8)))
+        XCTAssertFalse(usableIcon(Data()))
+        var big = png
+        big.append(Data(count: MAX_ICON_BYTES))
+        XCTAssertFalse(usableIcon(big), "larger than MAX_ICON_BYTES")
+        var edge = png
+        edge.append(Data(count: MAX_ICON_BYTES - png.count))
+        XCTAssertTrue(usableIcon(edge))
+    }
 }
