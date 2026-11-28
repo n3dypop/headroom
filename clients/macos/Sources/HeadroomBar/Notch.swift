@@ -861,6 +861,9 @@ final class NotchController {
         if let w = c.weekly {
             arc(cx, cy, OUTER_R * k, 0, 1, OUTER_STROKE * k, fade(pal.outerTrack, ringA))
             arc(cx, cy, OUTER_R * k, 0, CGFloat(w.solid + w.projected), OUTER_STROKE * k, color(c.color, 0.6 * ringA))
+        } else if c.headline?.id == "seven_day" {
+            // The ring already shows the weekly limit: the outer ring stays, empty, in the inner track's colour
+            arc(cx, cy, OUTER_R * k, 0, 1, OUTER_STROKE * k, fade(pal.track, ringA))
         }
         if let icon = icons.icon(c.provider, prefs: prefs) {
             let size = iconBox(icon.size.height > 0 ? icon.size.width / icon.size.height : 1, ICON_BOX)

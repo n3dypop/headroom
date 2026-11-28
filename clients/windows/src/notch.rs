@@ -1080,6 +1080,20 @@ impl Notch {
                 c.color,
                 0.6 * ring_a,
             )?;
+        } else if c.headline.as_ref().is_some_and(|h| h.id == "seven_day") {
+            // The ring already shows the weekly limit: the outer ring stays, empty, in the inner track's colour
+            unsafe {
+                g.rt.DrawEllipse(
+                    &D2D1_ELLIPSE {
+                        point: pt(cx, cy),
+                        radiusX: OUTER_R * k,
+                        radiusY: OUTER_R * k,
+                    },
+                    &g.ink(pal.track, ring_a)?,
+                    OUTER_STROKE * k,
+                    None,
+                );
+            }
         }
         if let Some((_, icon)) = self.icons.iter().find(|(p, _)| *p == c.provider) {
             let (bw, bh) = (icon.w * k, icon.h * k);

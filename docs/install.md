@@ -507,7 +507,8 @@ token. It never touches Claude, Codex or Gemini. It is a preview: there is no in
 4. **Use it.**
    - Move the pointer to the small nub at the right edge (with several monitors, of the one furthest right unless you choose
      another): the notch opens with a ring per provider (what is left of its 5-hour limit, its weekly limit as the thin outer ring).
-     Over a ring, a card shows every limit, as the widget's large size does.
+     A provider without a 5-hour limit shows its weekly limit in the ring, and the outer ring stays empty. Over a ring, a card
+     shows every limit, as the widget's large size does.
    - Click a ring to read the server now. It reads at most once every 5 minutes, and waits longer after failures.
    - The tray icon's menu lists each provider and has **Refresh now**, **Settings…** and **Quit Headroom**.
    - On a screen less than 300 px high (after scaling), the card points to the tray menu instead of listing the limits that don't fit.
