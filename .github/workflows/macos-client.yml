@@ -1,0 +1,31 @@
+# Builds the macOS client and checks it shows what the widget shows (the same tests/parity.json as the Windows client), on every
+# push that touches it, on any branch, and on pull requests
+name: macOS client
+
+on:
+  push:
+    paths:
+      - "clients/macos/**"
+      - "clients/windows/tests/parity.json"
+      - ".github/workflows/macos-client.yml"
+  pull_request:
+    paths:
+      - "clients/macos/**"
+      - "clients/windows/tests/parity.json"
+      - ".github/workflows/macos-client.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  macos-client:
+    name: macOS client
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build
+        run: swift build --package-path clients/macos -c release
+      - name: Test
+        run: swift test --package-path clients/macos
