@@ -50,7 +50,7 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
-    uses: n3dypop/repo-autopilot/.github/workflows/layer2-nightly-tests.yml@36d694a3a441a7b157d97b70d08de35ce79097be # v0.1.0
+    uses: n3dypop/repo-autopilot/.github/workflows/layer2-nightly-tests.yml@270d7328d75512af7dd96fb068608a6a7e7e1207 # v0.1.1
     with:
       repo_tier: 'A'
       runtime: 'node'
@@ -72,7 +72,7 @@ jobs:
       contents: write
       issues: write
       pull-requests: write
-    uses: n3dypop/repo-autopilot/.github/workflows/layer3-weekly-audit.yml@36d694a3a441a7b157d97b70d08de35ce79097be # v0.1.0
+    uses: n3dypop/repo-autopilot/.github/workflows/layer3-weekly-audit.yml@270d7328d75512af7dd96fb068608a6a7e7e1207 # v0.1.1
     with:
       repo_tier: 'A'
       runtime: 'node'
@@ -94,7 +94,7 @@ jobs:
       discussions: write
       issues: read
       pull-requests: read
-    uses: n3dypop/repo-autopilot/.github/workflows/layer5-product-evolve.yml@36d694a3a441a7b157d97b70d08de35ce79097be # v0.1.0
+    uses: n3dypop/repo-autopilot/.github/workflows/layer5-product-evolve.yml@270d7328d75512af7dd96fb068608a6a7e7e1207 # v0.1.1
     with:
       repo_tier: 'A'
       runtime: 'node'
@@ -118,7 +118,7 @@ jobs:
       discussions: write
       issues: read
       pull-requests: read
-    uses: n3dypop/repo-autopilot/.github/workflows/layer5-product-evolve.yml@36d694a3a441a7b157d97b70d08de35ce79097be # v0.1.0
+    uses: n3dypop/repo-autopilot/.github/workflows/layer5-product-evolve.yml@270d7328d75512af7dd96fb068608a6a7e7e1207 # v0.1.1
     with:
       repo_tier: 'A'
       runtime: 'node'
