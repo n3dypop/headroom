@@ -19,9 +19,29 @@ permissions:
 
 jobs:
   macos-client:
-    name: macOS client
-    runs-on: macos-latest
+    name: macOS client (${{ matrix.os }})
+    # The newest toolchain (with Liquid Glass, macOS 26), and an older one (Swift before 6.2, without it)
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            xcode: default
+          - os: macos-15
+            xcode: oldest-16
+    runs-on: ${{ matrix.os }}
     steps:
+      - name: Toolchain
+        env:
+          XCODE: ${{ matrix.xcode }}
+        run: |
+          if [ "$XCODE" = "oldest-16" ]; then
+            app=$(ls -d /Applications/Xcode_16*.app 2>/dev/null | sort -V | head -1)
+            if [ -z "$app" ]; then echo "No Xcode 16 on this runner"; exit 1; fi
+            sudo xcode-select -s "$app"
+          fi
+          xcodebuild -version
+          swift --version
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false

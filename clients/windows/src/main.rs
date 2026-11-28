@@ -4,11 +4,16 @@
 
 mod demo;
 mod gfx;
+mod glass;
 mod model;
 mod notch;
+mod prefs;
 mod schedule;
+mod screens;
 mod server;
 mod settings;
+mod startup;
+mod theme;
 mod tray;
 
 mod icons {
@@ -25,7 +30,8 @@ use windows::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS};
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
 use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::Controls::{
-    InitCommonControlsEx, ICC_STANDARD_CLASSES, INITCOMMONCONTROLSEX,
+    InitCommonControlsEx, ICC_BAR_CLASSES, ICC_STANDARD_CLASSES, ICC_TAB_CLASSES,
+    INITCOMMONCONTROLSEX,
 };
 use windows::Win32::UI::HiDpi::{
     SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
@@ -222,6 +228,37 @@ pub fn save_settings(url: &str, token: Option<String>, demo: bool) -> Result<(),
     Ok(())
 }
 
+/** How the notch looks and behaves now */
+pub fn prefs() -> prefs::Prefs {
+    inner().settings.prefs.clone()
+}
+
+/** Takes new prefs and shows them; with `write`, also writes them to the settings file (with the server and the token as they
+ * are). When the file can't be written they are still shown, until the app ends, and the error says so */
+pub fn set_prefs(p: prefs::Prefs, write: bool) -> Result<(), String> {
+    let saved = {
+        let mut i = inner();
+        apply_prefs(&mut i, &OsKeep, p, write)
+    };
+    notch::post_place();
+    saved
+}
+
+fn apply_prefs(
+    i: &mut Inner,
+    keep: &impl Keep,
+    p: prefs::Prefs,
+    write: bool,
+) -> Result<(), String> {
+    let next = Settings {
+        prefs: p,
+        ..i.settings.clone()
+    };
+    let written = if write { keep.write(&next) } else { Ok(()) };
+    i.settings = next;
+    written
+}
+
 pub fn remove_token() -> Result<(), String> {
     let mut i = inner();
     apply_remove(&mut i, &OsKeep)?;
@@ -310,6 +347,7 @@ fn apply_save(
         url,
         demo,
         token_slot,
+        prefs: old.prefs.clone(),
     };
     let new_entry = token.is_some();
     if let Err(e) = keep.write(&settings) {
@@ -439,7 +477,7 @@ fn main() -> windows::core::Result<()> {
         CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok()?;
         let icc = INITCOMMONCONTROLSEX {
             dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32,
-            dwICC: ICC_STANDARD_CLASSES,
+            dwICC: ICC_STANDARD_CLASSES | ICC_TAB_CLASSES | ICC_BAR_CLASSES,
         };
         let _ = InitCommonControlsEx(&icc);
     }
@@ -460,8 +498,10 @@ fn main() -> windows::core::Result<()> {
     tray::create()?;
     notch::create(pinned)?;
     std::thread::spawn(move || reader(rx));
-    // First run with nothing set: open Settings
-    if mode_of(&inner()) == Mode::Setup {
+    // First run with nothing set: open Settings (development builds: also with HEADROOM_DESKTOP_SETTINGS=1, for checking it)
+    let check_settings =
+        cfg!(debug_assertions) && std::env::var_os("HEADROOM_DESKTOP_SETTINGS").is_some();
+    if mode_of(&inner()) == Mode::Setup || check_settings {
         settings::open();
     }
     unsafe {
@@ -719,6 +759,41 @@ mod tests {
             (Some("three".into()), Some("three".into()))
         );
         assert_eq!(keep.entries.borrow().len(), 1);
+    }
+
+    #[test]
+    fn the_prefs_and_the_server_never_lose_each_other() {
+        let keep = FakeKeep::default();
+        let mut i = Inner::default();
+        apply_save(&mut i, &keep, A, Some("one".into()), false).unwrap();
+        let glass = prefs::Prefs {
+            theme: prefs::Theme::Glass,
+            position: 10,
+            ..prefs::Prefs::default()
+        };
+        let generation = i.generation;
+        apply_prefs(&mut i, &keep, glass.clone(), true).unwrap();
+        assert_eq!(
+            i.generation, generation,
+            "the prefs don't read the server again"
+        );
+        assert_eq!(used(&i, &keep), (Some("one".into()), Some("one".into())));
+        assert_eq!(
+            keep.file.borrow().as_ref().map(|s| s.prefs.clone()),
+            Some(glass.clone())
+        );
+        // A new token keeps the prefs
+        apply_save(&mut i, &keep, A, Some("two".into()), false).unwrap();
+        assert_eq!(i.settings.prefs, glass);
+        assert_eq!(
+            keep.file.borrow().as_ref().map(|s| s.prefs.clone()),
+            Some(glass.clone())
+        );
+        // A file that can't be written: shown anyway, and said
+        keep.fail_write.set(true);
+        assert!(apply_prefs(&mut i, &keep, prefs::Prefs::default(), true).is_err());
+        assert_eq!(i.settings.prefs, prefs::Prefs::default());
+        assert_eq!(used(&i, &keep).0, Some("two".into()));
     }
 
     #[test]

@@ -195,4 +195,55 @@ final class StateTests: XCTestCase {
         s.settings.demo = true
         XCTAssertEqual(s.footer(now: 0).0, "Sample data (Settings to connect)")
     }
+
+    func testSavingTheServerKeepsThePrefs() throws {
+        let keep = FakeKeep()
+        var s = State()
+        s.settings.prefs.theme = .glass
+        s.settings.prefs.position = 20
+        try s.save(url: A, token: "one", demo: false, keep: keep)
+        XCTAssertEqual(s.settings.prefs.theme, .glass)
+        XCTAssertEqual(keep.file?.prefs.position, 20)
+        try s.save(url: B, token: "two", demo: false, keep: keep)
+        XCTAssertEqual(keep.file?.prefs.theme, .glass)
+        try s.removeToken(keep: keep)
+        XCTAssertEqual(keep.file?.prefs.theme, .glass)
+        XCTAssertEqual(s.settings.prefs.position, 20)
+    }
+
+    func testPrefsChangedDuringASaveAreNotTakenBack() throws {
+        let keep = FakeKeep()
+        var s = State()
+        // The save is written with the prefs of its start; the prefs change before it is applied
+        let saved = try State.persist(settings: s.settings, hasToken: s.hasToken, url: A, token: "one", demo: false, keep: keep)
+        s.settings.prefs.size = .large
+        s.apply(saved)
+        XCTAssertEqual(s.settings.prefs.size, .large)
+        XCTAssertEqual(s.settings.url, A)
+        XCTAssertEqual(used(s, keep), ["one", "one"])
+    }
+
+    func testAPrefsChangeKeepsTheServerAndTheToken() throws {
+        let keep = FakeKeep()
+        var s = State()
+        try s.save(url: A, token: "one", demo: false, keep: keep)
+        let generation = s.generation
+        s.settings.prefs.openOn = .click
+        try keep.write(s.settings)
+        XCTAssertEqual(used(s, keep), ["one", "one"])
+        XCTAssertEqual(keep.file?.url, A)
+        XCTAssertEqual(keep.file?.prefs.openOn, .click)
+        XCTAssertEqual(s.generation, generation, "what is shown stays")
+    }
+
+    func testTheNotchGoesOnTheScreenNothingIsRightOf() {
+        XCTAssertNil(rightmostScreen(rightEdges: []))
+        XCTAssertEqual(rightmostScreen(rightEdges: [1512]), 0)
+        // The menu bar's screen in the middle, one on each side: the right one
+        XCTAssertEqual(rightmostScreen(rightEdges: [1920, 3840, 0]), 1)
+        // One left of the menu bar's screen: the menu bar's
+        XCTAssertEqual(rightmostScreen(rightEdges: [1512, 0]), 0)
+        // Stacked, reaching as far right: the first
+        XCTAssertEqual(rightmostScreen(rightEdges: [1920, 1920]), 0)
+    }
 }

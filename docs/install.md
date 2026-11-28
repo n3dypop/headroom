@@ -227,7 +227,8 @@ Always download and extract into a new, empty folder. An older package you keep 
 cargo build --release --locked --manifest-path agent/Cargo.toml
 ```
 
-The server and widget steps (1 and 3) use files from the source repository. A release package contains only the agent.
+The server step (1) uses files from the source repository. A release also has the iPhone widget (`Headroom.js`, section 3) and the
+desktop clients (sections 6 and 7) as files of their own; the agent's package contains only the agent.
 
 ### 2.4 Configure (before installing)
 
@@ -379,7 +380,8 @@ Headroom can also show Gemini's limits, read with Google's Antigravity CLI (`agy
 
 1. Install [Scriptable](https://apps.apple.com/app/id1405459188).
 2. **Get the script.**
-   - Use `packages/scriptable/Headroom.js` as it is.
+   - Download `Headroom.js` from the [Releases page](https://github.com/n3dypop/headroom/releases) (from the release that has it;
+     check it against `Headroom.js.sha256` or the digest shown there), or use `packages/scriptable/Headroom.js` as it is.
    - Or build a copy with provider icons:
      1. Put `claude.png`, `codex.png` and `gemini.png` (16–1024 px, 64 KB at most) in `packages/scriptable/icons/`. These are not included because they are third-party logos. Crop each to what is visible (little transparent margin): a wide icon is drawn wider and shorter, so it looks as large as a square one.
      2. Optionally, put a second set with the same names in `packages/scriptable/icons/alt/`. **Settings › Display** in the app then switches each provider's icon between its two, on every widget and the details page at once.
@@ -477,15 +479,20 @@ If the widget can't schedule notifications on your iPhone, use a Shortcuts autom
 ## 6. Windows desktop client (preview)
 
 A small notch on the right edge of the screen and a tray icon show the same limits as the widget, read from your server with a read
-token. It never touches Claude, Codex or Gemini. It is a preview: there is no installer yet, and you build it yourself.
+token. It never touches Claude, Codex or Gemini. It is a preview: there is no installer yet.
 
-1. **Build it** (Windows 10 or 11, x64, with [Rust](https://rustup.rs)):
+1. **Get it** (Windows 10 or 11, x64), either way:
+   - **Download** `headroom-desktop-<version>-windows-x64.zip` from the [Releases page](https://github.com/n3dypop/headroom/releases)
+     (from the release that has it), check it as in section 2.3 (its `.sha256` file, and `gh attestation verify`), and extract it
+     into a new, empty folder. It isn't code-signed, so Windows SmartScreen may ask before the first run. The rings show letters:
+     the provider icons are third-party logos and aren't in the package.
+   - **Build it** with [Rust](https://rustup.rs):
 
-   ```powershell
-   cargo build --release --manifest-path clients/windows/Cargo.toml
-   ```
+     ```powershell
+     cargo build --release --manifest-path clients/windows/Cargo.toml
+     ```
 
-   If `packages/scriptable/icons/` has the provider icons (section 3), they are built in; otherwise the rings show letters.
+     If `packages/scriptable/icons/` has the provider icons (section 3), they are built in; otherwise the rings show letters.
 2. **Create a read token for the PC** (from the repository root), and add its line to `TOKENS` as in section 1, step 6 (store the
    whole array again):
 
@@ -494,39 +501,73 @@ token. It never touches Claude, Codex or Gemini. It is a preview: there is no in
    ```
 
    Use a name that doesn't identify you, and keep it apart from the PC's write token: the two are separate credentials.
-3. **Run** `clients/windows/target/release/headroom-desktop.exe`. The first time, **Settings** opens: enter the Worker URL (the origin
+3. **Run** `headroom-desktop.exe` (from the package's folder, or `clients/windows/target/release/`). The first time, **Settings** opens: enter the Worker URL (the origin
    only) and the read token, and choose **Save**. The token is kept in Windows Credential Manager, for that server only; changing the
    server asks for its token. To look around first, choose **Show sample data instead of the server**.
 4. **Use it.**
-   - Move the pointer to the small nub at the right edge: the notch opens with a ring per provider (what is left of its 5-hour limit,
-     its weekly limit as the thin outer ring). Over a ring, a card shows every limit, as the widget's large size does.
+   - Move the pointer to the small nub at the right edge (with several monitors, of the one furthest right unless you choose
+     another): the notch opens with a ring per provider (what is left of its 5-hour limit, its weekly limit as the thin outer ring).
+     Over a ring, a card shows every limit, as the widget's large size does.
    - Click a ring to read the server now. It reads at most once every 5 minutes, and waits longer after failures.
    - The tray icon's menu lists each provider and has **Refresh now**, **Settings…** and **Quit Headroom**.
    - On a screen less than 300 px high (after scaling), the card points to the tray menu instead of listing the limits that don't fit.
-5. **Start it at sign-in** (optional): press Win+R, open `shell:startup`, and put a shortcut to `headroom-desktop.exe` there.
-6. **Remove it:** choose **Quit Headroom**, then in **Settings** choose **Remove token** (or remove the `headroom-desktop` entries in
-   Credential Manager), and delete `%APPDATA%\Headroom\desktop.json`. Remove its line from `TOKENS` on the server too.
+5. **Settings** (from the tray menu) has four tabs. Only **Connection** needs **Save**; the other tabs take each change at once.
+   - **Connection:** the Worker URL, the read token, and the sample data.
+   - **Placement:** the screen (automatic is the one furthest right), the position along the edge, and the size.
+   - **Appearance:** the theme (as Windows' apps are, dark, light, or **Liquid Glass**) and the animations. Liquid Glass blurs and
+     bends what is behind the notch: while the notch is open it reads the part of the screen right behind it, in memory only, and
+     never saves or sends it. While that is on, screenshots and screen recordings leave the notch out (so the glass never reads
+     itself). Turn off **Blur and bend what is behind it** to have the look of glass without that. Its tint can be
+     clear, dark or light.
+   - **Behavior:** whether the notch opens when the pointer touches it or when it is clicked, how soon it folds after the pointer
+     leaves, hiding it while a full-screen app (a game, a video) is in front, and starting Headroom when you sign in to Windows (a
+     `Headroom` value in your user's Run key, removed when you turn it off).
+6. **Remove it:** in **Settings**, turn off starting at sign-in and choose **Remove token** (or remove the `headroom-desktop`
+   entries in Credential Manager), then choose **Quit Headroom** and delete `%APPDATA%\Headroom\desktop.json`. If you put a
+   shortcut in `shell:startup` before, delete it too. Remove its line from `TOKENS` on the server as well.
 
 ## 7. macOS desktop client (preview)
 
 The same notch as on Windows, on the right edge of the screen, with a menu bar item in place of the tray icon. It reads your server
-with a read token and never touches Claude, Codex or Gemini. It is a preview: you build and run it yourself, and it isn't signed.
+with a read token and never touches Claude, Codex or Gemini. It is a preview, and it has only an ad-hoc signature (not notarized).
 
-1. **Build it** (macOS 13 or later, with Xcode or the Xcode Command Line Tools):
+1. **Get it** (macOS 13 or later), either way:
+   - **Download** `headroom-desktop-<version>-macos-arm64.tar.gz` (Apple silicon) from the
+     [Releases page](https://github.com/n3dypop/headroom/releases), from the release that has it. As with the agent (section 2.3), use
+     `curl`, not a browser, check its SHA-256 value, and extract it into a new, empty folder. Put the release's version and the
+     archive's SHA-256 value (from the Releases page) in the first two lines:
 
-   ```bash
-   swift build -c release --package-path clients/macos
-   ```
+     ```bash
+     set -euo pipefail
+     V="0.0.0"
+     EXPECTED="the archive's SHA-256 value"
+     F="headroom-desktop-$V-macos-arm64.tar.gz"
+     D="headroom-desktop-$(date +%Y%m%d%H%M%S)"
+     mkdir "$D"
+     cd "$D"
+     curl -fsSLO "https://github.com/n3dypop/headroom/releases/download/v$V/$F"
+     echo "$EXPECTED  $F" | shasum -a 256 -c -
+     tar -xzf "$F"
+     cd "headroom-desktop-$V-macos-arm64"
+     ```
+   - **Build it** (with Xcode or the Xcode Command Line Tools):
+
+     ```bash
+     swift build -c release --package-path clients/macos
+     ```
 2. **Create a read token for the Mac** as in section 6, step 2 (for example `node packages/worker/scripts/new-token.ts read mac-view`),
    and add its line to `TOKENS`.
-3. **Run** `clients/macos/.build/release/HeadroomBar`. It has no Dock icon. The first time, **Settings** opens: enter the Worker URL
+3. **Run** `./HeadroomBar` in the package's folder (or `clients/macos/.build/release/HeadroomBar`). It has no Dock icon. The first time, **Settings** opens: enter the Worker URL
    and the read token, and choose **Save**. The token is kept in your login keychain (as `headroom-desktop`), for that server only.
    To look around first, choose **Show sample data instead of the server**.
 4. **Use it** as on Windows (section 6, step 4): the nub at the right edge opens the notch, a ring shows its card, a click reads the
    server (at most once every 5 minutes), and the menu bar item lists each provider with **Refresh now**, **Settings…** and
    **Quit Headroom**. On a trackpad, the card's rows scroll when they don't fit.
-5. **Provider icons** (optional): put `claude.png`, `codex.png` and `gemini.png` (as in section 3) in
+5. **Settings** has the same four tabs as on Windows (section 6, step 5). On macOS 26 and later, **Liquid Glass** is the system's
+   own glass (on earlier versions, its translucent material), so nothing is read from the screen; **Start Headroom when you log in**
+   adds a `com.headroom.desktop.plist` to `~/Library/LaunchAgents/`, used from the next login.
+6. **Provider icons** (optional): put `claude.png`, `codex.png` and `gemini.png` (as in section 3) in
    `~/Library/Application Support/Headroom/icons/` and start it again. Without them the rings show letters.
-6. **Remove it:** choose **Quit Headroom**, then in **Settings** choose **Remove token** (or delete the `headroom-desktop` items in
-   Keychain Access), and delete `~/Library/Application Support/Headroom/`. Remove its line from `TOKENS` on the server too.
+7. **Remove it:** in **Settings**, turn off starting at login and choose **Remove token** (or delete the `headroom-desktop` items in
+   Keychain Access), then choose **Quit Headroom** and delete `~/Library/Application Support/Headroom/`. Remove its line from `TOKENS` on the server too.
 

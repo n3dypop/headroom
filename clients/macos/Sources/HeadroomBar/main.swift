@@ -38,6 +38,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         notch.onTray = { status.set($0) }
         self.notch = notch
         app.onChange = { [weak notch] in notch?.refresh() }
+        // A change in the settings' Placement, Appearance or Behavior: placed and drawn again at once
+        app.onPrefs = { [weak notch] in notch?.applyPrefs() }
         app.startReading()
         // Back from sleep: read again when the schedule allows it
         NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [app] _ in
@@ -45,6 +47,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         // First run with nothing set: open Settings
         if app.with({ $0.mode == .setup }) { settings.show() }
+    }
+
+    /** Quitting waits for the settings queue: a change shown as set is in the file when the app ends (only once the app has its state;
+     * a second copy that quits at once never made one) */
+    func applicationWillTerminate(_ notification: Notification) {
+        if settings != nil { app.finishSaving() }
     }
 
     /** Copy, paste and select all in the settings fields (an app without a Dock icon has no menu bar of its own) */

@@ -69,6 +69,10 @@ impl Place {
         self.alpha = alpha;
         self
     }
+    /** A theme's colour, its opacity times another */
+    pub fn ink(self, ink: crate::theme::Ink, alpha: f32) -> Place {
+        self.color(ink.0, ink.1 * alpha)
+    }
     pub fn tabular(mut self) -> Place {
         self.tabular = true;
         self
@@ -144,6 +148,11 @@ impl Gfx {
 
     pub fn brush(&self, hex: &str, a: f32) -> Result<ID2D1SolidColorBrush> {
         unsafe { self.rt.CreateSolidColorBrush(&color(hex, a), None) }
+    }
+
+    /** A brush of a theme's colour, its opacity times another */
+    pub fn ink(&self, ink: crate::theme::Ink, a: f32) -> Result<ID2D1SolidColorBrush> {
+        self.brush(ink.0, ink.1 * a)
     }
 
     pub fn format(

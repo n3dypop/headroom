@@ -22,6 +22,14 @@ final class AppState {
     let keep = KeychainKeep()
     /** Told (on the main thread) whenever the state may have changed */
     var onChange: (() -> Void)?
+    /** Told (on the main thread) when the notch's prefs changed: it is placed and drawn again */
+    var onPrefs: (() -> Void)?
+    /** Moves on with every prefs change (under the lock): a write that a later one follows is skipped */
+    private var prefsChange: UInt64 = 0
+    /** Why the last write of the prefs failed, kept until a later write succeeds (under the lock) */
+    private var prefsError: SaveError?
+    /** The prefs change the settings file holds (under the lock; 0: the prefs read at start) */
+    private var writtenChange: UInt64 = 0
     /** Whether the keychain has said whether the settings' token is there (read and written under the lock only) */
     private var tokenKnown = false
 
@@ -68,6 +76,11 @@ final class AppState {
                     s.apply(saved)
                     // The save asked the keychain for these settings
                     tokenKnown = true
+                    // The file now holds the prefs in use, if they didn't change meanwhile
+                    if s.settings.prefs == saved.next.prefs {
+                        prefsError = nil
+                        writtenChange = prefsChange
+                    }
                 }
                 outcome = nil
             } catch let e as SaveError {
@@ -83,13 +96,75 @@ final class AppState {
         }
     }
 
+    /** Changes the notch's prefs (on the main thread): they take effect at once, and the settings file is written on the settings
+     * queue, after any save before it and outside the lock. The server and the token are written as they are then. `done` gets the
+     * error (nil once the file holds these prefs), on the main thread, after the writes before it; a change another one follows
+     * before it is written reports nothing (the later one reports). A value already in use reports what the last write came to */
+    func setPrefs(_ change: (inout Prefs) -> Void, done: @escaping (SaveError?) -> Void) {
+        let (mine, now) = with { s -> (UInt64?, UInt64) in
+            var p = s.settings.prefs
+            change(&p)
+            if p == s.settings.prefs { return (nil, prefsChange) }
+            s.settings.prefs = p
+            prefsChange += 1
+            return (prefsChange, prefsChange)
+        }
+        guard let mine else {
+            // Nothing new to write: told after the writes already queued. Saved only when the file holds the prefs in use; a later
+            // change meanwhile reports for itself
+            saving.async { [self] in
+                let report = with { _ -> SaveError?? in
+                    if prefsChange != now { return .none }
+                    if writtenChange == now { return .some(nil) }
+                    return .some(prefsError ?? SaveError("Couldn't write the settings"))
+                }
+                if let outcome = report {
+                    DispatchQueue.main.async { done(outcome) }
+                }
+            }
+            return
+        }
+        onPrefs?()
+        saving.async { [self] in
+            // The settings as they are now (a later change writes for itself)
+            let settings = with { s -> Settings? in prefsChange == mine ? s.settings : nil }
+            guard let settings else { return }
+            let outcome: SaveError?
+            do {
+                try keep.write(settings)
+                outcome = nil
+            } catch let e as SaveError {
+                outcome = e
+            } catch {
+                outcome = SaveError("Couldn't write the settings")
+            }
+            with { _ in
+                prefsError = outcome
+                if outcome == nil { writtenChange = mine }
+            }
+            DispatchQueue.main.async { done(outcome) }
+        }
+    }
+
+    /** Waits for the saves and writes queued (before quitting: what was shown as set is in the file) */
+    func finishSaving() {
+        saving.sync {}
+    }
+
     /** Removes the token on the settings queue; `done` gets the error (nil when removed), on the main thread */
     func removeToken(done: @escaping (SaveError?) -> Void) {
         saving.async { [self] in
             let outcome: SaveError?
             do {
                 let saved = try State.persistRemoval(settings: with { $0.settings }, keep: keep)
-                with { $0.apply(saved) }
+                with { s in
+                    s.apply(saved)
+                    // The whole file was written: it holds the prefs in use, if they didn't change meanwhile
+                    if s.settings.prefs == saved.next.prefs {
+                        prefsError = nil
+                        writtenChange = prefsChange
+                    }
+                }
                 outcome = nil
             } catch let e as SaveError {
                 outcome = e
@@ -116,7 +191,7 @@ final class AppState {
         // Taken only for the settings it was asked about (a save meanwhile has said for itself)
         let current = with { s -> Bool in
             // A save meanwhile asked for itself: this answer is about settings no longer in use
-            guard s.settings == settings, !tokenKnown else { return false }
+            guard s.settings.sameToken(as: settings), !tokenKnown else { return false }
             switch found {
             case .token:
                 s.hasToken = true

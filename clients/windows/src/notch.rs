@@ -3,12 +3,15 @@
 //! goes through it wherever nothing is drawn; around what is drawn it paints an all but invisible margin to keep the pointer.
 
 use crate::gfx::{pt, rect, Gfx, Place};
+use crate::glass::{self, Glass};
 use crate::model::{self, CardRow, Cell, Pieces, View};
+use crate::prefs::{OpenOn, Prefs, Theme};
+use crate::theme::{self, Palette};
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicIsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
-use windows::core::{w, Result};
+use windows::core::{w, Interface, Result};
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Direct2D::Common::*;
 use windows::Win32::Graphics::Direct2D::*;
@@ -48,15 +51,6 @@ const NUB_H: f32 = 64.0;
 const HOT_PAD: f32 = 6.0;
 const NUB_HOT_W: f32 = 14.0;
 
-const INK: &str = "#ffffff";
-const INK_2: &str = "#c9c9ce";
-const DIM: &str = "#8e8e93";
-const WARN: &str = "#ffd60a";
-const TRACK: &str = "#2a2a2d";
-const OUTER_TRACK: &str = "#1c1c1f";
-const CARD: &str = "#0c0c0d";
-const CARD_LINE: &str = "#26262a";
-const NUB: &str = "#3a3a3e";
 /** The widget's gray for the recent consumption */
 const RECENT: &str = "#6B7280";
 /** Two letters in the ring when no icon was supplied, so Claude and Codex differ */
@@ -64,8 +58,12 @@ const MARKS: [(&str, &str); 3] = [("claude", "Cl"), ("codex", "Cx"), ("gemini", 
 
 const FOLD_MS: f32 = 340.0;
 const CARD_MOVE_MS: f32 = 260.0;
-const FOLD_GRACE_MS: u32 = 450;
-const CARD_GRACE_MS: u32 = 250;
+/** How often what is behind the glass is read again while the notch is open */
+const GLASS_MS: u32 = 250;
+/** How often the window in front is checked for a full-screen app */
+const FULL_MS: u32 = 1_000;
+/** The glass's bevel: the band along its edge that bends what is behind */
+const BEVEL: f32 = 7.0;
 /** How long "Next read in N min" stays after a click */
 const NOTE_MS: u128 = 4_000;
 
@@ -78,6 +76,8 @@ const T_ANIM: usize = 1;
 const T_FOLD: usize = 2;
 const T_CARD: usize = 3;
 const T_TICK: usize = 4;
+const T_FULL: usize = 5;
+const T_GLASS: usize = 6;
 
 /** The notch window, for the reader thread to post to */
 pub static HWND_VALUE: AtomicIsize = AtomicIsize::new(0);
@@ -165,6 +165,9 @@ struct Surface {
     dc: HDC,
     bitmap: HBITMAP,
     old: HGDIOBJ,
+    /** The pixels (for the development build's frame dump) */
+    #[cfg_attr(not(debug_assertions), allow(dead_code))]
+    bits: *const u8,
     w: i32,
     h: i32,
 }
@@ -207,6 +210,7 @@ impl Surface {
                 dc,
                 bitmap,
                 old,
+                bits: bits as *const u8,
                 w,
                 h,
             })
@@ -324,6 +328,17 @@ pub struct Notch {
     /** Kept open with the first card (HEADROOM_DESKTOP_OPEN=1, for checking the look) */
     pinned: bool,
     tick_ms: u32,
+    /** How it looks and behaves (taken again at each placement) */
+    prefs: Prefs,
+    /** Windows' apps are light (for the System theme) */
+    system_light: bool,
+    glass: Glass,
+    /** The monitor it is on */
+    monitor: HMONITOR,
+    /** Hidden while a full-screen app is in front */
+    hidden: bool,
+    /** Left out of screen copies (so the glass, reading what is behind, never reads itself) */
+    excluded: bool,
 }
 
 /** How a card is laid out: whether its rows scroll, how far they are scrolled and can be, their room, and the card's height */
@@ -442,7 +457,7 @@ impl Notch {
         Layout {
             n,
             pill_x: WIN_W - PILL_W,
-            pill_y: (self.win_h - pill_h) / 2.0,
+            pill_y: crate::prefs::along(self.prefs.position, self.win_h, self.win_h, pill_h).1,
             pill_h,
         }
     }
@@ -459,12 +474,126 @@ impl Notch {
         }
     }
 
-    /** Against the right edge of the primary monitor's work area (above the taskbar), centered vertically */
+    /** Against the right edge of the desktop: the work area (above the taskbar) of the monitor nothing is right of, centered
+     * vertically */
     fn place(&mut self) {
         // While placing, the changes the placement itself causes don't ask for another
         PLACE_POSTED.with(|p| p.set(true));
+        self.take_prefs();
         self.place_guarded();
+        if self.fold.to > 0.0 && self.glass_reads() {
+            self.start_glass();
+            self.render();
+        }
         PLACE_POSTED.with(|p| p.set(false));
+    }
+
+    /** Takes the prefs (and Windows' light or dark) again, and sets what follows from them */
+    fn take_prefs(&mut self) {
+        self.prefs = crate::prefs();
+        self.system_light = theme::apps_light();
+        // A copy of the screen includes the notch (layered windows too, as the screen is composed): while the glass is set to read
+        // what is behind, the notch is left out of copies, its own and screenshots alike. Where Windows can't (before Windows 10 2004,
+        // where the same call blacks the window out of copies instead), the glass doesn't read
+        let exclude = self.prefs.theme == Theme::Glass
+            && self.prefs.glass_backdrop
+            && theme::windows_build() >= 19_041;
+        if exclude != self.excluded {
+            let affinity = if exclude {
+                WDA_EXCLUDEFROMCAPTURE
+            } else {
+                WDA_NONE
+            };
+            if unsafe { SetWindowDisplayAffinity(self.hwnd, affinity) }.is_ok() {
+                self.excluded = exclude;
+            }
+            // Not set: still excluded when it was to be lifted (tried again at the next placement), not excluded when it was to
+            // be set (the glass doesn't read)
+        }
+        let (fold_ms, move_ms) = if self.prefs.motion {
+            (FOLD_MS, CARD_MOVE_MS)
+        } else {
+            (1.0, 1.0)
+        };
+        self.fold.ms = fold_ms;
+        self.card_top.ms = move_ms;
+        unsafe {
+            if self.prefs.hide_fullscreen {
+                SetTimer(Some(self.hwnd), T_FULL, FULL_MS, None);
+            } else {
+                let _ = KillTimer(Some(self.hwnd), T_FULL);
+            }
+        }
+        if !self.prefs.hide_fullscreen {
+            self.set_hidden(false);
+        }
+        if !self.glass_reads() {
+            unsafe {
+                let _ = KillTimer(Some(self.hwnd), T_GLASS);
+            }
+            self.glass.drop_backdrop();
+        }
+    }
+
+    /** The colours now */
+    fn pal(&self) -> Palette {
+        theme::palette(&self.prefs, self.system_light, self.glass.has_backdrop())
+    }
+
+    /** Whether the glass reads what is behind it */
+    fn glass_reads(&self) -> bool {
+        self.prefs.theme == Theme::Glass
+            && self.prefs.glass_backdrop
+            && self.excluded
+            && !self.hidden
+    }
+
+    /** Reads what is behind the window for the glass (kept in memory only) */
+    fn take_backdrop(&mut self) {
+        if !self.glass_reads()
+            || self.size.0 <= 0
+            || !self.surface_ready()
+            || !self.glass.may_read(&self.gfx)
+        {
+            return;
+        }
+        let (w, h) = self.size;
+        let dpi = self.draw_dpi();
+        let taken = glass::capture(self.pos.x, self.pos.y, w, h)
+            .map(|px| self.glass.set_backdrop(&self.gfx, &px, w, h, dpi));
+        if !matches!(taken, Some(Ok(()))) {
+            self.glass.drop_backdrop();
+        }
+    }
+
+    /** The glass reads what is behind now and while the notch is open */
+    fn start_glass(&mut self) {
+        if self.glass_reads() {
+            self.take_backdrop();
+            unsafe { SetTimer(Some(self.hwnd), T_GLASS, GLASS_MS, None) };
+        }
+    }
+
+    /** The DPI drawing is done at: the screen's, times the size in the prefs */
+    fn draw_dpi(&self) -> f32 {
+        self.dpi * self.prefs.scale()
+    }
+
+    /** Shown or hidden (while a full-screen app is in front) */
+    fn set_hidden(&mut self, hide: bool) {
+        if hide == self.hidden {
+            return;
+        }
+        self.hidden = hide;
+        unsafe {
+            let _ = ShowWindow(self.hwnd, if hide { SW_HIDE } else { SW_SHOWNOACTIVATE });
+        }
+        if hide {
+            self.glass.drop_backdrop();
+        } else if self.fold.to > 0.0 {
+            // Shown again while open: the glass reads again
+            self.start_glass();
+        }
     }
 
     fn place_guarded(&mut self) {
@@ -479,10 +608,11 @@ impl Notch {
         }
     }
 
-    /** Sizes and places the window at a DPI (the primary monitor's when none), and shows it there; whether it was shown */
+    /** Sizes and places the window at a DPI (the monitor's when none), and shows it there; whether it was shown */
     fn place_at(&mut self, dpi: Option<f32>) -> bool {
         unsafe {
-            let monitor = MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY);
+            let monitor = crate::screens::monitor_for(&self.prefs.display);
+            self.monitor = monitor;
             let mut info = MONITORINFO {
                 cbSize: std::mem::size_of::<MONITORINFO>() as u32,
                 ..Default::default()
@@ -494,9 +624,10 @@ impl Notch {
             let _ = GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dx, &mut dy);
             let area = info.rcWork;
             let dpi = dpi.unwrap_or(dx as f32);
-            let scale_changed = self.dpi != dpi;
+            let scale = dpi / 96.0 * self.prefs.scale();
+            let scale_changed = self.dpi != dpi || self.scale != scale;
             self.dpi = dpi;
-            self.scale = self.dpi / 96.0;
+            self.scale = scale;
             let area_h = (area.bottom - area.top) as f32;
             self.win_h = WIN_H.min(area_h / self.scale);
             let (w, h) = (
@@ -507,12 +638,17 @@ impl Notch {
                 // Against the right edge always (on a work area narrower than the window, its clear left part goes past the
                 // left edge; the pill stays on the screen, and the card too down to a work area about 330 DIP wide)
                 x: area.right - w,
-                y: area.top + ((area.bottom - area.top) - h) / 2,
+                y: area.top
+                    + crate::prefs::along(self.prefs.position, area_h, h as f32, 0.0)
+                        .0
+                        .round() as i32,
             };
             self.size = (w, h);
             if scale_changed || self.surface.as_ref().map(|s| (s.w, s.h)) != Some((w, h)) {
                 self.surface = None;
             }
+            // What is behind was read at the old place
+            self.glass.drop_backdrop();
         }
         self.render()
     }
@@ -565,6 +701,7 @@ impl Notch {
         }
         if self.fold.to < 1.0 {
             self.fold.go(1.0);
+            self.start_glass();
             self.animate();
         }
     }
@@ -645,17 +782,18 @@ impl Notch {
      * Drawing goes ahead only when all three are there */
     fn surface_ready(&mut self) -> bool {
         if self.target_lost {
-            if self.gfx.renew(self.dpi).is_err() {
+            if self.gfx.renew(self.draw_dpi()).is_err() {
                 return false;
             }
             self.target_lost = false;
+            self.glass.reset();
             self.icons.clear();
             self.icons_stale = true;
             self.surface = None;
         }
         if self.surface.is_none() && self.size.0 > 0 {
             if let Ok(s) = Surface::new(self.size.0, self.size.1) {
-                if self.gfx.bind(s.dc, s.w, s.h, self.dpi).is_ok() {
+                if self.gfx.bind(s.dc, s.w, s.h, self.draw_dpi()).is_ok() {
                     self.surface = Some(s);
                 } else {
                     self.target_lost = true;
@@ -726,6 +864,18 @@ impl Notch {
             return false;
         }
         self.failures = 0;
+        // Development builds only: HEADROOM_DESKTOP_DUMP=<file> writes each frame shown (width, height, then premultiplied BGRA),
+        // for checking a look that screen copies leave out
+        #[cfg(debug_assertions)]
+        if let (Some(path), Some(s)) = (std::env::var_os("HEADROOM_DESKTOP_DUMP"), &self.surface) {
+            let n = (s.w * s.h * 4) as usize;
+            let px = unsafe { std::slice::from_raw_parts(s.bits, n) };
+            let mut out = Vec::with_capacity(n + 8);
+            out.extend_from_slice(&(s.w as u32).to_le_bytes());
+            out.extend_from_slice(&(s.h as u32).to_le_bytes());
+            out.extend_from_slice(px);
+            let _ = std::fs::write(path, out);
+        }
         // The pointer is read at the scale of what is on the screen
         self.shown_scale = self.scale;
         true
@@ -734,6 +884,7 @@ impl Notch {
     fn draw(&mut self) -> Result<()> {
         let l = self.layout();
         let e = self.fold.value();
+        let pal = self.pal();
         let g = &self.gfx;
         unsafe {
             g.rt.Clear(Some(&D2D1_COLOR_F {
@@ -745,7 +896,8 @@ impl Notch {
             g.rt.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
             // Where the pointer is kept: an all but invisible margin (a fully clear pixel lets the pointer through)
             let hot = g.brush("#000000", 1.0 / 255.0)?;
-            let mid = self.win_h / 2.0;
+            // The nub sits at the pill's middle
+            let mid = l.pill_y + l.pill_h / 2.0;
             g.rt.FillRectangle(
                 &rect(
                     WIN_W - NUB_HOT_W,
@@ -803,7 +955,28 @@ impl Notch {
                 g.rt.PushAxisAlignedClip(&clip, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
                 let drawn = (|| -> Result<()> {
                     let shape = pill_path(g, l.pill_x, l.pill_y, PILL_W, l.pill_h)?;
-                    g.rt.FillGeometry(&shape, &g.brush("#000000", 1.0)?, None);
+                    if pal.glass.is_some() {
+                        // The bevel's inner edge: past the screen's edge, so no rim shows along it
+                        let inner = g.rounded(
+                            rect(
+                                l.pill_x + BEVEL,
+                                l.pill_y + FLARE + BEVEL,
+                                WIN_W + 20.0,
+                                l.pill_y + l.pill_h - FLARE - BEVEL,
+                            ),
+                            11.0,
+                        )?;
+                        self.glass.fill(
+                            g,
+                            &shape.cast()?,
+                            Some(&inner.cast()?),
+                            rect(l.pill_x, l.pill_y, WIN_W, l.pill_y + l.pill_h),
+                            pal.pill,
+                            1.0,
+                        )?;
+                    } else {
+                        g.rt.FillGeometry(&shape, &g.ink(pal.pill, 1.0)?, None);
+                    }
                     if self.cells.is_empty() {
                         let a = cell_alpha(e, 0);
                         let top = l.cell_top(0);
@@ -812,11 +985,12 @@ impl Notch {
                             &self.fmt.pct,
                             Place::at(l.pill_x, top + RING_PX / 2.0 - 8.0, PILL_W, PCT_LINE)
                                 .align(DWRITE_TEXT_ALIGNMENT_CENTER)
-                                .color(INK, a),
+                                .ink(pal.ink, a),
                         )?;
                     }
                     self.cells.iter().enumerate().try_for_each(|(i, c)| {
                         self.draw_cell(
+                            &pal,
                             c,
                             l.pill_x + PILL_W / 2.0 + 10.0 * (1.0 - cell_alpha(e, i)),
                             l.cell_top(i),
@@ -840,16 +1014,16 @@ impl Notch {
                     radiusX: 5.0,
                     radiusY: 5.0,
                 };
-                g.rt.FillRoundedRectangle(&r, &g.brush(NUB, nub_a)?);
+                g.rt.FillRoundedRectangle(&r, &g.ink(pal.nub, nub_a)?);
             }
             if let Some(i) = card {
-                self.draw_card(i, card_top, l.ring_centre(i.min(l.n - 1)))?;
+                self.draw_card(&pal, i, card_top, l.ring_centre(i.min(l.n - 1)))?;
             }
             Ok(())
         }
     }
 
-    fn draw_cell(&self, c: &Cell, cx: f32, top: f32, a: f32) -> Result<()> {
+    fn draw_cell(&self, pal: &Palette, c: &Cell, cx: f32, top: f32, a: f32) -> Result<()> {
         let g = &self.gfx;
         let k = RING_PX / VB;
         let cy = top + RING_PX / 2.0;
@@ -861,7 +1035,7 @@ impl Notch {
                     radiusX: RING_R * k,
                     radiusY: RING_R * k,
                 },
-                &g.brush(TRACK, ring_a)?,
+                &g.ink(pal.track, ring_a)?,
                 RING_STROKE * k,
                 None,
             );
@@ -886,7 +1060,7 @@ impl Notch {
                         radiusX: OUTER_R * k,
                         radiusY: OUTER_R * k,
                     },
-                    &g.brush(OUTER_TRACK, ring_a)?,
+                    &g.ink(pal.outer_track, ring_a)?,
                     OUTER_STROKE * k,
                     None,
                 );
@@ -938,29 +1112,19 @@ impl Notch {
         g.text(
             &text,
             &self.fmt.pct,
-            place.color(if warn { WARN } else { INK }, a).tabular(),
+            place
+                .ink(if warn { pal.warn } else { pal.ink }, a)
+                .tabular(),
         )?;
         Ok(())
     }
 
-    fn draw_card(&self, i: usize, top: f32, centre: f32) -> Result<()> {
+    fn draw_card(&self, pal: &Palette, i: usize, top: f32, centre: f32) -> Result<()> {
         let g = &self.gfx;
         let h = self.card_height(i);
         let right = WIN_W - CARD_RIGHT;
         let left = right - CARD_W;
         unsafe {
-            let outer = D2D1_ROUNDED_RECT {
-                rect: rect(left, top, right, top + h),
-                radiusX: 14.0,
-                radiusY: 14.0,
-            };
-            g.rt.FillRoundedRectangle(&outer, &g.brush(CARD, 1.0)?);
-            let inner = D2D1_ROUNDED_RECT {
-                rect: rect(left + 0.5, top + 0.5, right - 0.5, top + h - 0.5),
-                radiusX: 13.5,
-                radiusY: 13.5,
-            };
-            g.rt.DrawRoundedRectangle(&inner, &g.brush(CARD_LINE, 1.0)?, 1.0, None);
             // The tail pointing at the ring
             let ty = top + 1.0 + (centre - top - 11.0).clamp(10.0, (h - 32.0).max(10.0));
             let tail = g.d2d.CreatePathGeometry()?;
@@ -979,7 +1143,35 @@ impl Notch {
             });
             s.EndFigure(D2D1_FIGURE_END_CLOSED);
             s.Close()?;
-            g.rt.FillGeometry(&tail, &g.brush(CARD, 1.0)?, None);
+            let body = g.rounded(rect(left, top, right, top + h), 14.0)?;
+            if pal.glass.is_some() {
+                // One shape of the card and its tail
+                let shape = g.d2d.CreatePathGeometry()?;
+                let sink = shape.Open()?;
+                body.CombineWithGeometry(&tail, D2D1_COMBINE_MODE_UNION, None, 0.25, &sink)?;
+                sink.Close()?;
+                let inner = g.rounded(
+                    rect(left + BEVEL, top + BEVEL, right - BEVEL, top + h - BEVEL),
+                    14.0 - BEVEL,
+                )?;
+                self.glass.fill(
+                    g,
+                    &shape.cast()?,
+                    Some(&inner.cast()?),
+                    rect(left, top, right, top + h),
+                    pal.card,
+                    1.0,
+                )?;
+            } else {
+                g.rt.FillGeometry(&body, &g.ink(pal.card, 1.0)?, None);
+                let inner = D2D1_ROUNDED_RECT {
+                    rect: rect(left + 0.5, top + 0.5, right - 0.5, top + h - 0.5),
+                    radiusX: 13.5,
+                    radiusY: 13.5,
+                };
+                g.rt.DrawRoundedRectangle(&inner, &g.ink(pal.card_line, 1.0)?, 1.0, None);
+                g.rt.FillGeometry(&tail, &g.ink(pal.card, 1.0)?, None);
+            }
         }
         self.card_box.set(Some([left, top, right, top + h]));
         self.up_box.set(None);
@@ -990,13 +1182,13 @@ impl Notch {
                 D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
             )
         };
-        let inside = self.draw_card_body(i, left, top);
+        let inside = self.draw_card_body(pal, i, left, top);
         unsafe { g.rt.PopAxisAlignedClip() };
         inside
     }
 
     /** The card's text and bars (cut to the card) */
-    fn draw_card_body(&self, i: usize, left: f32, top: f32) -> Result<()> {
+    fn draw_card_body(&self, pal: &Palette, i: usize, left: f32, top: f32) -> Result<()> {
         let g = &self.gfx;
         let x = left + 15.0;
         let w = CARD_W - 30.0;
@@ -1004,13 +1196,13 @@ impl Notch {
         let f = &self.fmt;
         let c = self.cells.get(i);
         let name = c.map_or("Headroom", |c| c.name);
-        let name_w = g.text(name, &f.name, Place::at(x, y, w, 18.9))?;
+        let name_w = g.text(name, &f.name, Place::at(x, y, w, 18.9).ink(pal.ink, 1.0))?;
         if let Some(c) = c {
             if let Some(plan) = c.plan {
                 g.text(
                     plan,
                     &f.small,
-                    Place::at(x + name_w + 6.0, y + 3.5, w - name_w - 20.0, 16.0).color(DIM, 1.0),
+                    Place::at(x + name_w + 6.0, y + 3.5, w - name_w - 20.0, 16.0).ink(pal.dim, 1.0),
                 )?;
             }
             unsafe {
@@ -1028,7 +1220,7 @@ impl Notch {
         if let Some(c) = c {
             if let Some(m) = c.message {
                 y += 8.0;
-                g.text(m, &f.body, Place::at(x, y, w, 16.2).color(INK_2, 1.0))?;
+                g.text(m, &f.body, Place::at(x, y, w, 16.2).ink(pal.ink_2, 1.0))?;
                 y += 16.2;
             }
             let fit = self.card_fit(i);
@@ -1039,18 +1231,19 @@ impl Notch {
                 g.text(
                     notice,
                     &f.small,
-                    Place::at(x, y + 1.0, w, 16.2).color(DIM, 1.0),
+                    Place::at(x, y + 1.0, w, 16.2).ink(pal.dim, 1.0),
                 )?;
                 y += 16.2;
                 y += 11.0;
                 unsafe {
-                    g.rt.FillRectangle(&rect(x, y, x + w, y + 1.0), &g.brush(CARD_LINE, 1.0)?)
+                    g.rt.FillRectangle(&rect(x, y, x + w, y + 1.0), &g.ink(pal.card_line, 1.0)?)
                 };
                 y += 9.0;
                 g.text(
                     &self.footer.0,
                     &f.small,
-                    Place::at(x, y, w, 14.85).color(if self.footer.1 { WARN } else { DIM }, 1.0),
+                    Place::at(x, y, w, 14.85)
+                        .ink(if self.footer.1 { pal.warn } else { pal.dim }, 1.0),
                 )?;
                 return Ok(());
             }
@@ -1065,7 +1258,7 @@ impl Notch {
                 g.text(
                     "↑ more",
                     &f.small,
-                    Place::at(x, y + 1.0, w, 16.2).color(DIM, a),
+                    Place::at(x, y + 1.0, w, 16.2).ink(pal.dim, a),
                 )?;
                 y += 16.2;
             }
@@ -1092,14 +1285,14 @@ impl Notch {
                             g.text(
                                 label,
                                 &f.body,
-                                Place::at(x, y, w - tw - 8.0, 16.2).color(DIM, 1.0),
+                                Place::at(x, y, w - tw - 8.0, 16.2).ink(pal.dim, 1.0),
                             )?;
                             g.text(
                                 text,
                                 &f.small,
                                 Place::at(x, y + 1.0, w, 16.2)
                                     .align(DWRITE_TEXT_ALIGNMENT_TRAILING)
-                                    .color(DIM, 1.0)
+                                    .ink(pal.dim, 1.0)
                                     .tabular(),
                             )?;
                             y += 16.2;
@@ -1114,30 +1307,34 @@ impl Notch {
                             ..
                         } => {
                             let tw = g.width(time, &f.small, true)?;
-                            g.text(label, &f.label, Place::at(x, y, w - tw - 8.0, 16.2))?;
-                            let tc = if *warn { WARN } else { DIM };
+                            g.text(
+                                label,
+                                &f.label,
+                                Place::at(x, y, w - tw - 8.0, 16.2).ink(pal.ink, 1.0),
+                            )?;
+                            let tc = if *warn { pal.warn } else { pal.dim };
                             g.text(
                                 time,
                                 &f.small,
                                 Place::at(x, y + 1.0, w, 16.2)
                                     .align(DWRITE_TEXT_ALIGNMENT_TRAILING)
-                                    .color(tc, 1.0)
+                                    .ink(tc, 1.0)
                                     .tabular(),
                             )?;
                             y += 16.2 + 5.0;
-                            bar(g, x, y, w, pieces, c.color)?;
+                            bar(g, pal, x, y, w, pieces, c.color)?;
                             y += 5.0 + 4.0;
                             g.text(
                                 left,
                                 &f.small,
-                                Place::at(x, y, w, 14.85).color(INK_2, 1.0).tabular(),
+                                Place::at(x, y, w, 14.85).ink(pal.ink_2, 1.0).tabular(),
                             )?;
                             g.text(
                                 pace,
                                 &f.small,
                                 Place::at(x, y, w, 14.85)
                                     .align(DWRITE_TEXT_ALIGNMENT_TRAILING)
-                                    .color(DIM, 1.0)
+                                    .ink(pal.dim, 1.0)
                                     .tabular(),
                             )?;
                             y += 14.85;
@@ -1160,14 +1357,14 @@ impl Notch {
                 g.text(
                     "↓ more",
                     &f.small,
-                    Place::at(x, y + 1.0, w, 16.2).color(DIM, a),
+                    Place::at(x, y + 1.0, w, 16.2).ink(pal.dim, a),
                 )?;
                 y += 16.2;
             }
         }
         y += 11.0;
         unsafe {
-            g.rt.FillRectangle(&rect(x, y, x + w, y + 1.0), &g.brush(CARD_LINE, 1.0)?)
+            g.rt.FillRectangle(&rect(x, y, x + w, y + 1.0), &g.ink(pal.card_line, 1.0)?)
         };
         y += 9.0;
         let note = self
@@ -1180,7 +1377,7 @@ impl Notch {
         g.text(
             text,
             &f.small,
-            Place::at(x, y, w, 14.85).color(if warn { WARN } else { DIM }, 1.0),
+            Place::at(x, y, w, 14.85).ink(if warn { pal.warn } else { pal.dim }, 1.0),
         )?;
         Ok(())
     }
@@ -1205,6 +1402,10 @@ impl Notch {
         unsafe {
             let _ = KillTimer(Some(self.hwnd), T_FOLD);
             let _ = KillTimer(Some(self.hwnd), T_CARD);
+        }
+        // Opened by a click: the pointer alone doesn't open it
+        if self.prefs.open_on == OpenOn::Click && self.fold.to < 1.0 {
+            return;
         }
         self.unfold();
         let l = self.layout();
@@ -1236,10 +1437,11 @@ impl Notch {
         self.tracking = false;
         if !self.pinned {
             let now = Instant::now();
-            self.card_at = Some(now + std::time::Duration::from_millis(CARD_GRACE_MS.into()));
-            self.fold_at = Some(now + std::time::Duration::from_millis(FOLD_GRACE_MS.into()));
-            let card = unsafe { SetTimer(Some(self.hwnd), T_CARD, CARD_GRACE_MS, None) } != 0;
-            let fold = unsafe { SetTimer(Some(self.hwnd), T_FOLD, FOLD_GRACE_MS, None) } != 0;
+            let (card_ms, fold_ms) = self.prefs.graces();
+            self.card_at = Some(now + std::time::Duration::from_millis(card_ms.into()));
+            self.fold_at = Some(now + std::time::Duration::from_millis(fold_ms.into()));
+            let card = unsafe { SetTimer(Some(self.hwnd), T_CARD, card_ms, None) } != 0;
+            let fold = unsafe { SetTimer(Some(self.hwnd), T_FOLD, fold_ms, None) } != 0;
             let set = card && fold;
             if !set {
                 // The tick takes the deadlines instead
@@ -1251,6 +1453,11 @@ impl Notch {
 
     /** A click on a ring reads the server now, or says when it next may */
     fn click(&mut self, x: f32, y: f32) {
+        if self.prefs.open_on == OpenOn::Click && self.fold.to < 1.0 {
+            self.unfold();
+            self.mouse_move(x, y);
+            return;
+        }
         let within =
             |b: Option<[f32; 4]>| b.is_some_and(|b| x >= b[0] && x < b[2] && y >= b[1] && y < b[3]);
         // The card's lines for the rows above and below move them (where the wheel doesn't reach an inactive window)
@@ -1311,6 +1518,23 @@ impl Notch {
                 if self.due(T_CARD, self.card_at) {
                     self.card_at = None;
                     self.hide_card();
+                }
+            }
+            T_FULL => {
+                let covered = self.prefs.hide_fullscreen
+                    && crate::screens::fullscreen_on(self.monitor, self.hwnd);
+                self.set_hidden(covered);
+            }
+            T_GLASS => {
+                if self.fold.to <= 0.0 && !self.fold.moving() || !self.glass_reads() {
+                    // Folded: what is behind isn't read until it opens again
+                    unsafe {
+                        let _ = KillTimer(Some(self.hwnd), T_GLASS);
+                    }
+                    self.glass.drop_backdrop();
+                } else {
+                    self.take_backdrop();
+                    self.render();
                 }
             }
             T_TICK => {
@@ -1375,10 +1599,10 @@ fn ring_arcs(
 }
 
 /** A card's bar: the track, then the same three pieces from the left, cut to the track's rounded shape */
-fn bar(g: &Gfx, x: f32, y: f32, w: f32, p: &Pieces, hex: &str) -> Result<()> {
+fn bar(g: &Gfx, pal: &Palette, x: f32, y: f32, w: f32, p: &Pieces, hex: &str) -> Result<()> {
     let track = rect(x, y, x + w, y + 5.0);
     let shape = g.rounded(track, 2.5)?;
-    unsafe { g.rt.FillGeometry(&shape, &g.brush(CARD_LINE, 1.0)?, None) };
+    unsafe { g.rt.FillGeometry(&shape, &g.ink(pal.card_line, 1.0)?, None) };
     g.push_mask(&shape.into());
     let fade = if p.faded { 0.45 } else { 1.0 };
     let mut bx = x;
@@ -1622,6 +1846,12 @@ pub fn create(pinned: bool) -> Result<()> {
             icons_stale: false,
             pinned,
             tick_ms: 0,
+            prefs: Prefs::default(),
+            system_light: false,
+            glass: Glass::default(),
+            monitor: HMONITOR::default(),
+            hidden: false,
+            excluded: false,
         };
         notch.load_icons();
         notch.refresh_model();
@@ -1631,6 +1861,19 @@ pub fn create(pinned: bool) -> Result<()> {
         let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
     }
     Ok(())
+}
+
+/** Asks the notch to take the prefs again and place itself (a burst of asks places once) */
+pub fn post_place() {
+    let h = HWND_VALUE.load(Ordering::SeqCst);
+    if h == 0 || PLACE_POSTED.with(|p| p.replace(true)) {
+        return;
+    }
+    let posted =
+        unsafe { PostMessageW(Some(HWND(h as *mut _)), WM_APP_PLACE, WPARAM(0), LPARAM(0)) };
+    if posted.is_err() {
+        PLACE_POSTED.with(|p| p.set(false));
+    }
 }
 
 /** Asks the notch (from any thread) to take the state again */
